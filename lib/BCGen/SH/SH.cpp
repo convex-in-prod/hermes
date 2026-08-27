@@ -35,6 +35,8 @@
 #include "llvh/ADT/BitVector.h"
 #include "llvh/ADT/SetVector.h"
 
+#include <iterator>
+
 using namespace hermes;
 
 namespace {
@@ -358,10 +360,18 @@ class SHNativeJSFunctionTable {
   llvh::DenseMap<Function *, unsigned> funcMap_{};
   /// A reference to the global string table. Used for function names.
   SHStringTable &stringTable_;
+  /// Prefix used to give cross-translation-unit symbols unique linkage.
+  std::string bundlePrefix_;
 
  public:
-  explicit SHNativeJSFunctionTable(Module *M, SHStringTable &stringTable)
-      : stringTable_(stringTable) {
+  explicit SHNativeJSFunctionTable(
+      Module *M,
+      SHStringTable &stringTable,
+      llvh::StringRef bundleUnitName = {})
+      : stringTable_(stringTable),
+        bundlePrefix_(bundleUnitName.empty()
+                          ? std::string{}
+                          : ("sh_" + bundleUnitName + "_").str()) {
     // Ensure that the top level function has an id of 0.
     auto topLevelFunc = M->getTopLevelFunction();
     funcMap_[topLevelFunc] = 0;
@@ -385,10 +395,19 @@ class SHNativeJSFunctionTable {
     return funcMap_.size();
   }
 
+  std::vector<Function *> functionsByIndex() const {
+    std::vector<Function *> functions(funcMap_.size());
+    for (const auto &entry : funcMap_)
+      functions[entry.second] = entry.first;
+    return functions;
+  }
+
   /// Generates the correct label for Function \p F, and outputs it to \p OS. If
   /// the JS function name contains characters that aren't allowed in C
   /// identifiers, they will be replaced by '_'.
   void generateFunctionLabel(Function *F, llvh::raw_ostream &OS) const {
+    if (!bundlePrefix_.empty())
+      OS << bundlePrefix_ << 'f';
     OS << '_' << getIndex(F) << '_';
 
     auto name = F->getInternalNameStr();
@@ -403,6 +422,40 @@ class SHNativeJSFunctionTable {
     }
   }
 
+  void generateUnitIndexLabel(llvh::raw_ostream &OS) const {
+    if (bundlePrefix_.empty())
+      OS << "unit_index";
+    else
+      OS << bundlePrefix_ << "unit_index";
+  }
+
+  void generateFunctionInfoTableLabel(llvh::raw_ostream &OS) const {
+    if (bundlePrefix_.empty())
+      OS << "s_function_info_table";
+    else
+      OS << bundlePrefix_ << "function_info_table";
+  }
+
+  void generateOutlinedStateLabel(
+      Function *F,
+      llvh::raw_ostream &OS) const {
+    assert(isBundle() && "outlined state requires bundle labels");
+    OS << bundlePrefix_ << "f_" << getIndex(F) << "_state";
+  }
+
+  void generateOutlinedPartLabel(
+      Function *F,
+      uint32_t part,
+      llvh::raw_ostream &OS) const {
+    assert(isBundle() && "outlined part requires bundle labels");
+    OS << bundlePrefix_ << "f_" << getIndex(F) << "_part_"
+       << llvh::format("%05u", part);
+  }
+
+  bool isBundle() const {
+    return !bundlePrefix_.empty();
+  }
+
   /// Turn the table of function information into the corresponding SH C data
   /// structures.
   void generate(llvh::raw_ostream &OS) const {
@@ -411,7 +464,12 @@ class SHNativeJSFunctionTable {
     for (auto &entry : funcMap_)
       sortedKeys[entry.second] = entry.first;
 
-    OS << "\nstatic SHNativeFuncInfo s_function_info_table[] = {\n";
+    if (isBundle())
+      OS << "\nSH_BUNDLE_HIDDEN SHNativeFuncInfo ";
+    else
+      OS << "\nstatic SHNativeFuncInfo ";
+    generateFunctionInfoTableLabel(OS);
+    OS << "[] = {\n";
     for (const Function *F : sortedKeys) {
       uint32_t nameIdx = stringTable_.add(F->getOriginalOrInferredName().str());
       uint32_t argCount = F->getExpectedParamCountIncludingThis() - 1;
@@ -440,10 +498,13 @@ struct ModuleGen {
   /// Table of JS native functions
   SHNativeJSFunctionTable nativeFunctionTable;
 
-  explicit ModuleGen(Module *M, bool optimizationEnabled)
+  explicit ModuleGen(
+      Module *M,
+      bool optimizationEnabled,
+      llvh::StringRef bundleUnitName = {})
       : literalBuffers{M, stringTable, optimizationEnabled},
         srcLocationTable{stringTable},
-        nativeFunctionTable{M, stringTable} {}
+        nativeFunctionTable{M, stringTable, bundleUnitName} {}
 };
 
 /// \return true if the SHLegacyValue representations of values \p a and \p b
@@ -471,6 +532,11 @@ static bool canCompareStrictEqualityRaw(TypeContext &tc, Value *a, Value *b) {
   return true;
 }
 
+enum class RegisterStorage {
+  LocalsAndNonPtrVariables,
+  StatePointer,
+};
+
 class InstrGen {
  public:
   /// \p os is the output stream
@@ -486,7 +552,10 @@ class InstrGen {
       uint32_t &nextWriteCacheIdx,
       uint32_t &nextReadCacheIdx,
       uint32_t &nextPrivateNameCacheIdx,
-      const llvh::MapVector<TryStartInst *, uint32_t> &tryIDs)
+      const llvh::MapVector<TryStartInst *, uint32_t> &tryIDs,
+      const llvh::DenseMap<BasicBlock *, TryStartInst *> &enclosingTrys,
+      RegisterStorage registerStorage =
+          RegisterStorage::LocalsAndNonPtrVariables)
       : os_(os),
         ra_(ra),
         options_(options),
@@ -497,10 +566,10 @@ class InstrGen {
         nextWriteCacheIdx_(nextWriteCacheIdx),
         nextReadCacheIdx_(nextReadCacheIdx),
         nextPrivateNameCacheIdx_(nextPrivateNameCacheIdx),
-        tryIDs_(tryIDs) {
+        tryIDs_(tryIDs),
+        enclosingTrys_(enclosingTrys),
+        registerStorage_(registerStorage) {
     (void)options_;
-    if (!tryIDs_.empty())
-      enclosingTrys_ = *findEnclosingTrysPerBlock(&F_);
   }
 
   /// Converts Instruction \p I into valid C code and outputs it through the
@@ -556,7 +625,10 @@ class InstrGen {
   /// Map from BasicBlock to the TryStartInst that encloses it, nullptr if none.
   /// If empty, there's no try in the entire function.
   /// If there is any try in the function, this will have an entry for every BB.
-  llvh::DenseMap<BasicBlock *, TryStartInst *> enclosingTrys_{};
+  const llvh::DenseMap<BasicBlock *, TryStartInst *> &enclosingTrys_;
+
+  /// Where LocalPtr and LocalNonPtr registers are stored in generated C.
+  RegisterStorage registerStorage_;
 
   void unimplemented(Instruction &inst) {
     std::string err{"Unimplemented "};
@@ -595,7 +667,11 @@ class InstrGen {
   /// Generate a string constant by referencing the global string table.
   llvh::raw_ostream &genStringConst(LiteralString *LS) {
     auto str = LS->getValue().str();
-    os_ << "get_symbols(shUnit)[" << moduleGen_.stringTable.add(str) << ']';
+    if (options_.emitCBundle)
+      os_ << "shUnit->symbols[";
+    else
+      os_ << "get_symbols(shUnit)[";
+    os_ << moduleGen_.stringTable.add(str) << ']';
     return genStringComment(str);
   }
 
@@ -632,18 +708,33 @@ class InstrGen {
   /// different instructions accessing the same property probably are for
   /// objects of the same hidden class, and should get the same offset.
   llvh::raw_ostream &genWriteIC(LiteralString *LS) {
+    if (options_.emitCBundle)
+      return os_ << "shUnit->write_prop_cache + " << nextWriteCacheIdx_++;
     return os_ << "get_write_prop_cache(shUnit) + " << nextWriteCacheIdx_++;
   }
   llvh::raw_ostream &genReadIC(LiteralString *LS) {
+    if (options_.emitCBundle)
+      return os_ << "shUnit->read_prop_cache + " << nextReadCacheIdx_++;
     return os_ << "get_read_prop_cache(shUnit) + " << nextReadCacheIdx_++;
   }
   llvh::raw_ostream &genPrivateNameIC(Value *privateName) {
+    if (options_.emitCBundle)
+      return os_ << "shUnit->private_name_cache + "
+                 << nextPrivateNameCacheIdx_++;
     return os_ << "get_private_name_cache(shUnit) + "
                << nextPrivateNameCacheIdx_++;
   }
 
   /// Helper to generate a value in a register,
   void generateRegister(sh::Register reg) {
+    if (registerStorage_ != RegisterStorage::LocalsAndNonPtrVariables &&
+        (reg.getClass() == sh::RegClass::LocalPtr ||
+         reg.getClass() == sh::RegClass::LocalNonPtr)) {
+      os_ << "state->"
+          << (reg.getClass() == sh::RegClass::LocalPtr ? "t[" : "np[")
+          << reg.getIndex() << ']';
+      return;
+    }
     switch (reg.getClass()) {
       case sh::RegClass::LocalPtr:
         os_ << "locals.t" << reg.getIndex();
@@ -1813,9 +1904,11 @@ class InstrGen {
     generateValue(inst);
     os_ << " = ";
     os_ << "_sh_ljs_create_regexp(shr, ";
-    os_ << llvh::format("get_symbols(shUnit)[%u]", patternStrID);
+    os_ << (options_.emitCBundle ? "shUnit->symbols[" : "get_symbols(shUnit)[")
+        << patternStrID << ']';
     os_ << ", ";
-    os_ << llvh::format("get_symbols(shUnit)[%u]", flagsStrID);
+    os_ << (options_.emitCBundle ? "shUnit->symbols[" : "get_symbols(shUnit)[")
+        << flagsStrID << ']';
     os_ << ");\n";
   }
   void generateTryEndInst(TryEndInst &inst) {
@@ -1881,7 +1974,9 @@ class InstrGen {
     moduleGen_.nativeFunctionTable.generateFunctionLabel(
         inst.getFunctionCode(), os_);
     os_ << ", ";
-    os_ << "&s_function_info_table["
+    os_ << '&';
+    moduleGen_.nativeFunctionTable.generateFunctionInfoTableLabel(os_);
+    os_ << '['
         << moduleGen_.nativeFunctionTable.getIndex(inst.getFunctionCode())
         << "]" << ", shUnit);\n";
   }
@@ -1897,7 +1992,9 @@ class InstrGen {
     moduleGen_.nativeFunctionTable.generateFunctionLabel(
         inst.getFunctionCode(), os_);
     os_ << ", ";
-    os_ << "&s_function_info_table["
+    os_ << '&';
+    moduleGen_.nativeFunctionTable.generateFunctionInfoTableLabel(os_);
+    os_ << '['
         << moduleGen_.nativeFunctionTable.getIndex(inst.getFunctionCode())
         << "]" << ", shUnit);\n";
   }
@@ -1914,7 +2011,9 @@ class InstrGen {
     moduleGen_.nativeFunctionTable.generateFunctionLabel(
         inst.getFunctionCode(), os_);
     os_ << ", ";
-    os_ << "&s_function_info_table["
+    os_ << '&';
+    moduleGen_.nativeFunctionTable.generateFunctionInfoTableLabel(os_);
+    os_ << '['
         << moduleGen_.nativeFunctionTable.getIndex(inst.getFunctionCode())
         << "]";
     os_ << ", (SHUnit *)shUnit, ";
@@ -1936,7 +2035,12 @@ class InstrGen {
     if (!tryIDs_.empty()) {
       os_ << "  _sh_end_try(shr, &jmpBuf);\n";
     }
-    os_ << "  _sh_leave(shr, &locals.head, frame);\n  return ";
+    os_ << "  _sh_leave(shr, &";
+    if (registerStorage_ == RegisterStorage::LocalsAndNonPtrVariables)
+      os_ << "locals.head";
+    else
+      os_ << "state->head";
+    os_ << ", frame);\n  return ";
     generateValue(*inst.getValue());
     os_ << ";\n";
   }
@@ -2769,6 +2873,10 @@ void generateFunction(
   srcMgr.dumpCoords(OS, F.getSourceRange().Start);
   OS << '\n';
 
+  llvh::DenseMap<BasicBlock *, TryStartInst *> enclosingTrys;
+  if (!tryIDs.empty())
+    enclosingTrys = *findEnclosingTrysPerBlock(&F);
+
   InstrGen instrGen(
       OS,
       RA,
@@ -2779,12 +2887,16 @@ void generateFunction(
       nextWriteCacheIdx,
       nextReadCacheIdx,
       nextPrivateNameCacheIdx,
-      tryIDs);
+      tryIDs,
+      enclosingTrys);
 
   // Number of registers stored in the `locals` struct below.
   uint32_t localsSize = RA.getMaxRegisterUsage(sh::RegClass::LocalPtr);
 
-  OS << "static SHLegacyValue ";
+  if (options.emitCBundle)
+    OS << "SH_BUNDLE_HIDDEN SHLegacyValue ";
+  else
+    OS << "static SHLegacyValue ";
   moduleGen.nativeFunctionTable.generateFunctionLabel(&F, OS);
   OS << "(SHRuntime *shr) {\n";
 
@@ -2835,7 +2947,9 @@ void generateFunction(
      << (RA.getMaxArgumentRegisters() + hbc::StackFrameLayout::FirstLocal)
      << ");\n"
      << "  locals.head.count =" << localsSize << ";\n"
-     << "  SHUnit *shUnit = shr->units[unit_index];\n";
+     << "  SHUnit *shUnit = shr->units[";
+  moduleGen.nativeFunctionTable.generateUnitIndexLabel(OS);
+  OS << "];\n";
 
   if (emitNativeTraces) {
     // Initialize the current SHUnit.
@@ -2997,13 +3111,12 @@ L_catch:
   OS << "}\n";
 }
 
-/// Collect all the native externs used in the module.
-std::unique_ptr<llvh::DenseSet<NativeExtern *>> collectUsedExterns(Module *M) {
+/// Collect all the native externs used by \p functions.
+std::unique_ptr<llvh::DenseSet<NativeExtern *>> collectUsedExterns(
+    llvh::ArrayRef<Function *> functions) {
   auto externs = llvh::make_unique<llvh::DenseSet<NativeExtern *>>();
-  // Iterate all functions, basic blocks and operands, checking for
-  // LiteralNativeExtern.
-  for (auto &F : *M) {
-    for (auto &BB : F) {
+  for (Function *F : functions) {
+    for (auto &BB : *F) {
       for (auto &I : BB) {
         for (unsigned i = 0, count = I.getNumOperands(); i != count; ++i) {
           if (auto *ne = llvh::dyn_cast<LiteralNativeExtern>(I.getOperand(i))) {
@@ -3014,6 +3127,15 @@ std::unique_ptr<llvh::DenseSet<NativeExtern *>> collectUsedExterns(Module *M) {
     }
   }
   return externs;
+}
+
+/// Collect all the native externs used in the module.
+std::unique_ptr<llvh::DenseSet<NativeExtern *>> collectUsedExterns(Module *M) {
+  std::vector<Function *> functions;
+  functions.reserve(M->size());
+  for (auto &F : *M)
+    functions.push_back(&F);
+  return collectUsedExterns(functions);
 }
 
 /// Generate the include statements requested by native externs.
@@ -3053,6 +3175,137 @@ void generateExternC(
   }
   if (count != 0)
     OS << '\n';
+}
+
+void generateUnitData(
+    Module *M,
+    llvh::raw_ostream &OS,
+    ModuleGen &moduleGen,
+    uint32_t nextWriteCacheIdx,
+    uint32_t nextReadCacheIdx,
+    uint32_t nextPrivateNameCacheIdx,
+    const BytecodeGenerationOptions &options) {
+  if (options.emitCBundle) {
+    OS << "SH_BUNDLE_HIDDEN uint32_t ";
+    moduleGen.nativeFunctionTable.generateUnitIndexLabel(OS);
+    OS << ";\n";
+  }
+
+  moduleGen.literalBuffers.generate(OS);
+  moduleGen.srcLocationTable.generate(
+      OS, M->getContext().getSourceErrorManager());
+  moduleGen.nativeFunctionTable.generate(OS);
+  // String table must be generated last because the other tables may add
+  // strings while they are emitted.
+  moduleGen.stringTable.generate(OS);
+
+  // Prefix the creator with sh_export_ to avoid conflicts between units.
+  OS << "#define CREATE_THIS_UNIT sh_export_" << options.unitName << "\n";
+
+  OS << "static const SHStaticABIDescriptor s_static_abi_descriptor =\n"
+     << "    SH_STATIC_ABI_DESCRIPTOR_INITIALIZER;\n"
+     << "struct UnitData {\n"
+     << "  SHUnit unit;\n"
+     << "  SHSymbolID symbol_data[" << moduleGen.stringTable.size() << "];\n"
+     << "  SHWritePropertyCacheEntry write_prop_cache_data["
+     << nextWriteCacheIdx << "];\n"
+     << "  SHReadPropertyCacheEntry read_prop_cache_data["
+     << nextReadCacheIdx << "];\n"
+     << "  SHPrivateNameCacheEntry private_name_cache_data["
+     << nextPrivateNameCacheIdx << "];\n"
+     << "  SHCompressedPointer object_literal_class_cache["
+     << moduleGen.literalBuffers.objShapeTable.size() << "];\n};\n"
+     << "SHUnit *CREATE_THIS_UNIT(void) {\n"
+     << "  _sh_check_abi(\n"
+     << "      &s_static_abi_descriptor, sizeof(s_static_abi_descriptor));\n"
+     << "  struct UnitData *unit_data = calloc(sizeof(struct UnitData), 1);\n"
+     << "  *unit_data = (struct UnitData){.unit = {.index = &";
+  moduleGen.nativeFunctionTable.generateUnitIndexLabel(OS);
+  OS << ",.num_symbols =" << moduleGen.stringTable.size()
+     << ", .num_write_prop_cache_entries = " << nextWriteCacheIdx
+     << ", .num_read_prop_cache_entries = " << nextReadCacheIdx
+     << ", .ascii_pool = s_ascii_pool, .u16_pool = s_u16_pool,"
+     << ".strings = s_strings, .symbols = unit_data->symbol_data,"
+     << ".write_prop_cache = unit_data->write_prop_cache_data,"
+     << ".read_prop_cache = unit_data->read_prop_cache_data, "
+     << ".private_name_cache = unit_data->private_name_cache_data, "
+     << ".obj_key_buffer = s_obj_key_buffer, .obj_key_buffer_size = "
+     << moduleGen.literalBuffers.objKeyBuffer.size() << ", "
+     << ".literal_val_buffer = s_literal_val_buffer, .literal_val_buffer_size = "
+     << moduleGen.literalBuffers.literalValueBuffer.size() << ", "
+     << ".obj_shape_table = s_obj_shape_table, "
+     << ".obj_shape_table_count = "
+     << moduleGen.literalBuffers.objShapeTable.size() << ", "
+     << ".object_literal_class_cache = unit_data->object_literal_class_cache, "
+     << ".source_locations = s_source_locations, "
+     << ".source_locations_size = " << moduleGen.srcLocationTable.size()
+     << ", " << ".unit_main = ";
+  if (options.emitCBundle)
+    moduleGen.nativeFunctionTable.generateFunctionLabel(
+        M->getTopLevelFunction(), OS);
+  else
+    OS << "_0_global";
+  OS << ", .unit_main_info = &";
+  moduleGen.nativeFunctionTable.generateFunctionInfoTableLabel(OS);
+  OS << "[0], "
+     << ".unit_name = \"sh_compiled\" }};\n"
+     << "  return (SHUnit *)unit_data;\n}\n";
+
+  if (!options.emitCBundle) {
+    OS << R"(
+SHSymbolID *get_symbols(SHUnit *unit) {
+  return ((struct UnitData *)unit)->symbol_data;
+}
+
+SHWritePropertyCacheEntry *get_write_prop_cache(SHUnit *unit) {
+  return ((struct UnitData *)unit)->write_prop_cache_data;
+}
+SHReadPropertyCacheEntry *get_read_prop_cache(SHUnit *unit) {
+  return ((struct UnitData *)unit)->read_prop_cache_data;
+}
+SHPrivateNameCacheEntry *get_private_name_cache(SHUnit *unit) {
+  return ((struct UnitData *)unit)->private_name_cache_data;
+}
+)";
+  }
+
+  if (options.emitMain) {
+    OS << R"(
+typedef struct SHConsoleContext SHConsoleContext;
+
+SHConsoleContext *init_console_bindings(
+    SHRuntime *shr, int scriptArgc, const char *const *scriptArgv);
+
+void free_console_context(SHConsoleContext *consoleContext);
+
+bool run_event_loop(
+    SHRuntime *shr,
+    SHConsoleContext *consoleContext);
+
+int main(int argc, char **argv) {
+  int scriptArgc = 0;
+  char **scriptArgv = NULL;
+  int clArgc = argc;
+  for (int i = 1; i < argc; ++i) {
+    if (argv[i][0] == '-' && argv[i][1] == '-' && argv[i][2] == '\0') {
+      scriptArgc = argc - i - 1;
+      scriptArgv = argv + i + 1;
+      clArgc = i;
+      break;
+    }
+  }
+  SHRuntime *shr = _sh_init(clArgc, argv);
+  SHConsoleContext *consoleContext =
+      init_console_bindings(shr, scriptArgc, (const char *const *)scriptArgv);
+  bool success =
+    _sh_initialize_units(shr, 1, CREATE_THIS_UNIT) &&
+    run_event_loop(shr, consoleContext);
+  free_console_context(consoleContext);
+  _sh_done(shr);
+  return success ? 0 : 1;
+}
+)";
+  }
 }
 
 /// Converts Module \p M into valid C code and outputs it through \p OS.
@@ -3135,107 +3388,925 @@ static SHNativeFuncInfo s_function_info_table[];
   }
 
   if (options.format == DumpBytecode || options.format == EmitBundle) {
-    moduleGen.literalBuffers.generate(OS);
-    moduleGen.srcLocationTable.generate(
-        OS, M->getContext().getSourceErrorManager());
-    moduleGen.nativeFunctionTable.generate(OS);
-    // String table should be generated last, because the generate calls to
-    // other module components may add new entries to the string table.
-    moduleGen.stringTable.generate(OS);
-
-    // Note that we prefix the unit name with sh_export_ to avoid potential
-    // conflicts.
-    OS << "#define CREATE_THIS_UNIT sh_export_" << options.unitName << "\n";
-
-    OS << "struct UnitData {\n"
-       << "  SHUnit unit;\n"
-       << "  SHSymbolID symbol_data[" << moduleGen.stringTable.size() << "];\n"
-       << "  SHWritePropertyCacheEntry write_prop_cache_data["
-       << nextWriteCacheIdx << "];\n"
-       << "  SHReadPropertyCacheEntry read_prop_cache_data[" << nextReadCacheIdx
-       << "];\n"
-       << "  SHPrivateNameCacheEntry private_name_cache_data["
-       << nextPrivateNameCacheIdx << "];\n"
-       << "  SHCompressedPointer object_literal_class_cache["
-       << moduleGen.literalBuffers.objShapeTable.size() << "];\n};\n"
-       << "SHUnit *CREATE_THIS_UNIT(void) {\n"
-       << "  struct UnitData *unit_data = calloc(sizeof(struct UnitData), 1);\n"
-       << "  *unit_data = (struct UnitData){.unit = {.index = &unit_index,"
-       << ".num_symbols =" << moduleGen.stringTable.size()
-       << ", .num_write_prop_cache_entries = " << nextWriteCacheIdx
-       << ", .num_read_prop_cache_entries = " << nextReadCacheIdx
-       << ", .ascii_pool = s_ascii_pool, .u16_pool = s_u16_pool,"
-       << ".strings = s_strings, .symbols = unit_data->symbol_data,"
-       << ".write_prop_cache = unit_data->write_prop_cache_data,"
-       << ".read_prop_cache = unit_data->read_prop_cache_data, "
-       << ".private_name_cache = unit_data->private_name_cache_data, "
-       << ".obj_key_buffer = s_obj_key_buffer, .obj_key_buffer_size = "
-       << moduleGen.literalBuffers.objKeyBuffer.size() << ", "
-       << ".literal_val_buffer = s_literal_val_buffer, .literal_val_buffer_size = "
-       << moduleGen.literalBuffers.literalValueBuffer.size() << ", "
-       << ".obj_shape_table = s_obj_shape_table, "
-       << ".obj_shape_table_count = "
-       << moduleGen.literalBuffers.objShapeTable.size() << ", "
-       << ".object_literal_class_cache = unit_data->object_literal_class_cache, "
-       << ".source_locations = s_source_locations, "
-       << ".source_locations_size = " << moduleGen.srcLocationTable.size()
-       << ", " << ".unit_main = _0_global, "
-       << ".unit_main_info = &s_function_info_table[0], "
-       << ".unit_name = \"sh_compiled\" }};\n"
-       << "  return (SHUnit *)unit_data;\n}\n"
-       << R"(
-SHSymbolID *get_symbols(SHUnit *unit) {
-  return ((struct UnitData *)unit)->symbol_data;
+    generateUnitData(
+        M,
+        OS,
+        moduleGen,
+        nextWriteCacheIdx,
+        nextReadCacheIdx,
+        nextPrivateNameCacheIdx,
+        options);
+  }
 }
 
-SHWritePropertyCacheEntry *get_write_prop_cache(SHUnit *unit) {
-  return ((struct UnitData *)unit)->write_prop_cache_data;
+struct BufferedBundleFunction {
+  Function *function;
+  std::string source;
+  bool isolate{false};
+  uint32_t functionFragmentIndex{0};
+  uint32_t functionFragmentCount{0};
+  sh::SHCBundleCOptimizationLevel cOptimizationLevel{
+      sh::SHCBundleCOptimizationLevel::Default};
+  sh::SHCBundleOversizeReason oversizeReason{
+      sh::SHCBundleOversizeReason::None};
+  /// For function fragments, the exact JS function labels referenced by this
+  /// fragment. Ordinary shards discover references from their whole functions.
+  llvh::BitVector referencedFunctions;
+};
+
+struct BufferedOutlinedInstruction {
+  Instruction *instruction;
+  SMLoc effectiveLocation;
+  std::string source;
+};
+
+struct BufferedOutlinedBlock {
+  BasicBlock *block;
+  std::vector<BufferedOutlinedInstruction> instructions;
+};
+
+struct OutlinedPart {
+  uint32_t blockIndex;
+  size_t begin;
+  size_t end;
+};
+
+/// Avoid adding cross-translation-unit calls to small functions and small CFG
+/// paths when a very small shard target is used to exercise ordinary function
+/// sharding.
+constexpr size_t kMinOutlinedInstructionCount = 64;
+
+/// A single generated C function exercises native optimization passes much
+/// more heavily than the same bytes spread across independent functions. Keep
+/// outlined helpers below the aggregate translation-unit target.
+constexpr size_t kOutlinedPartTargetDivisor = 8;
+
+/// Optimizing larger generated C control-flow graphs can require excessive
+/// compile time and memory even when the source body is below the shard target.
+constexpr size_t kO0BasicBlockCount = 1024;
+
+/// Leave room in a 65,536-member bundle for the manifest, header, and
+/// metadata translation unit.
+constexpr size_t kMaxBundleFunctionShards = 65533;
+
+sh::SHCBundleCOptimizationLevel cOptimizationLevelForFunction(
+    Function *function) {
+  size_t basicBlockCount = 0;
+  for (auto &block : *function) {
+    (void)block;
+    ++basicBlockCount;
+  }
+  return basicBlockCount >= kO0BasicBlockCount
+      ? sh::SHCBundleCOptimizationLevel::O0
+      : sh::SHCBundleCOptimizationLevel::Default;
 }
-SHReadPropertyCacheEntry *get_read_prop_cache(SHUnit *unit) {
-  return ((struct UnitData *)unit)->read_prop_cache_data;
+
+bool mustStayInOutlinedWrapper(Instruction *instruction) {
+  return llvh::isa<TerminatorInst>(instruction) ||
+      llvh::isa<CatchInst>(instruction);
 }
-SHPrivateNameCacheEntry *get_private_name_cache(SHUnit *unit) {
-  return ((struct UnitData *)unit)->private_name_cache_data;
+
+void collectReferencedFunction(
+    Instruction *instruction,
+    const SHNativeJSFunctionTable &functionTable,
+    llvh::BitVector &referenced) {
+  auto mark = [&](Function *target) {
+    referenced.set(functionTable.getIndex(target));
+  };
+  if (auto *create = llvh::dyn_cast<CreateFunctionInst>(instruction))
+    mark(create->getFunctionCode());
+  if (auto *create = llvh::dyn_cast<CreateGeneratorInst>(instruction))
+    mark(create->getFunctionCode());
+  if (auto *create = llvh::dyn_cast<CreateClassInst>(instruction))
+    mark(create->getFunctionCode());
+  if (auto *call = llvh::dyn_cast<CallInst>(instruction)) {
+    if (auto *target = llvh::dyn_cast<Function>(call->getTarget()))
+      mark(target);
+  }
 }
-)";
-    if (options.emitMain) {
+
+bool canOutlineFunction(Function *function) {
+  size_t instructionCount = 0;
+  for (auto &block : *function) {
+    instructionCount += block.size();
+    if (instructionCount >= kMinOutlinedInstructionCount)
+      return true;
+  }
+  return false;
+}
+
+void generateOutlinedStateDefinition(
+    llvh::raw_ostream &OS,
+    Function *function,
+    const SHNativeJSFunctionTable &functionTable,
+    uint32_t localsSize,
+    uint32_t nonPtrSize) {
+  OS << "struct ";
+  functionTable.generateOutlinedStateLabel(function, OS);
+  OS << " {\n  SHLocals head;\n";
+  if (localsSize != 0)
+    OS << "  SHLegacyValue t[" << localsSize << "];\n";
+  if (nonPtrSize != 0)
+    OS << "  SHLegacyValue np[" << nonPtrSize << "];\n";
+  OS << "};\n";
+  if (localsSize != 0) {
+    OS << "_Static_assert(offsetof(struct ";
+    functionTable.generateOutlinedStateLabel(function, OS);
+    OS << ", t) == offsetof(SHLocals, locals), "
+          "\"outlined locals must use SHLocals layout\");\n";
+  }
+  OS << '\n';
+}
+
+void generateOutlinedPartDeclaration(
+    llvh::raw_ostream &OS,
+    Function *function,
+    uint32_t part,
+    const SHNativeJSFunctionTable &functionTable) {
+  OS << "SH_BUNDLE_HIDDEN SH_ATTRIBUTE_NOINLINE void ";
+  functionTable.generateOutlinedPartLabel(function, part, OS);
+  OS << "(SHRuntime *shr, struct ";
+  functionTable.generateOutlinedStateLabel(function, OS);
+  OS << " *state, SHLegacyValue *frame, SHUnit *shUnit)";
+}
+
+void emitOutlinedInstructions(
+    sh::LineDirectiveEmitter &OS,
+    llvh::ArrayRef<BufferedOutlinedInstruction> instructions,
+    SourceErrorManager &srcMgr,
+    bool emitLineDirectives) {
+  if (emitLineDirectives)
+    OS.enableLineDirectives();
+  for (const auto &instruction : instructions) {
+    OS.setDirectiveInfo(instruction.effectiveLocation, srcMgr);
+    OS << instruction.source;
+  }
+  OS.disableLineDirectives();
+}
+
+std::string generateOutlinedPart(
+    Function *function,
+    uint32_t part,
+    llvh::ArrayRef<BufferedOutlinedInstruction> instructions,
+    const SHNativeJSFunctionTable &functionTable,
+    uint32_t localsSize,
+    uint32_t nonPtrSize,
+    SourceErrorManager &srcMgr,
+    bool emitLineDirectives) {
+  std::string source;
+  llvh::raw_string_ostream sourceOS(source);
+  {
+    sh::LineDirectiveEmitter OS(sourceOS);
+    generateOutlinedStateDefinition(
+        OS, function, functionTable, localsSize, nonPtrSize);
+    generateOutlinedPartDeclaration(OS, function, part, functionTable);
+    OS << " {\n";
+    emitOutlinedInstructions(
+        OS, instructions, srcMgr, emitLineDirectives);
+    OS << "}\n";
+  }
+  sourceOS.flush();
+  return source;
+}
+
+/// Generate an independently compilable wrapper and zero or more C helpers.
+/// The wrapper retains every basic-block label and terminator. Helpers contain
+/// only same-block non-terminator instruction runs and operate on the wrapper's
+/// register state without entering a JavaScript frame.
+std::vector<BufferedBundleFunction> generateOutlinedBundleFunction(
+    Function &F,
+    ModuleGen &moduleGen,
+    uint32_t &nextWriteCacheIdx,
+    uint32_t &nextReadCacheIdx,
+    uint32_t &nextPrivateNameCacheIdx,
+    sh::SHCBundleCOptimizationLevel cOptimizationLevel,
+    const BytecodeGenerationOptions &options) {
+  auto PO = hermes::postOrderAnalysis(&F);
+  llvh::SmallVector<BasicBlock *, 16> order(PO.rbegin(), PO.rend());
+
+  sh::SHRegisterAllocator RA(&F);
+  RA.allocate(order);
+  lowerAllocatedFunctionIR(&F, RA, options.optimizationEnabled);
+
+  llvh::DenseMap<BasicBlock *, unsigned> bbMap;
+  for (uint32_t index = 0; index < order.size(); ++index)
+    bbMap[order[index]] = index;
+  llvh::MapVector<TryStartInst *, uint32_t> tryIDs;
+  uint32_t nextTryID = 1;
+  for (BasicBlock *block : order) {
+    if (auto *tryStart =
+            llvh::dyn_cast<TryStartInst>(block->getTerminator())) {
+      tryIDs[tryStart] = nextTryID++;
+    }
+  }
+  llvh::DenseMap<BasicBlock *, TryStartInst *> enclosingTrys;
+  if (!tryIDs.empty())
+    enclosingTrys = *findEnclosingTrysPerBlock(&F);
+  auto &srcMgr = F.getContext().getSourceErrorManager();
+  const uint32_t localsSize =
+      RA.getMaxRegisterUsage(sh::RegClass::LocalPtr);
+  const uint32_t nonPtrSize =
+      RA.getMaxRegisterUsage(sh::RegClass::LocalNonPtr);
+  const bool emitNativeTraces =
+      F.getContext().getDebugInfoSetting() >= DebugInfoSetting::THROWING;
+  const bool emitSrcLocComments =
+      options.emitSourceLocations && !options.emitLineDirectives;
+  std::vector<BufferedOutlinedBlock> blocks;
+  blocks.reserve(order.size());
+  uint64_t outlineableBytes = 0;
+  SMLoc effectiveLocation = F.getSourceRange().Start;
+  for (BasicBlock *block : order) {
+    BufferedOutlinedBlock bufferedBlock{block, {}};
+    bufferedBlock.instructions.reserve(block->size());
+    for (auto &I : *block) {
+      if (I.getLocation().isValid())
+        effectiveLocation = I.getLocation();
+      std::string source;
+      llvh::raw_string_ostream OS(source);
+      if (emitSrcLocComments) {
+        OS << "  // ";
+        if (effectiveLocation.isValid())
+          srcMgr.dumpCoords(OS, effectiveLocation);
+        else
+          OS << "no-src-info";
+        OS << '\n';
+      }
+      if (emitNativeTraces && I.getSideEffect().getThrow()) {
+        SHSrcLocationTable::IdxTy idx = SHSrcLocationTable::kInvalidLocIdx;
+        SMLoc curLoc = I.getLocation();
+        if (curLoc.isValid()) {
+          SourceErrorManager::SourceCoords coords;
+          if (srcMgr.findBufferLineAndLoc(curLoc, coords))
+            idx = moduleGen.srcLocationTable.getIndex(srcMgr, coords);
+        }
+        // Each helper is an independent C function, and wrapper control flow
+        // can enter a block without executing the previously emitted block.
+        OS << "  state->head.src_location_idx = " << idx << ";\n";
+      }
+      InstrGen instrGen(
+          OS,
+          RA,
+          options,
+          bbMap,
+          F,
+          moduleGen,
+          nextWriteCacheIdx,
+          nextReadCacheIdx,
+          nextPrivateNameCacheIdx,
+          tryIDs,
+          enclosingTrys,
+          RegisterStorage::StatePointer);
+      instrGen.generate(I);
+      OS.flush();
+      if (!mustStayInOutlinedWrapper(&I))
+        outlineableBytes += source.size();
+      bufferedBlock.instructions.push_back(
+          {&I, effectiveLocation, std::move(source)});
+    }
+    blocks.push_back(std::move(bufferedBlock));
+  }
+
+  // Keep a helper body below a fraction of its containing translation-unit
+  // target. The remaining space holds declarations for function references,
+  // the shared-state definition, and the C file prologue. A single generated
+  // instruction can still exceed the target. Keep the O0 singleton intact:
+  // dividing it would create non-O0 helper fragments.
+  const uint64_t partTargetBytes =
+      cOptimizationLevel == sh::SHCBundleCOptimizationLevel::O0
+      ? options.cBundleShardSize
+      : std::max<uint64_t>(
+            1, options.cBundleShardSize / kOutlinedPartTargetDivisor);
+  const std::string emptyPart = generateOutlinedPart(
+      &F,
+      0,
+      {},
+      moduleGen.nativeFunctionTable,
+      localsSize,
+      nonPtrSize,
+      srcMgr,
+      options.emitLineDirectives);
+  const uint64_t instructionTarget =
+      partTargetBytes > emptyPart.size()
+      ? partTargetBytes - emptyPart.size()
+      : 1;
+  const bool needsOutlining = outlineableBytes >= instructionTarget;
+  std::vector<OutlinedPart> parts;
+  if (needsOutlining) {
+    for (uint32_t blockIndex = 0; blockIndex < blocks.size(); ++blockIndex) {
+      const auto &instructions = blocks[blockIndex].instructions;
+      size_t index = 0;
+      while (index < instructions.size()) {
+        if (mustStayInOutlinedWrapper(instructions[index].instruction)) {
+          ++index;
+          continue;
+        }
+        const size_t begin = index;
+        uint64_t runBytes = 0;
+        while (index < instructions.size() &&
+               !mustStayInOutlinedWrapper(instructions[index].instruction)) {
+          runBytes += instructions[index].source.size();
+          ++index;
+        }
+        const size_t end = index;
+        if (end - begin < kMinOutlinedInstructionCount &&
+            runBytes < instructionTarget) {
+          continue;
+        }
+
+        size_t partBegin = begin;
+        while (partBegin < end) {
+          size_t partEnd = partBegin;
+          uint64_t partBytes = 0;
+          while (partEnd < end) {
+            const uint64_t instructionBytes =
+                instructions[partEnd].source.size();
+            if (partEnd != partBegin &&
+                (partBytes >= instructionTarget ||
+                 instructionBytes > instructionTarget - partBytes)) {
+              break;
+            }
+            partBytes += instructionBytes;
+            ++partEnd;
+          }
+          if (parts.size() >= kMaxBundleFunctionShards - 1) {
+            hermes_fatal(
+                "Static Hermes C bundle function has too many fragments");
+          }
+          parts.push_back({blockIndex, partBegin, partEnd});
+          partBegin = partEnd;
+        }
+      }
+    }
+  }
+  const bool outline = !parts.empty();
+  llvh::BitVector wrapperReferences(moduleGen.nativeFunctionTable.size());
+  std::string wrapperSource;
+  llvh::raw_string_ostream wrapperSourceOS(wrapperSource);
+  {
+    sh::LineDirectiveEmitter OS(wrapperSourceOS);
+    generateOutlinedStateDefinition(
+        OS, &F, moduleGen.nativeFunctionTable, localsSize, nonPtrSize);
+    if (outline) {
+      for (uint32_t part = 0; part < parts.size(); ++part) {
+        generateOutlinedPartDeclaration(
+            OS, &F, part, moduleGen.nativeFunctionTable);
+        OS << ";\n";
+      }
+      OS << '\n';
+    }
+
+    OS << "// ";
+    srcMgr.dumpCoords(OS, F.getSourceRange().Start);
+    OS << "\nSH_BUNDLE_HIDDEN SHLegacyValue ";
+    moduleGen.nativeFunctionTable.generateFunctionLabel(&F, OS);
+    OS << "(SHRuntime *shr) {\n";
+    OS.setDirectiveInfo(F.getSourceRange().Start, srcMgr);
+    if (options.emitLineDirectives)
+      OS.enableLineDirectives();
+
+    if (F.isGlobalScope())
+      OS << "  _SH_MODEL();\n";
+    OS << "  struct ";
+    moduleGen.nativeFunctionTable.generateOutlinedStateLabel(&F, OS);
+    OS << " stateStorage;\n"
+       << "  struct ";
+    moduleGen.nativeFunctionTable.generateOutlinedStateLabel(&F, OS);
+    OS << " *state = &stateStorage;\n";
+
+    if (F.getParent()
+            ->getContext()
+            .getNativeContext()
+            .settings.emitCheckNativeStack) {
+      OS << "  _sh_check_native_stack_overflow(shr);\n";
+    }
+    OS << "  SHLegacyValue *frame = _sh_enter(shr, &state->head, "
+       << (RA.getMaxArgumentRegisters() +
+           hbc::StackFrameLayout::FirstLocal)
+       << ");\n"
+       << "  state->head.count =" << localsSize << ";\n"
+       << "  SHUnit *shUnit = shr->units[";
+    moduleGen.nativeFunctionTable.generateUnitIndexLabel(OS);
+    OS << "];\n";
+
+    if (emitNativeTraces) {
+      OS << "  state->head.unit = shUnit;\n"
+         << "  state->head.src_location_idx = "
+         << SHSrcLocationTable::kInvalidLocIdx << ";\n";
+    }
+    if (localsSize != 0) {
+      OS << "  for (uint32_t index = 0; index < " << localsSize
+         << "; ++index)\n"
+         << "    state->t[index] = _sh_ljs_undefined();\n";
+    }
+    if (nonPtrSize != 0) {
+      OS << "  for (uint32_t index = 0; index < " << nonPtrSize
+         << "; ++index)\n"
+         << "    state->np[index] = _sh_ljs_undefined();\n";
+    }
+
+    switch (F.getProhibitInvoke()) {
+      case Function::ProhibitInvoke::ProhibitNone:
+        break;
+      case Function::ProhibitInvoke::ProhibitConstruct:
+        OS << "  if (!_sh_ljs_is_undefined(frame["
+           << hbc::StackFrameLayout::NewTarget << "]))\n"
+           << "    _sh_throw_type_error_ascii(shr, \"Function is not a "
+              "constructor\");\n";
+        break;
+      case Function::ProhibitInvoke::ProhibitCall:
+        OS << "  if (_sh_ljs_is_undefined(frame["
+           << hbc::StackFrameLayout::NewTarget << "]))\n"
+           << "    _sh_throw_type_error_ascii(shr, \"Class constructor "
+              "invoked without new\");\n";
+        break;
+    }
+    if (!tryIDs.empty()) {
       OS << R"(
-typedef struct SHConsoleContext SHConsoleContext;
-
-SHConsoleContext *init_console_bindings(
-    SHRuntime *shr, int scriptArgc, const char *const *scriptArgv);
-
-void free_console_context(SHConsoleContext *consoleContext);
-
-bool run_event_loop(
-    SHRuntime *shr,
-    SHConsoleContext *consoleContext);
-
-int main(int argc, char **argv) {
-  int scriptArgc = 0;
-  char **scriptArgv = NULL;
-  int clArgc = argc;
-  for (int i = 1; i < argc; ++i) {
-    if (argv[i][0] == '-' && argv[i][1] == '-' && argv[i][2] == '\0') {
-      scriptArgc = argc - i - 1;
-      scriptArgv = argv + i + 1;
-      clArgc = i;
-      break;
-    }
-  }
-  SHRuntime *shr = _sh_init(clArgc, argv);
-  SHConsoleContext *consoleContext =
-      init_console_bindings(shr, scriptArgc, (const char *const *)scriptArgv);
-  bool success =
-    _sh_initialize_units(shr, 1, CREATE_THIS_UNIT) &&
-    run_event_loop(shr, consoleContext);
-  free_console_context(consoleContext);
-  _sh_done(shr);
-  return success ? 0 : 1;
-}
+  SHJmpBuf jmpBuf;
+  volatile uint32_t tryState = 0;
+  if (__builtin_expect(_sh_try(shr, &jmpBuf), 0) != 0) goto L_catch;
 )";
     }
+    if (emitNativeTraces) {
+      OS << "  frame[" << hbc::StackFrameLayout::SHLocals << "]"
+         << " = _sh_ljs_native_pointer(&state->head);\n";
+    }
+
+    uint32_t nextPart = 0;
+    for (uint32_t blockIndex = 0; blockIndex < blocks.size(); ++blockIndex) {
+      auto &block = blocks[blockIndex];
+      if (options.emitLineDirectives)
+        OS.enableLineDirectives();
+      OS.setDirectiveInfo(block.block->front().getLocation(), srcMgr);
+      OS << '\n';
+      generateBasicBlockLabel(block.block, OS, bbMap);
+      OS << ":\n  ;\n";
+      OS.disableLineDirectives();
+
+      size_t instructionIndex = 0;
+      while (instructionIndex < block.instructions.size()) {
+        if (outline && nextPart < parts.size() &&
+            parts[nextPart].blockIndex == blockIndex &&
+            parts[nextPart].begin == instructionIndex) {
+          OS << "  ";
+          moduleGen.nativeFunctionTable.generateOutlinedPartLabel(
+              &F, nextPart, OS);
+          OS << "(shr, state, frame, shUnit);\n";
+          instructionIndex = parts[nextPart].end;
+          ++nextPart;
+          continue;
+        }
+        collectReferencedFunction(
+            block.instructions[instructionIndex].instruction,
+            moduleGen.nativeFunctionTable,
+            wrapperReferences);
+        emitOutlinedInstructions(
+            OS,
+            llvh::ArrayRef<BufferedOutlinedInstruction>(
+                &block.instructions[instructionIndex], 1),
+            srcMgr,
+            options.emitLineDirectives);
+        ++instructionIndex;
+      }
+    }
+    assert(nextPart == parts.size() && "not all outlined parts were called");
+    if (!tryIDs.empty()) {
+      OS << R"(
+L_catch:
+  if (tryState == 0) {
+    _sh_end_try(shr, &jmpBuf);
+    _sh_throw_current(shr);
   }
+  )";
+      OS << "_sh_catch_no_pop(shr, (SHLocals*)state, frame, "
+         << (RA.getMaxArgumentRegisters() +
+             hbc::StackFrameLayout::FirstLocal)
+         << ");\n";
+
+      OS << R"(
+  switch (tryState) {
+    default:
+      abort();
+)";
+      for (const auto &[tryStart, id] : tryIDs) {
+        OS << "    case " << id << ":\n"
+           << "      goto ";
+        generateBasicBlockLabel(tryStart->getCatchTarget(), OS, bbMap);
+        OS << ";\n";
+      }
+      OS << "  }\n";
+    }
+    OS << "}\n";
+  }
+  wrapperSourceOS.flush();
+
+  // The wrapper keeps block labels and terminators while helpers replace
+  // outlineable instruction runs. A remaining singleton cannot be divided.
+  size_t wrapperInstructionCount = 0;
+  uint32_t nextWrapperPart = 0;
+  for (uint32_t blockIndex = 0; blockIndex < blocks.size(); ++blockIndex) {
+    const auto &instructions = blocks[blockIndex].instructions;
+    for (size_t instructionIndex = 0;
+         instructionIndex < instructions.size();) {
+      if (outline && nextWrapperPart < parts.size() &&
+          parts[nextWrapperPart].blockIndex == blockIndex &&
+          parts[nextWrapperPart].begin == instructionIndex) {
+        instructionIndex = parts[nextWrapperPart].end;
+        ++nextWrapperPart;
+      } else {
+        ++wrapperInstructionCount;
+        ++instructionIndex;
+      }
+    }
+  }
+  assert(
+      nextWrapperPart == parts.size() && "not all outlined parts were counted");
+
+  std::vector<BufferedBundleFunction> result;
+  auto wrapperOversizeReason = sh::SHCBundleOversizeReason::None;
+  if (wrapperSource.size() > options.cBundleShardSize) {
+    if (wrapperInstructionCount == 1)
+      wrapperOversizeReason = sh::SHCBundleOversizeReason::SingleInstruction;
+    else if (!outline)
+      wrapperOversizeReason =
+          sh::SHCBundleOversizeReason::NoOutlineableRun;
+  }
+  result.push_back({
+      &F,
+      std::move(wrapperSource),
+      outline ||
+          cOptimizationLevel == sh::SHCBundleCOptimizationLevel::O0,
+      0,
+      outline ? static_cast<uint32_t>(parts.size() + 1) : 0,
+      cOptimizationLevel,
+      wrapperOversizeReason,
+  });
+  if (outline)
+    result.back().referencedFunctions = std::move(wrapperReferences);
+  if (outline) {
+    for (uint32_t part = 0; part < parts.size(); ++part) {
+      const auto &outlinedPart = parts[part];
+      const auto &instructions = blocks[outlinedPart.blockIndex].instructions;
+      auto source = generateOutlinedPart(
+          &F,
+          part,
+          llvh::ArrayRef<BufferedOutlinedInstruction>(instructions).slice(
+              outlinedPart.begin, outlinedPart.end - outlinedPart.begin),
+          moduleGen.nativeFunctionTable,
+          localsSize,
+          nonPtrSize,
+          srcMgr,
+          options.emitLineDirectives);
+      auto oversizeReason = sh::SHCBundleOversizeReason::None;
+      if (source.size() > options.cBundleShardSize &&
+          outlinedPart.end - outlinedPart.begin == 1) {
+        oversizeReason = sh::SHCBundleOversizeReason::SingleInstruction;
+      }
+      result.push_back({
+          &F,
+          std::move(source),
+          true,
+          part + 1,
+          static_cast<uint32_t>(parts.size() + 1),
+          sh::SHCBundleCOptimizationLevel::Default,
+          oversizeReason,
+      });
+      auto &referencedFunctions = result.back().referencedFunctions;
+      referencedFunctions.resize(moduleGen.nativeFunctionTable.size());
+      for (const auto &instruction :
+           llvh::ArrayRef<BufferedOutlinedInstruction>(instructions)
+               .slice(
+                   outlinedPart.begin,
+                   outlinedPart.end - outlinedPart.begin)) {
+        collectReferencedFunction(
+            instruction.instruction,
+            moduleGen.nativeFunctionTable,
+            referencedFunctions);
+      }
+    }
+  }
+  return result;
+}
+
+std::string bundleFilePath(
+    llvh::StringRef unitName,
+    llvh::StringRef suffix) {
+  return ("sh_" + unitName + suffix).str();
+}
+
+void generateBundleHeader(
+    llvh::raw_ostream &OS,
+    ModuleGen &moduleGen,
+    llvh::StringRef unitName) {
+  OS << "#ifndef SH_" << unitName << "_INTERNAL_H\n"
+     << "#define SH_" << unitName << "_INTERNAL_H\n\n"
+     << "#include \"hermes/VM/static_h.h\"\n\n"
+     << "#include <stdlib.h>\n\n"
+     << "#if defined(_WIN32)\n"
+     << "#define SH_BUNDLE_HIDDEN\n"
+     << "#else\n"
+     << "#define SH_BUNDLE_HIDDEN __attribute__((visibility(\"hidden\")))\n"
+     << "#endif\n\n"
+     << "extern SH_BUNDLE_HIDDEN uint32_t ";
+  moduleGen.nativeFunctionTable.generateUnitIndexLabel(OS);
+  OS << ";\nextern SH_BUNDLE_HIDDEN SHNativeFuncInfo ";
+  moduleGen.nativeFunctionTable.generateFunctionInfoTableLabel(OS);
+  OS << "[];\n\n#endif\n";
+}
+
+void collectReferencedFunctions(
+    Function *function,
+    const SHNativeJSFunctionTable &functionTable,
+    llvh::BitVector &referenced) {
+  for (auto &BB : *function) {
+    for (auto &I : BB)
+      collectReferencedFunction(&I, functionTable, referenced);
+  }
+}
+
+void generateBundleFunctionDeclaration(
+    llvh::raw_ostream &OS,
+    Function *function,
+    const SHNativeJSFunctionTable &functionTable) {
+  OS << "SH_BUNDLE_HIDDEN SHLegacyValue ";
+  functionTable.generateFunctionLabel(function, OS);
+  OS << "(SHRuntime *shr);\n";
+}
+
+bool generateBundleFunctionShard(
+    Module *M,
+    sh::SHCBundleWriteFile writeFile,
+    llvh::StringRef headerPath,
+    llvh::StringRef unitName,
+    ModuleGen &moduleGen,
+    const std::vector<Function *> &functionsByIndex,
+    const std::vector<BufferedBundleFunction> &functions,
+    uint64_t bodyBytes,
+    uint32_t shardIndex,
+    uint64_t targetBytes,
+    sh::SHCBundleFile &file) {
+  std::string path;
+  llvh::raw_string_ostream pathOS(path);
+  pathOS << "sh_" << unitName << "_functions_"
+         << llvh::format("%05u", shardIndex) << ".c";
+  pathOS.flush();
+
+  llvh::BitVector declarations(moduleGen.nativeFunctionTable.size());
+  std::vector<Function *> shardFunctions;
+  shardFunctions.reserve(functions.size());
+  for (const auto &function : functions) {
+    shardFunctions.push_back(function.function);
+    declarations.set(
+        moduleGen.nativeFunctionTable.getIndex(function.function));
+    if (function.functionFragmentCount != 0) {
+      assert(
+          function.referencedFunctions.size() == declarations.size() &&
+          "function fragments require exact declaration sets");
+      declarations |= function.referencedFunctions;
+    } else {
+      collectReferencedFunctions(
+          function.function, moduleGen.nativeFunctionTable, declarations);
+    }
+  }
+  auto usedExterns = collectUsedExterns(shardFunctions);
+
+  assert(
+      (functions.size() == 1 ||
+       llvh::all_of(functions, [](const BufferedBundleFunction &function) {
+         return function.functionFragmentCount == 0 &&
+             function.cOptimizationLevel ==
+             sh::SHCBundleCOptimizationLevel::Default;
+       })) &&
+      "function fragments and compile-policy overrides require isolated "
+      "shards");
+
+  const bool oversize = functions.size() == 1 && bodyBytes > targetBytes;
+  const auto oversizeReason = functions.size() == 1
+      ? functions.front().oversizeReason
+      : sh::SHCBundleOversizeReason::None;
+  if (oversize && oversizeReason == sh::SHCBundleOversizeReason::None) {
+    M->getContext().getSourceErrorManager().error(
+        functions.front().function->getSourceRange().Start,
+        "Static Hermes C bundle could not outline an oversized function "
+        "shard");
+    return false;
+  }
+  if (!oversize && oversizeReason != sh::SHCBundleOversizeReason::None) {
+    M->getContext().getSourceErrorManager().error(
+        functions.front().function->getSourceRange().Start,
+        "Static Hermes C bundle assigned an oversize reason to a fitting "
+        "function shard");
+    return false;
+  }
+
+  if (!writeFile(path, [&](llvh::raw_ostream &OS) {
+        OS << "#include \"" << headerPath << "\"\n\n";
+        generateExternCIncludes(M, OS, *usedExterns);
+        generateExternC(M, OS, *usedExterns);
+        for (int index = declarations.find_first(); index >= 0;
+             index = declarations.find_next(index)) {
+          generateBundleFunctionDeclaration(
+              OS, functionsByIndex[index], moduleGen.nativeFunctionTable);
+        }
+        OS << '\n';
+        for (const auto &function : functions)
+          OS << function.source;
+      })) {
+    return false;
+  }
+
+  file = {
+      path,
+      sh::SHCBundleFileRole::Function,
+      moduleGen.nativeFunctionTable.getIndex(functions.front().function),
+      moduleGen.nativeFunctionTable.getIndex(functions.back().function),
+      static_cast<uint32_t>(functions.size()),
+      targetBytes,
+      oversize,
+      oversizeReason,
+      functions.size() == 1 ? functions.front().functionFragmentIndex : 0,
+      functions.size() == 1 ? functions.front().functionFragmentCount : 0,
+      functions.size() == 1
+          ? functions.front().cOptimizationLevel
+          : sh::SHCBundleCOptimizationLevel::Default,
+  };
+  return true;
+}
+
+bool generateModuleBundle(
+    Module *M,
+    sh::SHCBundleWriteFile writeFile,
+    std::vector<sh::SHCBundleFile> &files,
+    const BytecodeGenerationOptions &options) {
+  assert(options.emitCBundle && "bundle generation requires emitCBundle");
+  assert(options.cBundleShardSize > 0 && "bundle shard size must be positive");
+  assert(
+      (options.format == DumpBytecode || options.format == EmitBundle) &&
+      "bundle generation requires C output");
+  if (!lowerModuleIR(M, options.optimizationEnabled))
+    return false;
+
+  if (options.verifyIR &&
+      !verifyModule(*M, &llvh::errs(), VerificationMode::IR_LOWERED)) {
+    M->getContext().getSourceErrorManager().error(
+        SMLoc{}, "Lowered IR verification failed");
+    return false;
+  }
+  if (!isValidSHUnitName(options.unitName))
+    hermes_fatal("Invalid unit name passed to SH backend.");
+
+  uint32_t nextWriteCacheIdx = 0;
+  uint32_t nextReadCacheIdx = 0;
+  uint32_t nextPrivateNameCacheIdx = 0;
+  ModuleGen moduleGen{
+      M, options.optimizationEnabled, options.unitName};
+  const auto functionsByIndex =
+      moduleGen.nativeFunctionTable.functionsByIndex();
+  M->assignIndexToVariables();
+
+  const std::string headerPath =
+      bundleFilePath(options.unitName, "_internal.h");
+  if (!writeFile(headerPath, [&](llvh::raw_ostream &OS) {
+        generateBundleHeader(OS, moduleGen, options.unitName);
+      })) {
+    return false;
+  }
+
+  std::vector<sh::SHCBundleFile> functionFiles;
+  std::vector<BufferedBundleFunction> bufferedFunctions;
+  uint64_t bufferedBytes = 0;
+  uint32_t shardIndex = 0;
+  auto flushShard = [&]() {
+    if (bufferedFunctions.empty())
+      return true;
+    if (shardIndex >= kMaxBundleFunctionShards) {
+      hermes_fatal("Static Hermes C bundle has too many function shards");
+    }
+    sh::SHCBundleFile file;
+    if (!generateBundleFunctionShard(
+            M,
+            writeFile,
+            headerPath,
+            options.unitName,
+            moduleGen,
+            functionsByIndex,
+            bufferedFunctions,
+            bufferedBytes,
+            shardIndex++,
+            options.cBundleShardSize,
+            file)) {
+      return false;
+    }
+    functionFiles.push_back(std::move(file));
+    bufferedFunctions.clear();
+    bufferedBytes = 0;
+    return true;
+  };
+
+  // Keep function generation sequential. String, source-location, and cache
+  // indexes are allocated while bodies are emitted and are shared by all
+  // shards in this logical unit.
+  for (Function *function : functionsByIndex) {
+    const auto cOptimizationLevel =
+        cOptimizationLevelForFunction(function);
+    std::vector<BufferedBundleFunction> generatedFunctions;
+    if (canOutlineFunction(function)) {
+      generatedFunctions = generateOutlinedBundleFunction(
+          *function,
+          moduleGen,
+          nextWriteCacheIdx,
+          nextReadCacheIdx,
+          nextPrivateNameCacheIdx,
+          cOptimizationLevel,
+          options);
+    } else {
+      std::string source;
+      llvh::raw_string_ostream sourceOS(source);
+      {
+        sh::LineDirectiveEmitter emitter(sourceOS);
+        generateFunction(
+            *function,
+            emitter,
+            moduleGen,
+            nextWriteCacheIdx,
+            nextReadCacheIdx,
+            nextPrivateNameCacheIdx,
+            options);
+      }
+      sourceOS.flush();
+      size_t instructionCount = 0;
+      for (const auto &block : *function) {
+        for (const auto &instruction : block) {
+          (void)instruction;
+          ++instructionCount;
+        }
+      }
+      auto oversizeReason = sh::SHCBundleOversizeReason::None;
+      if (source.size() > options.cBundleShardSize) {
+        if (instructionCount == 1)
+          oversizeReason = sh::SHCBundleOversizeReason::SingleInstruction;
+        else
+          oversizeReason = sh::SHCBundleOversizeReason::NoOutlineableRun;
+      }
+      generatedFunctions.push_back({
+          function,
+          std::move(source),
+          cOptimizationLevel == sh::SHCBundleCOptimizationLevel::O0,
+          0,
+          0,
+          cOptimizationLevel,
+          oversizeReason,
+      });
+    }
+
+    for (auto &generated : generatedFunctions) {
+      const uint64_t functionBytes = generated.source.size();
+      const bool isolate = generated.isolate;
+      if (!bufferedFunctions.empty() &&
+          (isolate || bufferedBytes >= options.cBundleShardSize ||
+           functionBytes > options.cBundleShardSize - bufferedBytes)) {
+        if (!flushShard())
+          return false;
+      }
+      bufferedBytes += functionBytes;
+      bufferedFunctions.push_back(std::move(generated));
+      if ((isolate || functionBytes > options.cBundleShardSize) &&
+          !flushShard())
+        return false;
+    }
+  }
+  if (!flushShard())
+    return false;
+
+  // The metadata tables must be emitted after every body has allocated its
+  // shared indexes.
+  const std::string metadataPath =
+      bundleFilePath(options.unitName, "_metadata.c");
+  if (!writeFile(metadataPath, [&](llvh::raw_ostream &OS) {
+        OS << "#include \"" << headerPath << "\"\n\n";
+        generateBundleFunctionDeclaration(
+            OS, M->getTopLevelFunction(), moduleGen.nativeFunctionTable);
+        OS << '\n';
+        generateUnitData(
+            M,
+            OS,
+            moduleGen,
+            nextWriteCacheIdx,
+            nextReadCacheIdx,
+            nextPrivateNameCacheIdx,
+            options);
+      })) {
+    return false;
+  }
+
+  files.clear();
+  files.push_back({headerPath, sh::SHCBundleFileRole::Header});
+  files.push_back({metadataPath, sh::SHCBundleFileRole::Metadata});
+  files.insert(
+      files.end(),
+      std::make_move_iterator(functionFiles.begin()),
+      std::make_move_iterator(functionFiles.end()));
+  return true;
 }
 } // namespace
 
@@ -3246,4 +4317,12 @@ void sh::generateSH(
     const BytecodeGenerationOptions &options) {
   LineDirectiveEmitter emitter{OS};
   generateModule(M, emitter, options);
+}
+
+bool sh::generateSHBundle(
+    Module *M,
+    SHCBundleWriteFile writeFile,
+    std::vector<SHCBundleFile> &files,
+    const BytecodeGenerationOptions &options) {
+  return generateModuleBundle(M, writeFile, files, options);
 }

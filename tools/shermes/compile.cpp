@@ -13,9 +13,13 @@
 #include "hermes/BCGen/SH/SH.h"
 
 #include "llvh/ADT/ScopeExit.h"
+#include "llvh/Support/MemoryBuffer.h"
 #include "llvh/Support/Path.h"
 #include "llvh/Support/Program.h"
 #include "llvh/Support/Signals.h"
+
+#include <algorithm>
+#include <array>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -30,6 +34,153 @@
 using namespace hermes;
 
 namespace {
+
+class SHA256 {
+  std::array<uint8_t, 64> data_{};
+  size_t dataLength_{0};
+  uint64_t bitLength_{0};
+  std::array<uint32_t, 8> state_{
+      0x6a09e667,
+      0xbb67ae85,
+      0x3c6ef372,
+      0xa54ff53a,
+      0x510e527f,
+      0x9b05688c,
+      0x1f83d9ab,
+      0x5be0cd19,
+  };
+
+  static uint32_t rotateRight(uint32_t value, uint32_t count) {
+    return (value >> count) | (value << (32 - count));
+  }
+
+  void transform() {
+    static constexpr std::array<uint32_t, 64> constants{
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b,
+        0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01,
+        0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7,
+        0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+        0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152,
+        0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+        0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819,
+        0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08,
+        0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f,
+        0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    };
+    std::array<uint32_t, 64> words{};
+    for (size_t i = 0; i < 16; ++i) {
+      words[i] = (static_cast<uint32_t>(data_[i * 4]) << 24) |
+          (static_cast<uint32_t>(data_[i * 4 + 1]) << 16) |
+          (static_cast<uint32_t>(data_[i * 4 + 2]) << 8) |
+          static_cast<uint32_t>(data_[i * 4 + 3]);
+    }
+    for (size_t i = 16; i < words.size(); ++i) {
+      const uint32_t s0 = rotateRight(words[i - 15], 7) ^
+          rotateRight(words[i - 15], 18) ^ (words[i - 15] >> 3);
+      const uint32_t s1 = rotateRight(words[i - 2], 17) ^
+          rotateRight(words[i - 2], 19) ^ (words[i - 2] >> 10);
+      words[i] = words[i - 16] + s0 + words[i - 7] + s1;
+    }
+
+    uint32_t a = state_[0];
+    uint32_t b = state_[1];
+    uint32_t c = state_[2];
+    uint32_t d = state_[3];
+    uint32_t e = state_[4];
+    uint32_t f = state_[5];
+    uint32_t g = state_[6];
+    uint32_t h = state_[7];
+    for (size_t i = 0; i < words.size(); ++i) {
+      const uint32_t sum1 =
+          rotateRight(e, 6) ^ rotateRight(e, 11) ^ rotateRight(e, 25);
+      const uint32_t choice = (e & f) ^ (~e & g);
+      const uint32_t temp1 = h + sum1 + choice + constants[i] + words[i];
+      const uint32_t sum0 =
+          rotateRight(a, 2) ^ rotateRight(a, 13) ^ rotateRight(a, 22);
+      const uint32_t majority = (a & b) ^ (a & c) ^ (b & c);
+      const uint32_t temp2 = sum0 + majority;
+      h = g;
+      g = f;
+      f = e;
+      e = d + temp1;
+      d = c;
+      c = b;
+      b = a;
+      a = temp1 + temp2;
+    }
+    state_[0] += a;
+    state_[1] += b;
+    state_[2] += c;
+    state_[3] += d;
+    state_[4] += e;
+    state_[5] += f;
+    state_[6] += g;
+    state_[7] += h;
+  }
+
+ public:
+  void update(llvh::StringRef bytes) {
+    for (uint8_t byte : bytes.bytes()) {
+      data_[dataLength_++] = byte;
+      if (dataLength_ == data_.size()) {
+        transform();
+        bitLength_ += 512;
+        dataLength_ = 0;
+      }
+    }
+  }
+
+  std::string finalHex() {
+    size_t index = dataLength_;
+    data_[index++] = 0x80;
+    if (index > 56) {
+      std::fill(data_.begin() + index, data_.end(), 0);
+      transform();
+      index = 0;
+    }
+    std::fill(data_.begin() + index, data_.begin() + 56, 0);
+    bitLength_ += dataLength_ * 8;
+    for (size_t i = 0; i < 8; ++i)
+      data_[63 - i] = static_cast<uint8_t>(bitLength_ >> (i * 8));
+    transform();
+
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string result(64, '0');
+    for (size_t i = 0; i < state_.size(); ++i) {
+      for (size_t byte = 0; byte < 4; ++byte) {
+        const uint8_t value =
+            static_cast<uint8_t>(state_[i] >> (24 - byte * 8));
+        result[(i * 4 + byte) * 2] = hex[value >> 4];
+        result[(i * 4 + byte) * 2 + 1] = hex[value & 0x0f];
+      }
+    }
+    return result;
+  }
+};
+
+struct BundleFileIdentity {
+  uint64_t size;
+  std::string sha256;
+};
+
+llvh::Optional<BundleFileIdentity> identifyBundleFile(
+    llvh::StringRef path) {
+  auto file = llvh::MemoryBuffer::getFile(path, -1, false, false);
+  if (!file) {
+    llvh::errs() << "Failed to read generated bundle file " << path << ": "
+                 << file.getError().message() << '\n';
+    return llvh::None;
+  }
+  SHA256 hash;
+  hash.update(file.get()->getBuffer());
+  return BundleFileIdentity{
+      file.get()->getBufferSize(),
+      hash.finalHex(),
+  };
+}
 
 /// Invoke the backend with the specified options. If the backend generates
 /// an error (unlikely, but possible), print the number of errors and return
@@ -116,6 +267,212 @@ bool compileToC(
   if (!invokeBackend(context, M, params.genOptions, fileOS.os()))
     return false;
   return fileOS.close();
+}
+
+const char *bundleFileRoleName(sh::SHCBundleFileRole role) {
+  switch (role) {
+    case sh::SHCBundleFileRole::Header:
+      return "header";
+    case sh::SHCBundleFileRole::Metadata:
+      return "metadata";
+    case sh::SHCBundleFileRole::Function:
+      return "function";
+  }
+  llvm_unreachable("invalid Static Hermes C bundle file role");
+}
+
+const char *bundleOversizeReasonName(sh::SHCBundleOversizeReason reason) {
+  switch (reason) {
+    case sh::SHCBundleOversizeReason::None:
+      return "none";
+    case sh::SHCBundleOversizeReason::SingleInstruction:
+      return "single-instruction";
+    case sh::SHCBundleOversizeReason::NoOutlineableRun:
+      return "no-outlineable-run";
+  }
+  llvm_unreachable("invalid Static Hermes C bundle oversize reason");
+}
+
+bool compileToCBundle(
+    hermes::Context *context,
+    hermes::Module &M,
+    const ShermesCompileParams &params,
+    llvh::StringRef inputFilename,
+    llvh::StringRef outputFilename) {
+  llvh::SmallString<32> outputPathBuf{};
+  if (outputFilename.empty())
+    outputFilename = deriveFilename(inputFilename, outputPathBuf, ".c.json");
+  if (outputFilename == "-") {
+    llvh::errs() << "A generated C bundle requires a manifest file path\n";
+    return false;
+  }
+  const std::string generatedFilePrefix =
+      ("sh_" + params.genOptions.unitName + "_").str();
+  if (llvh::sys::path::filename(outputFilename).startswith(
+          generatedFilePrefix)) {
+    llvh::errs()
+        << "The generated C bundle manifest name conflicts with its members\n";
+    return false;
+  }
+
+  const llvh::StringRef outputDirectory =
+      llvh::sys::path::parent_path(outputFilename);
+  std::vector<sh::SHCBundleFile> files;
+  const auto writeFile = [&](llvh::StringRef path,
+                             llvh::function_ref<void(llvh::raw_ostream &)>
+                                 emit) {
+    llvh::SmallString<128> fullPath(outputDirectory);
+    llvh::sys::path::append(fullPath, path);
+    OutputStream output;
+    if (!output.open(fullPath, llvh::sys::fs::F_None))
+      return false;
+    emit(output.os());
+    return output.close();
+  };
+
+  assert(
+      context->getSourceErrorManager().getErrorCount() == 0 &&
+      "backend invocation with non-zero errors");
+  const bool generated =
+      sh::generateSHBundle(&M, writeFile, files, params.genOptions);
+  if (auto count = context->getSourceErrorManager().getErrorCount()) {
+    llvh::errs() << "Emitted " << count << " errors. exiting.\n";
+    return false;
+  }
+  if (!generated)
+    return false;
+  if (files.size() < 3 || files[0].role != sh::SHCBundleFileRole::Header ||
+      files[1].role != sh::SHCBundleFileRole::Metadata) {
+    llvh::errs() << "Static Hermes emitted an invalid C bundle file list\n";
+    return false;
+  }
+  uint32_t nextFunctionId = 0;
+  for (size_t index = 2; index < files.size();) {
+    const auto &file = files[index];
+    if (file.role != sh::SHCBundleFileRole::Function) {
+      llvh::errs() << "Static Hermes emitted an invalid C bundle file role\n";
+      return false;
+    }
+    const bool invalidShard =
+        file.functionCount == 0 ||
+        file.lastFunctionId < file.firstFunctionId ||
+        file.lastFunctionId - file.firstFunctionId + 1 !=
+            file.functionCount ||
+        file.firstFunctionId != nextFunctionId ||
+        (file.oversize &&
+         (file.functionCount != 1 ||
+          file.oversizeReason == sh::SHCBundleOversizeReason::None)) ||
+        (!file.oversize &&
+         file.oversizeReason != sh::SHCBundleOversizeReason::None);
+    if (invalidShard) {
+      llvh::errs() << "Static Hermes emitted invalid function shard "
+                      "oversize metadata\n";
+      return false;
+    }
+    if (file.functionFragmentCount == 0) {
+      nextFunctionId = file.lastFunctionId + 1;
+      ++index;
+      continue;
+    }
+    if (file.role != sh::SHCBundleFileRole::Function ||
+        file.firstFunctionId != file.lastFunctionId ||
+        file.functionCount != 1 ||
+        file.functionFragmentIndex != 0 ||
+        file.functionFragmentCount < 2) {
+      llvh::errs() << "Static Hermes emitted invalid function fragments\n";
+      return false;
+    }
+    if (file.functionFragmentCount > files.size() - index) {
+      llvh::errs() << "Static Hermes emitted incomplete function fragments\n";
+      return false;
+    }
+
+    // The backend emits a wrapper immediately followed by its helpers. Check
+    // that group once: checking every fragment against the whole file list
+    // would be quadratic at the 65,533-shard bundle limit.
+    for (uint32_t part = 0; part < file.functionFragmentCount; ++part) {
+      const auto &candidate = files[index + part];
+      if (candidate.role != sh::SHCBundleFileRole::Function ||
+          candidate.firstFunctionId != file.firstFunctionId ||
+          candidate.lastFunctionId != file.firstFunctionId ||
+          candidate.functionCount != 1 ||
+          candidate.functionFragmentCount != file.functionFragmentCount ||
+          candidate.functionFragmentIndex != part ||
+          (candidate.oversize &&
+           candidate.oversizeReason !=
+               sh::SHCBundleOversizeReason::SingleInstruction) ||
+          (!candidate.oversize &&
+           candidate.oversizeReason != sh::SHCBundleOversizeReason::None)) {
+        llvh::errs() << "Static Hermes emitted invalid function fragments\n";
+        return false;
+      }
+    }
+    nextFunctionId = file.firstFunctionId + 1;
+    index += file.functionFragmentCount;
+  }
+  if (nextFunctionId != static_cast<uint32_t>(M.size())) {
+    llvh::errs() << "Static Hermes emitted incomplete function shard coverage\n";
+    return false;
+  }
+
+  std::vector<BundleFileIdentity> identities;
+  identities.reserve(files.size());
+  for (const auto &file : files) {
+    llvh::SmallString<128> fullPath(outputDirectory);
+    llvh::sys::path::append(fullPath, file.path);
+    auto identity = identifyBundleFile(fullPath);
+    if (!identity)
+      return false;
+    identities.push_back(std::move(*identity));
+  }
+
+  OutputStream manifest;
+  if (!manifest.open(outputFilename, llvh::sys::fs::F_None))
+    return false;
+  auto &OS = manifest.os();
+  const auto emitCommonFields = [&](size_t index) {
+    const auto &file = files[index];
+    const auto &identity = identities[index];
+    OS << "\"path\":\"" << file.path << "\",\"role\":\""
+       << bundleFileRoleName(file.role) << "\",\"sha256\":\""
+       << identity.sha256 << "\",\"size\":" << identity.size;
+  };
+  OS << "{\"header\":{";
+  emitCommonFields(0);
+  OS << "},\"kind\":\"static-hermes-c-bundle-v1\",\"schemaVersion\":1,"
+        "\"translationUnits\":[";
+  for (size_t index = 1; index < files.size(); ++index) {
+    if (index != 1)
+      OS << ',';
+    OS << '{';
+    if (files[index].role == sh::SHCBundleFileRole::Function) {
+      if (files[index].cOptimizationLevel ==
+          sh::SHCBundleCOptimizationLevel::O0) {
+        OS << "\"cOptimizationLevel\":0,";
+      }
+      OS << "\"firstFunctionId\":" << files[index].firstFunctionId
+         << ",\"functionCount\":" << files[index].functionCount;
+      if (files[index].functionFragmentCount != 0) {
+        OS << ",\"functionFragmentCount\":"
+           << files[index].functionFragmentCount
+           << ",\"functionFragmentIndex\":"
+           << files[index].functionFragmentIndex;
+      }
+      OS << ",\"lastFunctionId\":" << files[index].lastFunctionId
+         << ",\"oversize\":" << (files[index].oversize ? "true" : "false")
+         << ',';
+      if (files[index].oversize) {
+        OS << "\"oversizeReason\":\""
+           << bundleOversizeReasonName(files[index].oversizeReason) << "\",";
+      }
+    }
+    emitCommonFields(index);
+    if (files[index].role == sh::SHCBundleFileRole::Function)
+      OS << ",\"targetBytes\":" << files[index].targetBytes;
+    OS << '}';
+  }
+  OS << "]}\n";
+  return manifest.close();
 }
 
 /// Configuration for invoking the C compiler.
@@ -535,6 +892,10 @@ bool shermesCompile(
     return compileToDump(context, M, params, outputFilename);
   }
   if (outputLevel == OutputLevelKind::C) {
+    if (params.genOptions.emitCBundle) {
+      return compileToCBundle(
+          context, M, params, inputFilename, outputFilename);
+    }
     return compileToC(context, M, params, inputFilename, outputFilename);
   }
   if (outputLevel <= OutputLevelKind::Executable) {
