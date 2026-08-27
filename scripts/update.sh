@@ -40,6 +40,19 @@ source_common_dir="$(git -C "$source_worktree" rev-parse --path-format=absolute 
   echo "FATAL: source worktree belongs to a different repository" >&2; exit 1;
 }
 
+source_branch="$(git -C "$source_worktree" symbolic-ref --quiet --short HEAD)" || {
+  echo "FATAL: source worktree must have $SOURCE_BRANCH checked out" >&2; exit 1;
+}
+[[ "$source_branch" == "$SOURCE_BRANCH" ]] || {
+  echo "FATAL: source worktree branch $source_branch does not equal required branch $SOURCE_BRANCH" >&2; exit 1;
+}
+source_tracking_ref="$(git -C "$source_worktree" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null)" || {
+  echo "FATAL: source branch $SOURCE_BRANCH must track a remote $SOURCE_BRANCH branch" >&2; exit 1;
+}
+[[ "${source_tracking_ref##*/}" == "$SOURCE_BRANCH" ]] || {
+  echo "FATAL: source branch $SOURCE_BRANCH tracks $source_tracking_ref instead of a remote $SOURCE_BRANCH branch" >&2; exit 1;
+}
+
 tip="$(git -C "$source_worktree" rev-parse HEAD)"
 case "$UPSTREAM_MODE" in
   merge-base) base="$(git -C "$source_worktree" merge-base "$UPSTREAM_REF" "$tip")" ;;
