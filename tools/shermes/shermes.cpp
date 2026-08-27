@@ -127,6 +127,16 @@ static cl::opt<bool> SmallC(
     cl::init(false),
     cl::desc("Optimize output native code for size instead of performance"));
 
+static cl::opt<bool> EmitCBundle(
+    "Xemit-c-bundle",
+    cl::init(false),
+    cl::desc("Emit generated C as a manifest and multiple translation units"));
+
+static cl::opt<unsigned> EmitCShardSize(
+    "Xemit-c-shard-size",
+    cl::init(2 * 1024 * 1024),
+    cl::desc("Target function-body bytes per generated C translation unit"));
+
 cl::opt<DebugLevel> DebugInfoLevel(
     cl::desc("Choose debug info level:"),
     cl::init(DebugLevel::g0),
@@ -915,6 +925,14 @@ bool compileFromCommandLineOptions() {
     llvh::errs() << "Error: unused exec arguments\n";
     return false;
   }
+  if (cli::EmitCBundle && cli::OutputLevel != OutputLevelKind::C) {
+    llvh::errs() << "Error: -Xemit-c-bundle requires -emit-c.\n";
+    return false;
+  }
+  if (cli::EmitCBundle && cli::EmitCShardSize == 0) {
+    llvh::errs() << "Error: -Xemit-c-shard-size must be positive.\n";
+    return false;
+  }
   if (!cli::ExportedUnit.empty()) {
     if (cli::OutputLevel == OutputLevelKind::Run ||
         cli::OutputLevel == OutputLevelKind::Executable) {
@@ -1063,6 +1081,8 @@ bool compileFromCommandLineOptions() {
     genOptions.unitName = cli::ExportedUnit;
 
   genOptions.smallC = cli::SmallC;
+  genOptions.emitCBundle = cli::EmitCBundle;
+  genOptions.cBundleShardSize = cli::EmitCShardSize;
 
   genOptions.emitSourceLocations =
       cli::DumpSourceLocation != LocationDumpMode::None;

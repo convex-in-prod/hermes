@@ -858,6 +858,7 @@ if(HERMES_ENABLE_TEST_SUITE)
   endif()
 
   set(HERMES_LIT_TEST_PARAMS_BASE
+    c_compiler=${CMAKE_C_COMPILER}
     test_exec_root=${CMAKE_CURRENT_BINARY_DIR}/test
     unittests_dir=${CMAKE_CURRENT_BINARY_DIR}/unittests
     debugger_enabled=${HERMES_ENABLE_DEBUGGER}
@@ -882,6 +883,9 @@ if(HERMES_ENABLE_TEST_SUITE)
     asan=${HERMES_ENABLE_ADDRESS_SANITIZER}
     coverage=${coverage_directory}
     shermes=${HERMES_TOOLS_OUTPUT_DIR}/shermes
+    shermes_console_lib_dir=${CMAKE_CURRENT_BINARY_DIR}/tools/shermes
+    hermesvm_lib_dir=${CMAKE_CURRENT_BINARY_DIR}/lib
+    static_h_config=${CMAKE_CURRENT_BINARY_DIR}/lib/config
     check_native_stack=${HERMES_CHECK_NATIVE_STACK}
     unicode_lite=${HERMES_UNICODE_LITE}
     core_extensions_enabled=${HERMES_ENABLE_CORE_EXTENSIONS}
