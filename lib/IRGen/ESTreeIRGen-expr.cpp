@@ -207,7 +207,7 @@ Value *ESTreeIRGen::_genExpressionImpl(
   }
 
   if (auto *classExpr = llvh::dyn_cast<ESTree::ClassExpressionNode>(expr)) {
-    return genLegacyClassExpression(classExpr, nameHint);
+    return genClassExpression(classExpr, nameHint);
   }
 
   if (auto *ICK = llvh::dyn_cast<ESTree::ImplicitCheckedCastNode>(expr)) {
@@ -1119,6 +1119,19 @@ sema::Decl *ESTreeIRGen::getTypedMemberExpressionDeclIfExists(
 
   sema::Decl *decl = nullptr;
   if (auto *id = llvh::dyn_cast<ESTree::IdentifierNode>(mem->_property)) {
+    if (auto *consType =
+            llvh::dyn_cast<flow::ClassConstructorType>(objTypeInfo)) {
+      auto *classType = llvh::cast<flow::ClassType>(
+          consType->getClassType()->info);
+      if (auto *staticType = classType->getStaticObjectTypeInfo();
+          staticType && staticType->hasComputedMethods()) {
+        return nullptr;
+      }
+    } else {
+      auto *classType = llvh::cast<flow::ClassType>(objTypeInfo);
+      if (classType->getHomeObjectTypeInfo()->hasComputedMethods())
+        return nullptr;
+    }
     decl = semCtx_.getExpressionDecl(id);
   } else if (
       auto *pn = llvh::dyn_cast<ESTree::PrivateNameNode>(mem->_property)) {
@@ -1229,6 +1242,13 @@ ESTreeIRGen::MemberExpressionResult ESTreeIRGen::emitMemberLoad(
       auto *classTypeInfo =
           llvh::cast<flow::ClassType>(consType->getClassType()->info);
       if (auto *staticInfo = classTypeInfo->getStaticObjectTypeInfo()) {
+        if (staticInfo->hasComputedMethods() &&
+            llvh::isa<ESTree::IdentifierNode>(mem->_property)) {
+          auto *load = Builder.createLoadPropertyInst(baseValue, propValue);
+          load->setType(
+              flowTypeToIRType(flowContext_.getNodeTypeOrAny(mem)));
+          return MemberExpressionResult{load, nullptr, baseValue};
+        }
         auto optField = findFieldForMemberProp(mem, staticInfo);
         if (optField && optField->getField()->hasGetter()) {
           const auto *field = optField->getField();
@@ -1342,6 +1362,12 @@ ESTreeIRGen::MemberExpressionResult ESTreeIRGen::emitMemberLoad(
       assert(
           optMethodLookup && "must have typechecked as either method or field");
       const auto *field = optMethodLookup->getField();
+
+      if (classType->getHomeObjectTypeInfo()->hasComputedMethods()) {
+        auto *load = Builder.createLoadPropertyInst(baseValue, propValue);
+        load->setType(flowTypeToIRType(flowContext_.getNodeTypeOrAny(mem)));
+        return MemberExpressionResult{load, nullptr, baseValue};
+      }
 
       // Getter: load closure from Variable, call it, return result.
       if (field->hasGetter()) {
@@ -1612,14 +1638,18 @@ void ESTreeIRGen::emitMemberStore(
       auto *classTypeInfo =
           llvh::cast<flow::ClassType>(consType->getClassType()->info);
       if (auto *staticInfo = classTypeInfo->getStaticObjectTypeInfo()) {
-        auto optField = findFieldForMemberProp(mem, staticInfo);
-        if (optField && optField->getField()->hasSetter()) {
-          const auto *field = optField->getField();
-          auto *setterKeyId =
-              ESTree::getPropertyIdentifier(field->setterMethod->_key);
-          sema::Decl *decl = semCtx_.getExpressionDecl(setterKeyId);
-          emitTypedSetterCall(decl, Builder.getLiteralUndefined(), storedValue);
-          return;
+        if (!staticInfo->hasComputedMethods() ||
+            llvh::isa<ESTree::PrivateNameNode>(mem->_property)) {
+          auto optField = findFieldForMemberProp(mem, staticInfo);
+          if (optField && optField->getField()->hasSetter()) {
+            const auto *field = optField->getField();
+            auto *setterKeyId =
+                ESTree::getPropertyIdentifier(field->setterMethod->_key);
+            sema::Decl *decl = semCtx_.getExpressionDecl(setterKeyId);
+            emitTypedSetterCall(
+                decl, Builder.getLiteralUndefined(), storedValue);
+            return;
+          }
         }
       }
     }
@@ -1629,14 +1659,22 @@ void ESTreeIRGen::emitMemberStore(
           flowContext_.getNodeTypeOrAny(mem->_object)->info)) {
     if (!mem->_computed) {
       // Accessor setters are stored as methods in the home object.
-      auto optMethod =
-          findFieldForMemberProp(mem, classType->getHomeObjectTypeInfo());
-      if (optMethod && optMethod->getField()->hasSetter()) {
-        const auto *field = optMethod->getField();
-        auto *setterKeyId =
-            ESTree::getPropertyIdentifier(field->setterMethod->_key);
-        sema::Decl *decl = semCtx_.getExpressionDecl(setterKeyId);
-        emitTypedSetterCall(decl, baseValue, storedValue);
+      auto *homeType = classType->getHomeObjectTypeInfo();
+      const bool isPrivate =
+          llvh::isa<ESTree::PrivateNameNode>(mem->_property);
+      if (!homeType->hasComputedMethods() || isPrivate) {
+        auto optMethod = findFieldForMemberProp(mem, homeType);
+        if (optMethod && optMethod->getField()->hasSetter()) {
+          const auto *field = optMethod->getField();
+          auto *setterKeyId =
+              ESTree::getPropertyIdentifier(field->setterMethod->_key);
+          sema::Decl *decl = semCtx_.getExpressionDecl(setterKeyId);
+          emitTypedSetterCall(decl, baseValue, storedValue);
+          return;
+        }
+      }
+      if (homeType->hasComputedMethods() && !isPrivate) {
+        Builder.createStorePropertyInst(storedValue, baseValue, propValue);
         return;
       }
       emitTypedFieldStore(classType, mem->_property, baseValue, storedValue);
@@ -3171,7 +3209,9 @@ Value *ESTreeIRGen::genNewExpr(ESTree::NewExpressionNode *N) {
         classType,
         proto,
         /* skipPrivateFields */ false,
-        /* propertiesEnumerable */ true);
+        /* propertiesEnumerable */ true,
+        /* allowDynamicProperties */ false,
+        /* emittedMethodFunctions */ nullptr);
 
     // Call the constructor, if necessary. There is always a constructor,
     // either explicit or implicit. We must invoke it if it has an explicit
