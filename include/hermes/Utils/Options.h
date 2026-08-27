@@ -10,6 +10,8 @@
 
 #include "llvh/ADT/StringRef.h"
 
+#include <cstdint>
+
 namespace hermes {
 
 enum OutputFormatKind {
@@ -58,6 +60,16 @@ struct BytecodeGenerationOptions {
   /// Whether the SH backend should emit small C code. If false, will inline
   /// more fast paths.
   bool smallC = false;
+
+  /// Whether the SH backend should emit a manifest and multiple C translation
+  /// units instead of one C file.
+  bool emitCBundle = false;
+
+  /// Target number of generated function-body bytes per C translation unit.
+  /// Large straight-line functions may be divided into C helpers. Other
+  /// functions larger than this target are emitted in their own translation
+  /// unit.
+  uint64_t cBundleShardSize = 2 * 1024 * 1024;
 
   /// Whether to strip the debug info in the bytecode binary.
   bool stripDebugInfoSection = false;
