@@ -32,6 +32,12 @@ SerialExecutor::~SerialExecutor() {
 }
 
 void SerialExecutor::add(llvh::unique_function<void()> task) {
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  // No worker exists in this configuration; keep task ownership on this thread.
+  task();
+  return;
+#endif
+
   std::unique_lock<std::mutex> lock(mutex_);
   // Draining inside ~SerialExecutor destroys tasks, and a task's captured
   // state may enqueue more work from its destructor. That is fine: the drain

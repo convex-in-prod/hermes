@@ -123,6 +123,7 @@ class SerialExecutor {
 
   /// Push a task to the back of the queue, lazily creating the worker thread if
   /// it does not exist.
+  /// Single-threaded Emscripten instead runs and destroys the task inline.
   ///
   /// Ownership of \p task transfers to the queue before this returns, so the
   /// task and everything it captures are destroyed on the worker thread after
