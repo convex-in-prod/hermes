@@ -19,6 +19,9 @@ the same repository, derives the upstream base from `upstream/static_h`,
 regenerates the complete series, applies every patch to a temporary index, and
 verifies that the resulting tree equals the source tree:
 
+Configure the `upstream` remote to point at `facebook/hermes` and fetch its
+`static_h` branch before updating the snapshot.
+
 ```sh
 ./scripts/update.sh /path/to/hermes-main-worktree
 ./scripts/update.sh --push convex-in-prod /path/to/hermes-main-worktree
