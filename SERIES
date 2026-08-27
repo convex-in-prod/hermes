@@ -4,3 +4,4 @@
 0003-StaticH-emit-sharded-C-bundles.patch cb4b29e059bde2d668a9840f059bc01add9027c8
 0004-Flow-support-typed-class-expressions-and-computed-me.patch b4ecb1511ef3f882eb1018755844c5bcb9aea2e2
 0005-StaticH-fix-typed-string-and-FastArray-builtins.patch a331a1a2349af533575c5a8c48f7d1be6cccca44
+0006-Docs-describe-Static-Hermes-fork-branches.patch b4f7e9232f3eb9282ad00785beb690ad00950cc3

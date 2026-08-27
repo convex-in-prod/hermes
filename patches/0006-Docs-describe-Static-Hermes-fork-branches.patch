@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Thu, 27 Aug 2026 13:52:31 +0800
+Subject: [PATCH 6/6] Docs: describe Static Hermes fork branches
+
+Document the mirrored static_h base, downstream main branch, and generated patch-history workflow for maintainers and upstream reviewers.
+---
+ README.md | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/README.md b/README.md
+index 769386ebde68dbd79cb1c221752d7c99ce2929ab..4e1a51d165cd3f97f147f649d7b51d384b71c3d6 100644
+--- a/README.md
++++ b/README.md
+@@ -6,6 +6,21 @@
+ 
+ Hermes is a JavaScript engine optimized for fast start-up of [React Native](https://reactnative.dev/) apps. It features ahead-of-time static optimization and compact bytecode.
+ 
++## Downstream static_h fork
++
++This fork keeps the upstream `static_h` branch mirrored and maintains its
++downstream changes on `main`. The downstream series targets reproducible
++Static Hermes C-bundle builds and compatibility needed by self-hosted
++deployments on constrained hosts. Changes are kept in small commits with
++focused tests so isolated fixes can be proposed upstream independently.
++
++The `patch-history` orphan branch is the applyable record of the current train.
++It records the exact upstream base, source tip, generated patches, and result
++tree. Use its `scripts/update.sh` before and after a rebase or amended source
++commit, and `scripts/apply.sh` to reconstruct the train on the recorded
++upstream checkout. The source branch remains the authoritative working tree;
++the history branch is generated verification data.
++
+ If you're only interested in using pre-built Hermes in a new or existing React Native app, you do not need to follow this guide or have direct access to the Hermes source. Instead, just follow [these instructions to enable Hermes](https://reactnative.dev/docs/hermes).
+ 
+ > Noted that each Hermes release is aimed at a specific RN version. The rule of thumb is to always follow [Hermes releases](https://github.com/facebook/hermes/releases) strictly. Version mismatch can result in instant crash of your apps in the worst case scenario.

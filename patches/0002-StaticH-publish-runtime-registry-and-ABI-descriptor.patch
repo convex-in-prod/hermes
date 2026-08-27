@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Thu, 27 Aug 2026 13:49:27 +0800
-Subject: [PATCH 2/5] StaticH: publish runtime registry and ABI descriptor
+Subject: [PATCH 2/6] StaticH: publish runtime registry and ABI descriptor
 
 Expose a bounded application-unit registry and an explicit descriptor for every generated/runtime layout used by Static Hermes. Validate the descriptor at unit initialization and cover capacity and mismatch behavior with VM runtime tests.
 ---

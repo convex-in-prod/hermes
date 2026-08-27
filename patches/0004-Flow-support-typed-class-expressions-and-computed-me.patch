@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Thu, 27 Aug 2026 13:49:45 +0800
-Subject: [PATCH 4/5] Flow: support typed class expressions and computed
+Subject: [PATCH 4/6] Flow: support typed class expressions and computed
  methods
 
 Generate typed class expressions through the class pipeline, evaluate computed keys once in source order, preserve home-object semantics, and keep dynamic property access sound when computed methods can collide with named members. Validate supported behavior and explicit unsupported combinations in Flow and Hermes tests.

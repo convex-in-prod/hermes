@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Thu, 27 Aug 2026 13:49:20 +0800
-Subject: [PATCH 1/5] Support: run serial tasks inline on single-threaded
+Subject: [PATCH 1/6] Support: run serial tasks inline on single-threaded
  Emscripten
 
 Avoid creating the executor thread when Emscripten is built without pthreads. Running the task inline preserves SerialExecutor ordering while allowing the single-threaded runtime to complete finalizers.

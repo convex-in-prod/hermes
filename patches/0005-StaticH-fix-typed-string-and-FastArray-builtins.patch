@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Thu, 27 Aug 2026 13:49:51 +0800
-Subject: [PATCH 5/5] StaticH: fix typed string and FastArray builtins
+Subject: [PATCH 5/6] StaticH: fix typed string and FastArray builtins
 
 Expose String.prototype.charCodeAt in the typed library and give FastArray a dedicated prototype with the standard iterator when values cross into dynamic JavaScript. Add semantic and execution coverage for both surfaces.
 ---

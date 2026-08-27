@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Thu, 27 Aug 2026 13:49:36 +0800
-Subject: [PATCH 3/5] StaticH: emit sharded C bundles
+Subject: [PATCH 3/6] StaticH: emit sharded C bundles
 
 Add an authenticated C-bundle output mode with deterministic manifests, metadata, function shards, per-unit optimization policy, and safe straight-line outlining for oversized functions. Expose the mode through shermes and lit, and exercise manifest integrity, shard invariants, compilation, and execution.
 ---
