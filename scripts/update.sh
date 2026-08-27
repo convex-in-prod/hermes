@@ -47,10 +47,10 @@ source_branch="$(git -C "$source_worktree" symbolic-ref --quiet --short HEAD)" |
   echo "FATAL: source worktree branch $source_branch does not equal required branch $SOURCE_BRANCH" >&2; exit 1;
 }
 source_tracking_ref="$(git -C "$source_worktree" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null)" || {
-  echo "FATAL: source branch $SOURCE_BRANCH must track a remote $SOURCE_BRANCH branch" >&2; exit 1;
+  echo "FATAL: source branch $SOURCE_BRANCH must track $SOURCE_UPSTREAM_REF" >&2; exit 1;
 }
-[[ "${source_tracking_ref##*/}" == "$SOURCE_BRANCH" ]] || {
-  echo "FATAL: source branch $SOURCE_BRANCH tracks $source_tracking_ref instead of a remote $SOURCE_BRANCH branch" >&2; exit 1;
+[[ "$source_tracking_ref" == "$SOURCE_UPSTREAM_REF" ]] || {
+  echo "FATAL: source branch $SOURCE_BRANCH tracks $source_tracking_ref instead of $SOURCE_UPSTREAM_REF" >&2; exit 1;
 }
 
 tip="$(git -C "$source_worktree" rev-parse HEAD)"
