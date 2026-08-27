@@ -925,6 +925,11 @@ class ClassType : public TypeWithId {
   /// fieldNameMap_.size().
   size_t numLayoutSlots_ = 0;
 
+  /// Whether this object or an object in its prototype chain can receive
+  /// computed class methods. Named method access must remain dynamic when a
+  /// computed key can replace the corresponding property.
+  bool hasComputedMethods_ = false;
+
  public:
   explicit ClassType(
       size_t id,
@@ -1018,6 +1023,16 @@ class ClassType : public TypeWithId {
   size_t getNumLayoutSlots() const {
     assert(isInitialized());
     return numLayoutSlots_;
+  }
+
+  bool hasComputedMethods() const {
+    assert(isInitialized());
+    return hasComputedMethods_;
+  }
+
+  void setHasComputedMethods() {
+    assert(isInitialized());
+    hasComputedMethods_ = true;
   }
 
   /// \return the type arguments, empty if not a generic specialization.

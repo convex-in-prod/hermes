@@ -1261,7 +1261,10 @@ void ESTreeIRGen::emitFunctionEpilogue(Value *returnValue) {
 
 Function *ESTreeIRGen::genFieldInitFunction() {
   const auto &typedClassContext = curFunction()->typedClassContext;
-  ESTree::ClassDeclarationNode *classNode = typedClassContext.node;
+  ESTree::ClassLikeNode *classNode = typedClassContext.node;
+  llvh::StringRef className = typedClassContext.name.isValid()
+      ? typedClassContext.name.str()
+      : llvh::StringRef{};
   sema::FunctionInfo *initFuncInfo =
       ESTree::getDecoration<ESTree::ClassLikeDecoration>(classNode)
           ->instanceElementsInitFunctionInfo;
@@ -1276,7 +1279,7 @@ Function *ESTreeIRGen::genFieldInitFunction() {
 
   auto initFunc = llvh::cast<Function>(Builder.createFunction(
       (llvh::Twine("<instance_members_initializer:") +
-       typedClassContext.type->getClassName().str() + ">")
+       className + ">")
           .str(),
       Function::DefinitionKind::ES5Function,
       true /*strictMode*/));
@@ -1303,8 +1306,7 @@ Function *ESTreeIRGen::genFieldInitFunction() {
         DoEmitDeclarations::No,
         parentScope);
 
-    auto *classBody =
-        llvh::cast<ESTree::ClassBodyNode>(typedClassContext.node->_body);
+    auto *classBody = ESTree::getClassBody(typedClassContext.node);
     for (ESTree::Node &it : classBody->_body) {
       if (auto *prop = llvh::dyn_cast<ESTree::ClassPropertyNode>(&it)) {
         // Skip static fields.
@@ -1334,6 +1336,9 @@ void ESTreeIRGen::emitCreateTypedFieldInitFunction() {
   }
 
   auto *classType = curFunction()->typedClassContext.type;
+  llvh::StringRef className = curFunction()->typedClassContext.name.isValid()
+      ? curFunction()->typedClassContext.name.str()
+      : llvh::StringRef{};
   ClassFieldInitInfo &classInfo = classFieldInitInfo_[classType];
 
   classInfo.fieldInitFunction = initFunc;
@@ -1342,8 +1347,7 @@ void ESTreeIRGen::emitCreateTypedFieldInitFunction() {
       Builder.createCreateFunctionInst(curFunction()->curScope(), initFunc);
   Variable *fieldInitFuncVar = Builder.createVariable(
       curFunction()->curScope()->getVariableScope(),
-      (llvh::Twine("<fieldInitFuncVar:") + classType->getClassName().str() +
-       ">"),
+      (llvh::Twine("<fieldInitFuncVar:") + className + ">"),
       Type::createObject(),
       /* hidden */ true);
   Builder.createStoreFrameInst(
