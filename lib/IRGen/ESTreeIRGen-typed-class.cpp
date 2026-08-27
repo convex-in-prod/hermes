@@ -30,20 +30,63 @@ void ESTreeIRGen::genClassDeclaration(ESTree::ClassDeclarationNode *node) {
     return;
   }
 
+  genTypedClassLike(node, consType, decl, Identifier{});
+}
+
+Value *ESTreeIRGen::genClassExpression(
+    ESTree::ClassExpressionNode *node,
+    Identifier nameHint) {
+  auto *consType = llvh::dyn_cast<flow::ClassConstructorType>(
+      flowContext_.getNodeTypeOrAny(node)->info);
+  if (!consType)
+    return genLegacyClassExpression(node, nameHint);
+
+  emitScopeDeclarations(node->getScope());
+  sema::Decl *constructorDecl = nullptr;
+  if (auto *id = ESTree::getClassID(node))
+    constructorDecl = semCtx_.getExpressionDecl(id);
+  return genTypedClassLike(node, consType, constructorDecl, nameHint);
+}
+
+Value *ESTreeIRGen::genTypedClassLike(
+    ESTree::ClassLikeNode *node,
+    flow::ClassConstructorType *consType,
+    sema::Decl *constructorDecl,
+    Identifier nameHint) {
   flow::ClassType *classType = consType->getClassTypeInfo();
+  Identifier consName = classType->getClassName().isValid()
+      ? classType->getClassName()
+      : nameHint;
 
   Value *superClass = nullptr;
-  if (node->_superClass) {
-    superClass = genExpression(node->_superClass);
+  if (ESTree::getSuperClass(node)) {
+    superClass = genExpression(ESTree::getSuperClass(node));
   }
 
   // Push a new typed class context.
   TypedClassContext savedClsCtx = curFunction()->typedClassContext;
-  curFunction()->typedClassContext = {node, classType};
+  curFunction()->typedClassContext = {node, classType, consName};
   // Pop the class context on function exit.
   auto popClsContext = llvh::make_scope_exit([&savedClsCtx, this]() {
     curFunction()->typedClassContext = savedClsCtx;
   });
+
+  auto *classBody = ESTree::getClassBody(node);
+
+  // Computed method keys are evaluated in class element order and converted
+  // to property keys exactly once. The methods themselves are installed after
+  // the constructor and prototype objects have been created.
+  llvh::DenseMap<ESTree::MethodDefinitionNode *, Value *> computedMethodKeys;
+  bool hasComputedInstanceMethods = false;
+  for (ESTree::Node &elem : classBody->_body) {
+    auto *method = llvh::dyn_cast<ESTree::MethodDefinitionNode>(&elem);
+    if (!method || !method->_computed)
+      continue;
+    if (!method->_static)
+      hasComputedInstanceMethods = true;
+    computedMethodKeys.try_emplace(
+        method, Builder.createToPropertyKeyInst(genExpression(method->_key)));
+  }
 
   // Emit private methods as variables.
   for (auto &[name, idx] :
@@ -100,10 +143,13 @@ void ESTreeIRGen::genClassDeclaration(ESTree::ClassDeclarationNode *node) {
 
   // Emit static methods and fields as variables.
   auto *staticType = classType->getStaticObjectTypeInfo();
-  auto *classBody = llvh::cast<ESTree::ClassBodyNode>(node->_body);
+  const bool hasDynamicStaticMethods =
+      staticType && staticType->hasComputedMethods();
+  const bool delayStaticInitializers =
+      !computedMethodKeys.empty() || hasDynamicStaticMethods;
   for (ESTree::Node &elem : classBody->_body) {
     if (auto *method = llvh::dyn_cast<ESTree::MethodDefinitionNode>(&elem)) {
-      if (!method->_static)
+      if (!method->_static || method->_computed)
         continue;
       assert(staticType && "must have a staticType if there are static fields");
       ESTree::IdentifierNode *id;
@@ -168,12 +214,15 @@ void ESTreeIRGen::genClassDeclaration(ESTree::ClassDeclarationNode *node) {
           name,
           irType,
           /* hidden */ true);
-      Value *initValue = prop->_value
-          ? genExpression(prop->_value)
-          : getDefaultInitValue(optField->getField()->type);
-      Builder.createStoreFrameInst(curFunction()->curScope(), initValue, var);
       sema::Decl *decl = semCtx_.getExpressionDecl(id);
       setDeclData(decl, var);
+      if (!delayStaticInitializers) {
+        Value *initValue = prop->_value
+            ? genExpression(prop->_value)
+            : getDefaultInitValue(optField->getField()->type);
+        Builder.createStoreFrameInst(
+            curFunction()->curScope(), initValue, var);
+      }
     } else if (
         auto *prop = llvh::dyn_cast<ESTree::ClassPrivatePropertyNode>(&elem)) {
       if (!prop->_static)
@@ -189,12 +238,15 @@ void ESTreeIRGen::genClassDeclaration(ESTree::ClassDeclarationNode *node) {
           name,
           irType,
           /* hidden */ true);
-      Value *initValue = prop->_value
-          ? genExpression(prop->_value)
-          : getDefaultInitValue(optField->getField()->type);
-      Builder.createStoreFrameInst(curFunction()->curScope(), initValue, var);
       sema::Decl *decl = semCtx_.getExpressionDecl(id);
       setDeclData(decl, var);
+      if (!delayStaticInitializers) {
+        Value *initValue = prop->_value
+            ? genExpression(prop->_value)
+            : getDefaultInitValue(optField->getField()->type);
+        Builder.createStoreFrameInst(
+            curFunction()->curScope(), initValue, var);
+      }
     }
   }
 
@@ -205,16 +257,13 @@ void ESTreeIRGen::genClassDeclaration(ESTree::ClassDeclarationNode *node) {
 
   // Emit the explicit constructor, if present.
   Value *consFunction;
-  Identifier consName = classType->getClassName().isValid()
-      ? classType->getClassName()
-      : Identifier();
   if (ESTree::MethodDefinitionNode *consMethod = semCtx_.getConstructor(node)) {
     // Check that 'super()' call is the first statement in SH for derived
     // classes.
     // TODO: This is intentionally overly restrictive. In the future, we can
     // check that super() call happens prior to any function calls or 'this'
     // accesses.
-    if (node->_superClass) {
+    if (ESTree::getSuperClass(node)) {
       // Attempt to extract the super() call from the first statement of the
       // block.
       ESTree::NodeList &blockStmtBody =
@@ -248,14 +297,27 @@ void ESTreeIRGen::genClassDeclaration(ESTree::ClassDeclarationNode *node) {
     consFunction = genFunctionExpression(
         llvh::cast<ESTree::FunctionExpressionNode>(consMethod->_value),
         consName,
-        node->_superClass,
-        node->_superClass ? Function::DefinitionKind::ES6DerivedConstructor
-                          : Function::DefinitionKind::ES6BaseConstructor);
+        ESTree::getSuperClass(node),
+        ESTree::getSuperClass(node)
+            ? Function::DefinitionKind::ES6DerivedConstructor
+            : Function::DefinitionKind::ES6BaseConstructor);
   } else {
     // The constructor is implicit.
     consFunction = genTypedImplicitConstructor(consName, superClass);
   }
-  emitStore(consFunction, getDeclData(decl), true);
+  Variable *constructorVar;
+  if (constructorDecl) {
+    constructorVar = llvh::cast<Variable>(getDeclData(constructorDecl));
+    emitStore(consFunction, constructorVar, true);
+  } else {
+    constructorVar = Builder.createVariable(
+        curFunction()->curScope()->getVariableScope(),
+        Builder.createIdentifier("?class.constructor"),
+        Type::createObject(),
+        /* hidden */ true);
+    Builder.createStoreFrameInst(
+        curFunction()->curScope(), consFunction, constructorVar);
+  }
 
   // Create and populate the "prototype" property (vtable).
   // Must be done even if there are no methods to enable 'instanceof'.
@@ -270,15 +332,222 @@ void ESTreeIRGen::genClassDeclaration(ESTree::ClassDeclarationNode *node) {
     // instruction for class creation, but for now we need an object here
     // because we want to use PrLoad on it.
     vtable->setType(Type::createObject());
+  } else if (flowContext_.isArrayClassType(consType->getClassType())) {
+    // Typed arrays retain their specialized methods while inheriting standard
+    // array behavior, including iteration when they flow into dynamic code.
+    vtable = Builder.createLoadPropertyInst(
+        Builder.createTryLoadGlobalPropertyInst("Array"), "prototype");
+    vtable->setType(Type::createObject());
   } else {
     vtable = Builder.getLiteralNull();
   }
 
+  const bool hasDynamicInstanceMethods =
+      classType->getHomeObjectTypeInfo()->hasComputedMethods();
+  llvh::DenseMap<ESTree::MethodDefinitionNode *, Value *>
+      emittedMethodFunctions;
   auto *homeObject = emitTypedClassAllocation(
       classType->getHomeObjectTypeInfo(),
       vtable,
       /* skipPrivateFields */ true,
-      /* propertiesEnumerable */ false);
+      /* propertiesEnumerable */ false,
+      /* allowDynamicProperties */ hasDynamicInstanceMethods,
+      hasDynamicInstanceMethods ? &emittedMethodFunctions : nullptr);
+
+  // Store the home object before compiling computed methods so it can serve
+  // as their [[HomeObject]]. Check if a previous compilation (for example, a
+  // finally block) already created the variable.
+  Variable *homeObjectVar;
+  auto existingIt = classConstructors_.find(classType);
+  if (existingIt != classConstructors_.end()) {
+    homeObjectVar = existingIt->second.homeObjectVar;
+  } else {
+    homeObjectVar = Builder.createVariable(
+        curFunction()->curScope()->getVariableScope(),
+        Builder.createIdentifier(
+            llvh::Twine("?") +
+            (consName.isValid() ? consName.str() : llvh::StringRef("class")) +
+            ".prototype"),
+        flowTypeToIRType(classType->getHomeObjectType()),
+        /* hidden */ true);
+  }
+  Builder.createStoreFrameInst(
+      curFunction()->curScope(), homeObject, homeObjectVar);
+
+  auto loadStoredMethod = [this](ESTree::MethodDefinitionNode *method) {
+    auto *id = ESTree::getPropertyIdentifier(method->_key);
+    auto *methodDecl = semCtx_.getExpressionDecl(id);
+    assert(
+        methodDecl && methodDecl->customData &&
+        "stored method must have an associated variable");
+    return emitLoad(getDeclData(methodDecl), false);
+  };
+
+  // A computed method in a subclass can replace an inherited final method or
+  // accessor. Those methods normally exist only in scope variables, so expose
+  // them on the dynamic home object before applying this class's definitions.
+  if (hasComputedInstanceMethods) {
+    auto *homeType = classType->getHomeObjectTypeInfo();
+    for (const auto &[name, entry] : homeType->getFieldNameMap()) {
+      const auto *field = entry.getField();
+      if (entry.classType == homeType || !field->finalMethod)
+        continue;
+
+      auto *key = Builder.getLiteralString(name);
+      if (field->isAccessor()) {
+        Value *getter = Builder.getLiteralUndefined();
+        if (field->method)
+          getter = loadStoredMethod(field->method);
+        Value *setter = Builder.getLiteralUndefined();
+        if (field->setterMethod)
+          setter = loadStoredMethod(field->setterMethod);
+        Builder.createDefineOwnGetterSetterInst(
+            getter,
+            setter,
+            homeObject,
+            key,
+            IRBuilder::PropEnumerable::No);
+        continue;
+      }
+
+      if (field->isOverloaded()) {
+        for (const auto &[overloadMethod, overloadType] : field->overloads) {
+          if (llvh::isa<flow::GenericType>(overloadType->info))
+            continue;
+          Builder.createDefineOwnPropertyInst(
+              loadStoredMethod(overloadMethod),
+              homeObject,
+              key,
+              IRBuilder::PropEnumerable::No);
+        }
+        continue;
+      }
+
+      Builder.createDefineOwnPropertyInst(
+          loadStoredMethod(field->method),
+          homeObject,
+          key,
+          IRBuilder::PropEnumerable::No);
+    }
+  }
+
+  // Install methods in source order. Replaying named methods is necessary
+  // because a computed key can replace a named property in either direction.
+  for (ESTree::Node &elem : classBody->_body) {
+    auto *method = llvh::dyn_cast<ESTree::MethodDefinitionNode>(&elem);
+    if (!method || method->_kind == kw_.identConstructor ||
+        llvh::isa<ESTree::PrivateNameNode>(method->_key)) {
+      continue;
+    }
+
+    Value *key;
+    Value *function;
+    if (method->_computed) {
+      key = computedMethodKeys.lookup(method);
+      assert(key && "computed method key must have been evaluated");
+      function = genFunctionExpression(
+          llvh::cast<ESTree::FunctionExpressionNode>(method->_value),
+          Identifier{},
+          ESTree::getSuperClass(node),
+          Function::DefinitionKind::ES6Method,
+          method->_static ? constructorVar : homeObjectVar,
+          method);
+      genBuiltinCall(
+          BuiltinMethod::HermesBuiltin_setFunctionName,
+          {function, key, Builder.getLiteralNumber(0)});
+    } else {
+      if ((method->_static && !hasDynamicStaticMethods) ||
+          (!method->_static && !hasDynamicInstanceMethods)) {
+        continue;
+      }
+
+      auto *funcExpr =
+          llvh::cast<ESTree::FunctionExpressionNode>(method->_value);
+      if (funcExpr->_typeParameters)
+        continue;
+
+      auto *id = llvh::cast<ESTree::IdentifierNode>(method->_key);
+      key = Builder.getLiteralString(Identifier::getFromPointer(id->_name));
+      if (method->_static) {
+        function = loadStoredMethod(method);
+      } else {
+        auto optField = classType->getHomeObjectTypeInfo()->findPublicField(
+            Identifier::getFromPointer(id->_name));
+        assert(optField && "instance method must exist in home object type");
+        function = optField->getField()->finalMethod
+            ? loadStoredMethod(method)
+            : emittedMethodFunctions.lookup(method);
+        assert(function && "instance method closure must have been emitted");
+      }
+    }
+
+    Value *target = method->_static ? consFunction : homeObject;
+    if (method->_kind == kw_.identGet) {
+      Builder.createDefineOwnGetterSetterInst(
+          function,
+          Builder.getLiteralUndefined(),
+          target,
+          key,
+          IRBuilder::PropEnumerable::No);
+    } else if (method->_kind == kw_.identSet) {
+      Builder.createDefineOwnGetterSetterInst(
+          Builder.getLiteralUndefined(),
+          function,
+          target,
+          key,
+          IRBuilder::PropEnumerable::No);
+    } else {
+      Builder.createDefineOwnPropertyInst(
+          function, target, key, IRBuilder::PropEnumerable::No);
+    }
+  }
+
+  // Static field values are evaluated after every method has been installed.
+  // Their Variables and Decls were created in the earlier static-member pass,
+  // so initializers can refer to any static member of this class.
+  if (delayStaticInitializers) {
+    for (ESTree::Node &elem : classBody->_body) {
+      if (auto *prop = llvh::dyn_cast<ESTree::ClassPropertyNode>(&elem)) {
+        if (!prop->_static)
+          continue;
+        auto *id = llvh::cast<ESTree::IdentifierNode>(prop->_key);
+        Identifier name = Identifier::getFromPointer(id->_name);
+        auto optField = staticType->findPublicField(name);
+        assert(optField && "static field must exist in staticObjectType");
+        auto *var = llvh::cast<Variable>(
+            getDeclData(semCtx_.getExpressionDecl(id)));
+        Value *initValue = prop->_value
+            ? genExpression(prop->_value)
+            : getDefaultInitValue(optField->getField()->type);
+        Builder.createStoreFrameInst(
+            curFunction()->curScope(), initValue, var);
+        if (hasDynamicStaticMethods) {
+          Builder.createDefineOwnPropertyInst(
+              initValue,
+              consFunction,
+              Builder.getLiteralString(name),
+              IRBuilder::PropEnumerable::Yes);
+        }
+        continue;
+      }
+
+      auto *privateProp =
+          llvh::dyn_cast<ESTree::ClassPrivatePropertyNode>(&elem);
+      if (!privateProp || !privateProp->_static)
+        continue;
+      auto *id = llvh::cast<ESTree::IdentifierNode>(privateProp->_key);
+      Identifier name = Mod->getContext().getPrivateNameIdentifier(id->_name);
+      auto optField = staticType->findPrivateField(name);
+      assert(optField && "private static field must exist in staticObjectType");
+      auto *var = llvh::cast<Variable>(
+          getDeclData(semCtx_.getExpressionDecl(id)));
+      Value *initValue = privateProp->_value
+          ? genExpression(privateProp->_value)
+          : getDefaultInitValue(optField->getField()->type);
+      Builder.createStoreFrameInst(
+          curFunction()->curScope(), initValue, var);
+    }
+  }
 
   // Handle generic method specializations.
   // Compile each specialization, create a Variable, and store the closure.
@@ -307,26 +576,6 @@ void ESTreeIRGen::genClassDeclaration(ESTree::ClassDeclarationNode *node) {
     }
   }
 
-  // Store the home object in a variable so that we can reference it later,
-  // e.g. when we emit method calls. Check if we already have a cached entry
-  // (e.g., when recompiling a finally block) and reuse it.
-  Variable *homeObjectVar;
-  auto existingIt = classConstructors_.find(classType);
-  if (existingIt != classConstructors_.end()) {
-    // Reuse existing variable from previous compilation.
-    homeObjectVar = existingIt->second.homeObjectVar;
-  } else {
-    // First compilation: create new variable.
-    homeObjectVar = Builder.createVariable(
-        curFunction()->curScope()->getVariableScope(),
-        Builder.createIdentifier(
-            llvh::Twine("?") + classType->getClassName().str() + ".prototype"),
-        flowTypeToIRType(classType->getHomeObjectType()),
-        /* hidden */ true);
-  }
-  Builder.createStoreFrameInst(
-      curFunction()->curScope(), homeObject, homeObjectVar);
-
   // Check to make sure this is a valid class definition,
   // because there may have been errors.
   if (auto *createCallable =
@@ -353,6 +602,7 @@ void ESTreeIRGen::genClassDeclaration(ESTree::ClassDeclarationNode *node) {
       homeObject,
       consFunction,
       Builder.getLiteralString(kw_.identPrototype->str()));
+  return consFunction;
 }
 
 CreateFunctionInst *ESTreeIRGen::genTypedImplicitConstructor(
@@ -382,7 +632,7 @@ CreateFunctionInst *ESTreeIRGen::genTypedImplicitConstructor(
 
     // AST Node for the superClass, null if no superclass.
     ESTree::Node *superClassNode = superClass
-        ? curFunction()->typedClassContext.node->_superClass
+        ? ESTree::getSuperClass(curFunction()->typedClassContext.node)
         : nullptr;
 
     // Determine if the implicit constructor needs to emit a super() call.
@@ -491,8 +741,17 @@ Value *ESTreeIRGen::emitTypedClassAllocation(
     flow::ClassType *classType,
     Value *parent,
     bool skipPrivateFields,
-    bool propertiesEnumerable) {
+    bool propertiesEnumerable,
+    bool allowDynamicProperties,
+    llvh::DenseMap<ESTree::MethodDefinitionNode *, Value *>
+        *emittedMethodFunctions) {
   assert(parent && "parent must be specified");
+  assert(
+      (!allowDynamicProperties || !propertiesEnumerable) &&
+      "dynamic class properties are only supported on home objects");
+  assert(
+      (allowDynamicProperties || !emittedMethodFunctions) &&
+      "method closures are only needed for dynamic home objects");
   // TODO: should create a sealed object, etc.
   AllocTypedObjectInst::ObjectPropertyMap propMap{};
 
@@ -501,8 +760,14 @@ Value *ESTreeIRGen::emitTypedClassAllocation(
   // so we use getNumLayoutSlots() instead of getFieldNameMap().size().
   size_t numFields = classType->getNumLayoutSlots();
   propMap.resize(numFields);
-  auto addField = [this, &propMap, classType, parent](
-                      const flow::ClassType::FieldLookupEntry &entry) {
+  auto addField =
+      [this,
+       &propMap,
+       classType,
+       parent,
+       allowDynamicProperties,
+       emittedMethodFunctions](
+          const flow::ClassType::FieldLookupEntry &entry) {
     const flow::ClassType::Field &field = *entry.getField();
 
     // Verify that each layout slot is filled exactly once.
@@ -568,10 +833,13 @@ Value *ESTreeIRGen::emitTypedClassAllocation(
             llvh::cast<ESTree::FunctionExpressionNode>(field.method->_value),
             field.name);
         propMap[*field.layoutSlotIR] = {name, function};
+        if (emittedMethodFunctions) {
+          emittedMethodFunctions->try_emplace(field.method, function);
+        }
         if (auto *CFI = llvh::dyn_cast<CreateFunctionInst>(function)) {
           // If this field represents a non-overridden method, record the
           // IR function so we can populate the target of calls.
-          if (!field.overridden) {
+          if (!field.overridden && !allowDynamicProperties) {
             auto [it, success] = nonOverriddenMethods_.try_emplace(
                 &field, CFI->getFunctionCode());
             (void)it;
@@ -624,6 +892,19 @@ Value *ESTreeIRGen::emitTypedClassAllocation(
 
   if (propertiesEnumerable)
     return Builder.createAllocTypedObjectInst(propMap, parent);
+  if (allowDynamicProperties) {
+    // Typed objects have fixed hidden classes and are non-extensible at
+    // runtime. Build an ordinary object in the same slot order when computed
+    // methods need to be installed dynamically. PrLoad continues to use the
+    // statically assigned slots.
+    Value *object = Builder.createAllocObjectLiteralInst({}, parent);
+    for (const auto &[name, value] : propMap) {
+      assert(name && value && "class layout slot must be initialized");
+      Builder.createDefineOwnPropertyInst(
+          value, object, name, IRBuilder::PropEnumerable::No);
+    }
+    return object;
+  }
   return Builder.createAllocTypedNonEnumObjectInst(propMap, parent);
 }
 
