@@ -24,6 +24,14 @@ extern "C" {
 typedef struct SHUnit SHUnit;
 typedef struct SHLocals SHLocals;
 
+enum {
+  SH_UNIT_REGISTRY_RESERVED_SLOTS = 1,
+  SH_UNIT_REGISTRY_SHARED_SLOTS = 2,
+  SH_UNIT_REGISTRY_MAX_APPLICATION_UNITS = 1024,
+  SH_UNIT_REGISTRY_CAPACITY = SH_UNIT_REGISTRY_RESERVED_SLOTS +
+      SH_UNIT_REGISTRY_SHARED_SLOTS + SH_UNIT_REGISTRY_MAX_APPLICATION_UNITS,
+};
+
 /// This struct represents an element in the exception handler stack. This
 /// represents a try, and contains the information necessary to jump to its
 /// associated catch in the event of an exception.
@@ -73,8 +81,9 @@ typedef struct SHRuntime {
   uint8_t dummy;
 #endif
 
-  /// The active SHUnits in this runtime.
-  SHUnit *units[8];
+  /// The active SHUnits in this runtime. Slot zero is reserved, followed by
+  /// two shared runtime units and a bounded application-unit registry.
+  SHUnit *units[SH_UNIT_REGISTRY_CAPACITY];
 
   /// The current top of the exception handler stack.
   SHJmpBuf *shCurJmpBuf;

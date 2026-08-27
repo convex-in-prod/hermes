@@ -173,6 +173,97 @@ typedef struct SHLocals {
   SHLegacyValue locals[0];
 } SHLocals;
 
+/// Version for Static Hermes ABI contracts that are not represented by C
+/// structure layout. Increment this when changing value encodings, calling
+/// conventions, or other shared semantics without changing a field below.
+#define SH_STATIC_ABI_VERSION 1
+
+/// Every field shared between generated C and the runtime archive. Keeping the
+/// values in one list makes additions to this descriptor participate in both
+/// its declaration and initialization.
+#define SH_STATIC_ABI_DESCRIPTOR_FIELDS(V)                                   \
+  V(version, SH_STATIC_ABI_VERSION)                                          \
+  V(descriptor_size, sizeof(SHStaticABIDescriptor))                          \
+  V(legacy_value_size, sizeof(SHLegacyValue))                                \
+  V(compressed_pointer_size, sizeof(SHCompressedPointer))                    \
+  V(jmp_buf_size, sizeof(SHJmpBuf))                                          \
+  V(jmp_buf_prev_offset, offsetof(SHJmpBuf, prev))                           \
+  V(jmp_buf_storage_offset, offsetof(SHJmpBuf, buf))                         \
+  V(runtime_size, sizeof(SHRuntime))                                         \
+  V(runtime_units_offset, offsetof(SHRuntime, units))                        \
+  V(runtime_units_capacity, SH_UNIT_REGISTRY_CAPACITY)                       \
+  V(runtime_jmp_buf_offset, offsetof(SHRuntime, shCurJmpBuf))                 \
+  V(runtime_stack_pointer_offset, offsetof(SHRuntime, stackPointer))         \
+  V(runtime_stack_start_offset, offsetof(SHRuntime, registerStackStart))     \
+  V(runtime_stack_end_offset, offsetof(SHRuntime, registerStackEnd))         \
+  V(runtime_current_frame_offset, offsetof(SHRuntime, currentFrame))         \
+  V(runtime_locals_offset, offsetof(SHRuntime, shLocals))                    \
+  V(runtime_global_offset, offsetof(SHRuntime, global_))                     \
+  V(shape_table_entry_size, sizeof(SHShapeTableEntry))                       \
+  V(shape_table_key_offset, offsetof(SHShapeTableEntry, key_buffer_offset))  \
+  V(shape_table_count_offset, offsetof(SHShapeTableEntry, num_props))        \
+  V(source_location_size, sizeof(SHSrcLoc))                                  \
+  V(source_location_filename_offset, offsetof(SHSrcLoc, filename_idx))       \
+  V(source_location_line_offset, offsetof(SHSrcLoc, line))                   \
+  V(source_location_column_offset, offsetof(SHSrcLoc, column))               \
+  V(function_info_size, sizeof(SHNativeFuncInfo))                            \
+  V(function_info_name_offset, offsetof(SHNativeFuncInfo, name_index))       \
+  V(function_info_arg_count_offset, offsetof(SHNativeFuncInfo, arg_count))   \
+  V(unit_size, sizeof(SHUnit))                                               \
+  V(unit_index_offset, offsetof(SHUnit, index))                              \
+  V(unit_script_id_offset, offsetof(SHUnit, script_id))                      \
+  V(unit_num_symbols_offset, offsetof(SHUnit, num_symbols))                  \
+  V(unit_num_read_cache_offset,                                              \
+    offsetof(SHUnit, num_read_prop_cache_entries))                           \
+  V(unit_num_write_cache_offset,                                             \
+    offsetof(SHUnit, num_write_prop_cache_entries))                          \
+  V(unit_num_private_cache_offset,                                           \
+    offsetof(SHUnit, num_private_name_cache_entries))                        \
+  V(unit_ascii_pool_offset, offsetof(SHUnit, ascii_pool))                    \
+  V(unit_u16_pool_offset, offsetof(SHUnit, u16_pool))                        \
+  V(unit_strings_offset, offsetof(SHUnit, strings))                          \
+  V(unit_symbols_offset, offsetof(SHUnit, symbols))                          \
+  V(unit_write_cache_offset, offsetof(SHUnit, write_prop_cache))             \
+  V(unit_read_cache_offset, offsetof(SHUnit, read_prop_cache))               \
+  V(unit_private_cache_offset, offsetof(SHUnit, private_name_cache))         \
+  V(unit_object_key_buffer_offset, offsetof(SHUnit, obj_key_buffer))         \
+  V(unit_object_key_buffer_size_offset,                                      \
+    offsetof(SHUnit, obj_key_buffer_size))                                   \
+  V(unit_literal_value_buffer_offset,                                        \
+    offsetof(SHUnit, literal_val_buffer))                                    \
+  V(unit_literal_value_buffer_size_offset,                                   \
+    offsetof(SHUnit, literal_val_buffer_size))                               \
+  V(unit_shape_table_offset, offsetof(SHUnit, obj_shape_table))              \
+  V(unit_shape_table_count_offset, offsetof(SHUnit, obj_shape_table_count))  \
+  V(unit_object_class_cache_offset,                                          \
+    offsetof(SHUnit, object_literal_class_cache))                            \
+  V(unit_module_exports_offset, offsetof(SHUnit, moduleExports))             \
+  V(unit_source_locations_offset, offsetof(SHUnit, source_locations))        \
+  V(unit_source_locations_size_offset,                                       \
+    offsetof(SHUnit, source_locations_size))                                 \
+  V(unit_main_offset, offsetof(SHUnit, unit_main))                           \
+  V(unit_main_info_offset, offsetof(SHUnit, unit_main_info))                 \
+  V(unit_name_offset, offsetof(SHUnit, unit_name))                           \
+  V(unit_runtime_extension_offset, offsetof(SHUnit, runtime_ext))            \
+  V(locals_size, sizeof(SHLocals))                                           \
+  V(locals_prev_offset, offsetof(SHLocals, prev))                            \
+  V(locals_count_offset, offsetof(SHLocals, count))                          \
+  V(locals_unit_offset, offsetof(SHLocals, unit))                            \
+  V(locals_source_location_offset, offsetof(SHLocals, src_location_idx))     \
+  V(locals_values_offset, offsetof(SHLocals, locals))
+
+typedef struct SHStaticABIDescriptor {
+#define SH_STATIC_ABI_DECLARE_FIELD(name, value) uint32_t name;
+  SH_STATIC_ABI_DESCRIPTOR_FIELDS(SH_STATIC_ABI_DECLARE_FIELD)
+#undef SH_STATIC_ABI_DECLARE_FIELD
+} SHStaticABIDescriptor;
+
+#define SH_STATIC_ABI_INITIALIZE_FIELD(name, value) (uint32_t)(value),
+#define SH_STATIC_ABI_DESCRIPTOR_INITIALIZER                              \
+  {                                                                      \
+    SH_STATIC_ABI_DESCRIPTOR_FIELDS(SH_STATIC_ABI_INITIALIZE_FIELD)       \
+  }
+
 /// Utility to concatenate a prefix with HERMESVM_MODEL.
 #define _HERMESVM_JOIN_TOKENS(x, y) _HERMESVM_JOIN_HELPER(x, y)
 /// This helper is needed due to how the preprocessor works.
@@ -183,6 +274,17 @@ typedef struct SHLocals {
 
 /// A dummy export to ensure correct library is linked.
 SHERMES_EXPORT void _SH_MODEL(void);
+
+/// Descriptor compiled into the runtime library. It is public so build tools
+/// can include the Static Hermes ABI in artifact identity.
+extern SHERMES_EXPORT const SHStaticABIDescriptor _sh_static_abi_descriptor;
+
+/// Abort unless \p expected exactly matches the descriptor compiled into the
+/// runtime library. Passing the caller's descriptor size lets a newer runtime
+/// reject an older, shorter descriptor before reading beyond it.
+SHERMES_EXPORT void _sh_check_abi(
+    const SHStaticABIDescriptor *expected,
+    uint32_t expectedSize);
 
 #ifndef HERMES_IS_MOBILE_BUILD
 /// Parse the command line flags, if provided. If not provided, the VM command

@@ -14,12 +14,65 @@
 #include "hermes/VM/StaticHUtils.h"
 
 #include <cstdarg>
+#include <cstdio>
 
 using namespace hermes;
 using namespace hermes::vm;
 
 static void sh_unit_init_symbols(Runtime &runtime, SHUnit *unit);
 static SHLegacyValue sh_unit_run(SHRuntime *shr, SHUnit *unit);
+
+extern "C" const SHStaticABIDescriptor _sh_static_abi_descriptor =
+    SH_STATIC_ABI_DESCRIPTOR_INITIALIZER;
+
+extern "C" void _sh_check_abi(
+    const SHStaticABIDescriptor *expected,
+    uint32_t expectedSize) {
+  bool matches = expected != nullptr &&
+      expectedSize == sizeof(SHStaticABIDescriptor);
+#define SH_STATIC_ABI_COMPARE_FIELD(name, value)                            \
+  matches = matches &&                                                     \
+      expected->name == _sh_static_abi_descriptor.name;
+  if (matches) {
+    SH_STATIC_ABI_DESCRIPTOR_FIELDS(SH_STATIC_ABI_COMPARE_FIELD)
+  }
+#undef SH_STATIC_ABI_COMPARE_FIELD
+
+  if (matches)
+    return;
+
+  if (expected && expectedSize == sizeof(SHStaticABIDescriptor)) {
+    fprintf(
+        stderr,
+        "Static Hermes ABI mismatch: generated unit version %u, runtime "
+        "size %u, unit capacity %u; runtime archive version %u, runtime "
+        "size %u, unit capacity %u. Rebuild generated units and the runtime "
+        "archive together.\n",
+        expected->version,
+        expected->runtime_size,
+        expected->runtime_units_capacity,
+        _sh_static_abi_descriptor.version,
+        _sh_static_abi_descriptor.runtime_size,
+        _sh_static_abi_descriptor.runtime_units_capacity);
+  } else if (expected && expectedSize >= 2 * sizeof(uint32_t)) {
+    fprintf(
+        stderr,
+        "Static Hermes ABI mismatch: generated descriptor version %u, size "
+        "%u; runtime archive descriptor version %u, size %u. Rebuild "
+        "generated units and the runtime archive together.\n",
+        expected->version,
+        expectedSize,
+        _sh_static_abi_descriptor.version,
+        (uint32_t)sizeof(SHStaticABIDescriptor));
+  } else {
+    fprintf(
+        stderr,
+        "Static Hermes ABI mismatch: generated descriptor is missing or "
+        "shorter than the required ABI prefix. Rebuild generated units and "
+        "the runtime archive together.\n");
+  }
+  abort();
+}
 
 extern "C" bool _sh_initialize_units(SHRuntime *shr, uint32_t count, ...) {
   Runtime &runtime = getRuntime(shr);
