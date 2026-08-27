@@ -394,6 +394,8 @@ class FlowChecker::ParseClassType {
 
   size_t nextFieldLayoutSlotIR = 0;
   size_t nextMethodLayoutSlotIR = 0;
+  bool hasComputedInstanceMethods = false;
+  bool hasComputedStaticMethods = false;
 
  public:
   ParseClassType(
@@ -462,6 +464,10 @@ class FlowChecker::ParseClassType {
         outer_.setNodeType(&node, fieldType);
       } else if (
           auto *method = llvh::dyn_cast<ESTree::MethodDefinitionNode>(&node)) {
+        if (method->_computed && method->_static)
+          hasComputedStaticMethods = true;
+        else if (method->_computed)
+          hasComputedInstanceMethods = true;
         Type *methodType = parseMethodDefinition(classType, classBody, method);
         // Methods have FunctionExpression values.
         // Associate the same type with both the outer and inner nodes.
@@ -476,32 +482,44 @@ class FlowChecker::ParseClassType {
 
     Type *homeObjectType = outer_.flowContext_.createType(
         outer_.flowContext_.createClass(Identifier{}));
-    llvh::cast<ClassType>(homeObjectType->info)
-        ->init(
-            methods,
-            /* constructorType */ nullptr,
-            /* homeObjectType */ nullptr,
-            /* staticObjectType */ nullptr,
-            superClassTypeInfo ? superClassTypeInfo->getHomeObjectType()
-                               : nullptr,
-            nextMethodLayoutSlotIR);
+    auto *homeObjectTypeInfo = llvh::cast<ClassType>(homeObjectType->info);
+    homeObjectTypeInfo->init(
+        methods,
+        /* constructorType */ nullptr,
+        /* homeObjectType */ nullptr,
+        /* staticObjectType */ nullptr,
+        superClassTypeInfo ? superClassTypeInfo->getHomeObjectType() : nullptr,
+        nextMethodLayoutSlotIR);
+    if (hasComputedInstanceMethods ||
+        (superClassTypeInfo &&
+         superClassTypeInfo->getHomeObjectTypeInfo()->hasComputedMethods())) {
+      homeObjectTypeInfo->setHasComputedMethods();
+    }
 
     // Create the staticObjectType if there are static elements or the
     // superclass has one (to preserve the inheritance chain).
     Type *staticObjectType = nullptr;
-    if (!statics.empty() ||
+    if (hasComputedStaticMethods || !statics.empty() ||
         (superClassTypeInfo && superClassTypeInfo->getStaticObjectTypeInfo())) {
       staticObjectType = outer_.flowContext_.createType(
           outer_.flowContext_.createClass(Identifier{}));
-      llvh::cast<ClassType>(staticObjectType->info)
-          ->init(
-              statics,
-              /* constructorType */ nullptr,
-              /* homeObjectType */ nullptr,
-              /* staticObjectType */ nullptr,
-              superClassTypeInfo ? superClassTypeInfo->getStaticObjectType()
-                                 : nullptr,
-              0);
+      auto *staticObjectTypeInfo =
+          llvh::cast<ClassType>(staticObjectType->info);
+      staticObjectTypeInfo->init(
+          statics,
+          /* constructorType */ nullptr,
+          /* homeObjectType */ nullptr,
+          /* staticObjectType */ nullptr,
+          superClassTypeInfo ? superClassTypeInfo->getStaticObjectType()
+                             : nullptr,
+          0);
+      if (hasComputedStaticMethods ||
+          (superClassTypeInfo &&
+           superClassTypeInfo->getStaticObjectTypeInfo() &&
+           superClassTypeInfo->getStaticObjectTypeInfo()
+               ->hasComputedMethods())) {
+        staticObjectTypeInfo->setHasComputedMethods();
+      }
     }
 
     llvh::cast<ClassType>(classType->info)
@@ -787,6 +805,56 @@ class FlowChecker::ParseClassType {
           method->_decorators,
           {outer_.kw_.identHermes, outer_.kw_.identOverload});
 
+      // Computed methods are installed dynamically and deliberately do not
+      // become named fields in the class layout. Their function bodies still
+      // receive the normal typed method context.
+      if (method->_computed) {
+        bool isGetter = (method->_kind == outer_.kw_.identGet);
+        bool isSetter = (method->_kind == outer_.kw_.identSet);
+        if (isGetter || isSetter) {
+          outer_.sm_.error(
+              method->getStartLoc(),
+              "ft: computed class accessors are unsupported");
+          return outer_.flowContext_.getAny();
+        }
+        if (finalMethod || overloadMethod) {
+          outer_.sm_.error(
+              method->getStartLoc(),
+              "ft: decorators on computed class methods are unsupported");
+          return outer_.flowContext_.getAny();
+        }
+        if (fe->_typeParameters) {
+          outer_.sm_.error(
+              fe->_typeParameters->getStartLoc(),
+              "ft: generic computed class methods are unsupported");
+          return outer_.flowContext_.getAny();
+        }
+        if (fe->_async || fe->_generator) {
+          outer_.sm_.error(
+              method->getStartLoc(), "ft: async/generator methods unsupported");
+          return outer_.flowContext_.getAny();
+        }
+
+        if (method->_static && classTypeParams_) {
+          ScopeRAII staticScope(outer_);
+          shadowClassTypeParamsWithEmpty();
+          return outer_.parseFunctionType(
+              fe->_params,
+              fe->_returnType,
+              fe->_async,
+              fe->_generator,
+              nullptr,
+              classConsType_ ? classConsType_ : classType);
+        }
+        return outer_.parseFunctionType(
+            fe->_params,
+            fe->_returnType,
+            fe->_async,
+            fe->_generator,
+            nullptr,
+            method->_static && classConsType_ ? classConsType_ : classType);
+      }
+
       // @Hermes.overload requires @Hermes.final.
       if (overloadMethod && !finalMethod) {
         outer_.sm_.error(
@@ -828,12 +896,6 @@ class FlowChecker::ParseClassType {
         return outer_.flowContext_.getAny();
       }
 
-      if (method->_computed) {
-        outer_.sm_.error(
-            method->getStartLoc(),
-            "ft: computed property names in classes are unsupported");
-        return outer_.flowContext_.getAny();
-      }
       if (fe->_async || fe->_generator) {
         outer_.sm_.error(
             method->getStartLoc(), "ft: async/generator methods unsupported");
@@ -1252,6 +1314,45 @@ void FlowChecker::visit(ESTree::MethodDefinitionNode *node) {
     return;
   }
 
+  auto visitMethodBody = [this, node, fe](Type *funcType) {
+    FunctionContext functionContext(
+        *this,
+        fe,
+        funcType,
+        curClassContext_->classType,
+        /* newTargetType */ flowContext_.getVoid());
+
+    // For static methods on generic classes, replace the class type
+    // parameters with Empty since static methods can't reference them.
+    if (node->_static) {
+      ESTree::Node *typeParams = nullptr;
+      if (auto *cd = llvh::dyn_cast<ESTree::ClassDeclarationNode>(
+              curClassContext_->node)) {
+        typeParams = cd->_typeParameters;
+      } else if (
+          auto *ce = llvh::dyn_cast<ESTree::ClassExpressionNode>(
+              curClassContext_->node)) {
+        typeParams = ce->_typeParameters;
+      }
+      if (auto *tParams =
+              llvh::cast_or_null<ESTree::TypeParameterDeclarationNode>(
+                  typeParams)) {
+        ScopeRAII staticTypeParamScope(*this);
+        Type *empty = flowContext_.getEmpty();
+        for (auto &param : tParams->_params) {
+          auto *typeParam = llvh::cast<ESTree::TypeParameterNode>(&param);
+          bindingTable_.try_emplace(
+              typeParam->_name,
+              TypeDecl{empty, curClassContext_->node->getScope(), &param});
+        }
+        visitFunctionLike(fe, fe->_body, fe->_params);
+        return;
+      }
+    }
+
+    visitFunctionLike(fe, fe->_body, fe->_params);
+  };
+
   if (node->_kind == kw_.identConstructor) {
     FunctionContext functionContext(
         *this,
@@ -1261,6 +1362,12 @@ void FlowChecker::visit(ESTree::MethodDefinitionNode *node) {
         curClassContext_->newTargetType);
     visitFunctionLike(fe, fe->_body, fe->_params);
   } else if (node->_key) {
+    if (node->_computed) {
+      visitExpression(node->_key, node, nullptr);
+      visitMethodBody(getNodeTypeOrAny(node->_value));
+      return;
+    }
+
     Identifier name;
     OptValue<ClassType::FieldLookupEntry> optField;
     if (auto *privateName =
@@ -1347,43 +1454,7 @@ void FlowChecker::visit(ESTree::MethodDefinitionNode *node) {
       }
     }
 
-    FunctionContext functionContext(
-        *this,
-        fe,
-        funcType,
-        curClassContext_->classType,
-        /* newTargetType */ flowContext_.getVoid());
-
-    // For static methods on generic classes, replace the class type
-    // parameters with Empty since static methods can't reference them.
-    if (node->_static) {
-      ESTree::Node *typeParams = nullptr;
-      if (auto *cd = llvh::dyn_cast<ESTree::ClassDeclarationNode>(
-              curClassContext_->node)) {
-        typeParams = cd->_typeParameters;
-      } else if (
-          auto *ce = llvh::dyn_cast<ESTree::ClassExpressionNode>(
-              curClassContext_->node)) {
-        typeParams = ce->_typeParameters;
-      }
-      if (auto *tParams =
-              llvh::cast_or_null<ESTree::TypeParameterDeclarationNode>(
-                  typeParams)) {
-        // This is a static method on a generic class.
-        ScopeRAII staticTypeParamScope(*this);
-        Type *empty = flowContext_.getEmpty();
-        for (auto &param : tParams->_params) {
-          auto *typeParam = llvh::cast<ESTree::TypeParameterNode>(&param);
-          bindingTable_.try_emplace(
-              typeParam->_name,
-              TypeDecl{empty, curClassContext_->node->getScope(), &param});
-        }
-        visitFunctionLike(fe, fe->_body, fe->_params);
-        return;
-      }
-    }
-
-    visitFunctionLike(fe, fe->_body, fe->_params);
+    visitMethodBody(funcType);
   }
 }
 

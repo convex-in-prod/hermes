@@ -80,15 +80,18 @@ struct CapturedState {
   Variable *homeObject = nullptr;
 };
 
-// A context structure (pushed/popped within class declarations) for
+// A context structure (pushed/popped within typed classes) for
 // conveying info about the current typed class, for use in compiling
 // constructors and related implicit methods.
 struct TypedClassContext {
-  /// The declaration node of the innermost typed class we are compiliing.
-  ESTree::ClassDeclarationNode *node = nullptr;
+  /// The node of the innermost typed class we are compiling.
+  ESTree::ClassLikeNode *node = nullptr;
 
-  /// The type of the innermost typed class we are compiliing.
+  /// The type of the innermost typed class we are compiling.
   flow::ClassType *type = nullptr;
+
+  /// The explicit or inferred constructor name, if one is available.
+  Identifier name{};
 };
 
 /// Holds class state.
@@ -788,6 +791,19 @@ class ESTreeIRGen {
 
   void genClassDeclaration(ESTree::ClassDeclarationNode *node);
 
+  /// Generate a typed or legacy class expression.
+  Value *genClassExpression(
+      ESTree::ClassExpressionNode *node,
+      Identifier nameHint);
+
+  /// Generate a typed class declaration or expression and return its
+  /// constructor value.
+  Value *genTypedClassLike(
+      ESTree::ClassLikeNode *node,
+      flow::ClassConstructorType *consType,
+      sema::Decl *constructorDecl,
+      Identifier nameHint);
+
   // Assumes that the class of the current class context has no
   // explicit constructor.  The \p consName argument is the
   // constructor name for that class.  If the class has a superclass,
@@ -873,11 +889,20 @@ class ESTreeIRGen {
   ///   object creation time.
   /// \param propertiesEnumerable whether properties are enumerable. Set to
   ///   false for home objects (class prototypes with methods).
+  /// \param allowDynamicProperties allocate an extensible object while
+  ///   preserving the static layout slot order. This is needed when dynamic
+  ///   properties will be added to a class home object.
+  /// \param emittedMethodFunctions receives the closures for public methods
+  ///   declared on this object when they must later be installed in source
+  ///   order. It must be null when \p allowDynamicProperties is false.
   Value *emitTypedClassAllocation(
       flow::ClassType *classType,
       Value *parent,
       bool skipPrivateFields,
-      bool propertiesEnumerable);
+      bool propertiesEnumerable,
+      bool allowDynamicProperties,
+      llvh::DenseMap<ESTree::MethodDefinitionNode *, Value *>
+          *emittedMethodFunctions);
 
   /// Return the default init value for the specified type.
   Value *getDefaultInitValue(flow::Type *type);
