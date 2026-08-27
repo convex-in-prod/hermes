@@ -1,0 +1,6 @@
+# patch-file source-commit
+0001-Support-run-serial-tasks-inline-on-single-threaded-E.patch 03820543eadecb534873b3d2d05c0264576d1700
+0002-StaticH-publish-runtime-registry-and-ABI-descriptor.patch 39115407787f9082b1f6e0b7a622f6cfa4cf2c1e
+0003-StaticH-emit-sharded-C-bundles.patch cb4b29e059bde2d668a9840f059bc01add9027c8
+0004-Flow-support-typed-class-expressions-and-computed-me.patch b4ecb1511ef3f882eb1018755844c5bcb9aea2e2
+0005-StaticH-fix-typed-string-and-FastArray-builtins.patch a331a1a2349af533575c5a8c48f7d1be6cccca44

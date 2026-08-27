@@ -1,0 +1,2226 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Thu, 27 Aug 2026 13:49:36 +0800
+Subject: [PATCH 3/5] StaticH: emit sharded C bundles
+
+Add an authenticated C-bundle output mode with deterministic manifests, metadata, function shards, per-unit optimization policy, and safe straight-line outlining for oversized functions. Expose the mode through shermes and lit, and exercise manifest integrity, shard invariants, compilation, and execution.
+---
+ CMakeLists.txt                        |    4 +
+ include/hermes/BCGen/SH/SH.h          |   63 ++
+ include/hermes/Utils/Options.h        |   12 +
+ lib/BCGen/SH/SH.cpp                   | 1301 ++++++++++++++++++++++---
+ test/lit.cfg                          |    8 +
+ test/shermes/emit-c-bundle-outline.js |   47 +
+ test/shermes/emit-c-bundle.js         |   33 +
+ tools/shermes/compile.cpp             |  361 +++++++
+ tools/shermes/shermes.cpp             |   20 +
+ 9 files changed, 1738 insertions(+), 111 deletions(-)
+ create mode 100644 test/shermes/emit-c-bundle-outline.js
+ create mode 100644 test/shermes/emit-c-bundle.js
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 66cb42979600ad3bc696798ce12b528f90eb6b2b..027f1eb3564639fb8621669f925d38c6f1c9f53f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -858,6 +858,7 @@ if(HERMES_ENABLE_TEST_SUITE)
+   endif()
+ 
+   set(HERMES_LIT_TEST_PARAMS_BASE
++    c_compiler=${CMAKE_C_COMPILER}
+     test_exec_root=${CMAKE_CURRENT_BINARY_DIR}/test
+     unittests_dir=${CMAKE_CURRENT_BINARY_DIR}/unittests
+     debugger_enabled=${HERMES_ENABLE_DEBUGGER}
+@@ -882,6 +883,9 @@ if(HERMES_ENABLE_TEST_SUITE)
+     asan=${HERMES_ENABLE_ADDRESS_SANITIZER}
+     coverage=${coverage_directory}
+     shermes=${HERMES_TOOLS_OUTPUT_DIR}/shermes
++    shermes_console_lib_dir=${CMAKE_CURRENT_BINARY_DIR}/tools/shermes
++    hermesvm_lib_dir=${CMAKE_CURRENT_BINARY_DIR}/lib
++    static_h_config=${CMAKE_CURRENT_BINARY_DIR}/lib/config
+     check_native_stack=${HERMES_CHECK_NATIVE_STACK}
+     unicode_lite=${HERMES_UNICODE_LITE}
+     core_extensions_enabled=${HERMES_ENABLE_CORE_EXTENSIONS}
+diff --git a/include/hermes/BCGen/SH/SH.h b/include/hermes/BCGen/SH/SH.h
+index 7fe3aab4ce2b946e99d17686d2a8b4c1f832cdd4..62056850377a404c3c768b0d132af9bb807ad9d4 100644
+--- a/include/hermes/BCGen/SH/SH.h
++++ b/include/hermes/BCGen/SH/SH.h
+@@ -10,6 +10,10 @@
+ 
+ #include "hermes/IR/IR.h"
+ #include "hermes/Utils/Options.h"
++#include "llvh/ADT/STLExtras.h"
++
++#include <string>
++#include <vector>
+ 
+ namespace hermes {
+ namespace sh {
+@@ -21,6 +25,65 @@ void generateSH(
+     llvh::raw_ostream &OS,
+     const BytecodeGenerationOptions &options);
+ 
++enum class SHCBundleFileRole {
++  Header,
++  Metadata,
++  Function,
++};
++
++enum class SHCBundleCOptimizationLevel {
++  Default,
++  O0,
++};
++
++/// Why a one-function translation unit exceeds targetBytes. An oversized
++/// function without one of these reasons is a bundle-generation invariant
++/// failure.
++enum class SHCBundleOversizeReason {
++  None,
++  /// The oversized fragment has one generated instruction.
++  SingleInstruction,
++  /// No same-block non-terminator instruction run meets the outlining policy.
++  NoOutlineableRun,
++};
++
++struct SHCBundleFile {
++  std::string path;
++  SHCBundleFileRole role;
++  uint32_t firstFunctionId{0};
++  uint32_t lastFunctionId{0};
++  uint32_t functionCount{0};
++  uint64_t targetBytes{0};
++  bool oversize{false};
++  SHCBundleOversizeReason oversizeReason{SHCBundleOversizeReason::None};
++  /// Fragment fields are zero for ordinary function shards. For an outlined
++  /// function, index 0 is the wrapper and later indexes are helpers in
++  /// deterministic wrapper call-site emission order. Every fragment has the
++  /// same positive count.
++  uint32_t functionFragmentIndex{0};
++  uint32_t functionFragmentCount{0};
++  /// Default leaves optimization policy to the bundle consumer. O0 is an
++  /// explicit per-translation-unit requirement.
++  SHCBundleCOptimizationLevel cOptimizationLevel{
++      SHCBundleCOptimizationLevel::Default};
++};
++
++/// Callback used by generateSHBundle() to write one file atomically. The
++/// callback must call \p emit with a writable stream and return whether the
++/// file was successfully published.
++using SHCBundleWriteFile = llvh::function_ref<bool(
++    llvh::StringRef path,
++    llvh::function_ref<void(llvh::raw_ostream &)> emit)>;
++
++/// Compile \p M into one metadata translation unit and multiple function
++/// translation units. The returned file list is in dependency order: header,
++/// metadata, then function shards.
++bool generateSHBundle(
++    Module *M,
++    SHCBundleWriteFile writeFile,
++    std::vector<SHCBundleFile> &files,
++    const BytecodeGenerationOptions &options);
++
+ } // namespace sh
+ } // namespace hermes
+ 
+diff --git a/include/hermes/Utils/Options.h b/include/hermes/Utils/Options.h
+index 9b13460d0f70356dd1cab898df06adc3973f3678..c4d27a5671c29cdb8278ff3fac9bb90daf8d0511 100644
+--- a/include/hermes/Utils/Options.h
++++ b/include/hermes/Utils/Options.h
+@@ -10,6 +10,8 @@
+ 
+ #include "llvh/ADT/StringRef.h"
+ 
++#include <cstdint>
++
+ namespace hermes {
+ 
+ enum OutputFormatKind {
+@@ -59,6 +61,16 @@ struct BytecodeGenerationOptions {
+   /// more fast paths.
+   bool smallC = false;
+ 
++  /// Whether the SH backend should emit a manifest and multiple C translation
++  /// units instead of one C file.
++  bool emitCBundle = false;
++
++  /// Target number of generated function-body bytes per C translation unit.
++  /// Large straight-line functions may be divided into C helpers. Other
++  /// functions larger than this target are emitted in their own translation
++  /// unit.
++  uint64_t cBundleShardSize = 2 * 1024 * 1024;
++
+   /// Whether to strip the debug info in the bytecode binary.
+   bool stripDebugInfoSection = false;
+ 
+diff --git a/lib/BCGen/SH/SH.cpp b/lib/BCGen/SH/SH.cpp
+index 8856857441adadcf674f5816929a7ab0fc1b63cf..ad866f07e1c0f10bb41a77b26b27f050e0d163f5 100644
+--- a/lib/BCGen/SH/SH.cpp
++++ b/lib/BCGen/SH/SH.cpp
+@@ -35,6 +35,8 @@
+ #include "llvh/ADT/BitVector.h"
+ #include "llvh/ADT/SetVector.h"
+ 
++#include <iterator>
++
+ using namespace hermes;
+ 
+ namespace {
+@@ -358,10 +360,18 @@ class SHNativeJSFunctionTable {
+   llvh::DenseMap<Function *, unsigned> funcMap_{};
+   /// A reference to the global string table. Used for function names.
+   SHStringTable &stringTable_;
++  /// Prefix used to give cross-translation-unit symbols unique linkage.
++  std::string bundlePrefix_;
+ 
+  public:
+-  explicit SHNativeJSFunctionTable(Module *M, SHStringTable &stringTable)
+-      : stringTable_(stringTable) {
++  explicit SHNativeJSFunctionTable(
++      Module *M,
++      SHStringTable &stringTable,
++      llvh::StringRef bundleUnitName = {})
++      : stringTable_(stringTable),
++        bundlePrefix_(bundleUnitName.empty()
++                          ? std::string{}
++                          : ("sh_" + bundleUnitName + "_").str()) {
+     // Ensure that the top level function has an id of 0.
+     auto topLevelFunc = M->getTopLevelFunction();
+     funcMap_[topLevelFunc] = 0;
+@@ -385,10 +395,19 @@ class SHNativeJSFunctionTable {
+     return funcMap_.size();
+   }
+ 
++  std::vector<Function *> functionsByIndex() const {
++    std::vector<Function *> functions(funcMap_.size());
++    for (const auto &entry : funcMap_)
++      functions[entry.second] = entry.first;
++    return functions;
++  }
++
+   /// Generates the correct label for Function \p F, and outputs it to \p OS. If
+   /// the JS function name contains characters that aren't allowed in C
+   /// identifiers, they will be replaced by '_'.
+   void generateFunctionLabel(Function *F, llvh::raw_ostream &OS) const {
++    if (!bundlePrefix_.empty())
++      OS << bundlePrefix_ << 'f';
+     OS << '_' << getIndex(F) << '_';
+ 
+     auto name = F->getInternalNameStr();
+@@ -403,6 +422,40 @@ class SHNativeJSFunctionTable {
+     }
+   }
+ 
++  void generateUnitIndexLabel(llvh::raw_ostream &OS) const {
++    if (bundlePrefix_.empty())
++      OS << "unit_index";
++    else
++      OS << bundlePrefix_ << "unit_index";
++  }
++
++  void generateFunctionInfoTableLabel(llvh::raw_ostream &OS) const {
++    if (bundlePrefix_.empty())
++      OS << "s_function_info_table";
++    else
++      OS << bundlePrefix_ << "function_info_table";
++  }
++
++  void generateOutlinedStateLabel(
++      Function *F,
++      llvh::raw_ostream &OS) const {
++    assert(isBundle() && "outlined state requires bundle labels");
++    OS << bundlePrefix_ << "f_" << getIndex(F) << "_state";
++  }
++
++  void generateOutlinedPartLabel(
++      Function *F,
++      uint32_t part,
++      llvh::raw_ostream &OS) const {
++    assert(isBundle() && "outlined part requires bundle labels");
++    OS << bundlePrefix_ << "f_" << getIndex(F) << "_part_"
++       << llvh::format("%05u", part);
++  }
++
++  bool isBundle() const {
++    return !bundlePrefix_.empty();
++  }
++
+   /// Turn the table of function information into the corresponding SH C data
+   /// structures.
+   void generate(llvh::raw_ostream &OS) const {
+@@ -411,7 +464,12 @@ class SHNativeJSFunctionTable {
+     for (auto &entry : funcMap_)
+       sortedKeys[entry.second] = entry.first;
+ 
+-    OS << "\nstatic SHNativeFuncInfo s_function_info_table[] = {\n";
++    if (isBundle())
++      OS << "\nSH_BUNDLE_HIDDEN SHNativeFuncInfo ";
++    else
++      OS << "\nstatic SHNativeFuncInfo ";
++    generateFunctionInfoTableLabel(OS);
++    OS << "[] = {\n";
+     for (const Function *F : sortedKeys) {
+       uint32_t nameIdx = stringTable_.add(F->getOriginalOrInferredName().str());
+       uint32_t argCount = F->getExpectedParamCountIncludingThis() - 1;
+@@ -440,10 +498,13 @@ struct ModuleGen {
+   /// Table of JS native functions
+   SHNativeJSFunctionTable nativeFunctionTable;
+ 
+-  explicit ModuleGen(Module *M, bool optimizationEnabled)
++  explicit ModuleGen(
++      Module *M,
++      bool optimizationEnabled,
++      llvh::StringRef bundleUnitName = {})
+       : literalBuffers{M, stringTable, optimizationEnabled},
+         srcLocationTable{stringTable},
+-        nativeFunctionTable{M, stringTable} {}
++        nativeFunctionTable{M, stringTable, bundleUnitName} {}
+ };
+ 
+ /// \return true if the SHLegacyValue representations of values \p a and \p b
+@@ -471,6 +532,11 @@ static bool canCompareStrictEqualityRaw(TypeContext &tc, Value *a, Value *b) {
+   return true;
+ }
+ 
++enum class RegisterStorage {
++  LocalsAndNonPtrVariables,
++  StatePointer,
++};
++
+ class InstrGen {
+  public:
+   /// \p os is the output stream
+@@ -486,7 +552,10 @@ class InstrGen {
+       uint32_t &nextWriteCacheIdx,
+       uint32_t &nextReadCacheIdx,
+       uint32_t &nextPrivateNameCacheIdx,
+-      const llvh::MapVector<TryStartInst *, uint32_t> &tryIDs)
++      const llvh::MapVector<TryStartInst *, uint32_t> &tryIDs,
++      const llvh::DenseMap<BasicBlock *, TryStartInst *> &enclosingTrys,
++      RegisterStorage registerStorage =
++          RegisterStorage::LocalsAndNonPtrVariables)
+       : os_(os),
+         ra_(ra),
+         options_(options),
+@@ -497,10 +566,10 @@ class InstrGen {
+         nextWriteCacheIdx_(nextWriteCacheIdx),
+         nextReadCacheIdx_(nextReadCacheIdx),
+         nextPrivateNameCacheIdx_(nextPrivateNameCacheIdx),
+-        tryIDs_(tryIDs) {
++        tryIDs_(tryIDs),
++        enclosingTrys_(enclosingTrys),
++        registerStorage_(registerStorage) {
+     (void)options_;
+-    if (!tryIDs_.empty())
+-      enclosingTrys_ = *findEnclosingTrysPerBlock(&F_);
+   }
+ 
+   /// Converts Instruction \p I into valid C code and outputs it through the
+@@ -556,7 +625,10 @@ class InstrGen {
+   /// Map from BasicBlock to the TryStartInst that encloses it, nullptr if none.
+   /// If empty, there's no try in the entire function.
+   /// If there is any try in the function, this will have an entry for every BB.
+-  llvh::DenseMap<BasicBlock *, TryStartInst *> enclosingTrys_{};
++  const llvh::DenseMap<BasicBlock *, TryStartInst *> &enclosingTrys_;
++
++  /// Where LocalPtr and LocalNonPtr registers are stored in generated C.
++  RegisterStorage registerStorage_;
+ 
+   void unimplemented(Instruction &inst) {
+     std::string err{"Unimplemented "};
+@@ -595,7 +667,11 @@ class InstrGen {
+   /// Generate a string constant by referencing the global string table.
+   llvh::raw_ostream &genStringConst(LiteralString *LS) {
+     auto str = LS->getValue().str();
+-    os_ << "get_symbols(shUnit)[" << moduleGen_.stringTable.add(str) << ']';
++    if (options_.emitCBundle)
++      os_ << "shUnit->symbols[";
++    else
++      os_ << "get_symbols(shUnit)[";
++    os_ << moduleGen_.stringTable.add(str) << ']';
+     return genStringComment(str);
+   }
+ 
+@@ -632,18 +708,33 @@ class InstrGen {
+   /// different instructions accessing the same property probably are for
+   /// objects of the same hidden class, and should get the same offset.
+   llvh::raw_ostream &genWriteIC(LiteralString *LS) {
++    if (options_.emitCBundle)
++      return os_ << "shUnit->write_prop_cache + " << nextWriteCacheIdx_++;
+     return os_ << "get_write_prop_cache(shUnit) + " << nextWriteCacheIdx_++;
+   }
+   llvh::raw_ostream &genReadIC(LiteralString *LS) {
++    if (options_.emitCBundle)
++      return os_ << "shUnit->read_prop_cache + " << nextReadCacheIdx_++;
+     return os_ << "get_read_prop_cache(shUnit) + " << nextReadCacheIdx_++;
+   }
+   llvh::raw_ostream &genPrivateNameIC(Value *privateName) {
++    if (options_.emitCBundle)
++      return os_ << "shUnit->private_name_cache + "
++                 << nextPrivateNameCacheIdx_++;
+     return os_ << "get_private_name_cache(shUnit) + "
+                << nextPrivateNameCacheIdx_++;
+   }
+ 
+   /// Helper to generate a value in a register,
+   void generateRegister(sh::Register reg) {
++    if (registerStorage_ != RegisterStorage::LocalsAndNonPtrVariables &&
++        (reg.getClass() == sh::RegClass::LocalPtr ||
++         reg.getClass() == sh::RegClass::LocalNonPtr)) {
++      os_ << "state->"
++          << (reg.getClass() == sh::RegClass::LocalPtr ? "t[" : "np[")
++          << reg.getIndex() << ']';
++      return;
++    }
+     switch (reg.getClass()) {
+       case sh::RegClass::LocalPtr:
+         os_ << "locals.t" << reg.getIndex();
+@@ -1813,9 +1904,11 @@ class InstrGen {
+     generateValue(inst);
+     os_ << " = ";
+     os_ << "_sh_ljs_create_regexp(shr, ";
+-    os_ << llvh::format("get_symbols(shUnit)[%u]", patternStrID);
++    os_ << (options_.emitCBundle ? "shUnit->symbols[" : "get_symbols(shUnit)[")
++        << patternStrID << ']';
+     os_ << ", ";
+-    os_ << llvh::format("get_symbols(shUnit)[%u]", flagsStrID);
++    os_ << (options_.emitCBundle ? "shUnit->symbols[" : "get_symbols(shUnit)[")
++        << flagsStrID << ']';
+     os_ << ");\n";
+   }
+   void generateTryEndInst(TryEndInst &inst) {
+@@ -1881,7 +1974,9 @@ class InstrGen {
+     moduleGen_.nativeFunctionTable.generateFunctionLabel(
+         inst.getFunctionCode(), os_);
+     os_ << ", ";
+-    os_ << "&s_function_info_table["
++    os_ << '&';
++    moduleGen_.nativeFunctionTable.generateFunctionInfoTableLabel(os_);
++    os_ << '['
+         << moduleGen_.nativeFunctionTable.getIndex(inst.getFunctionCode())
+         << "]" << ", shUnit);\n";
+   }
+@@ -1897,7 +1992,9 @@ class InstrGen {
+     moduleGen_.nativeFunctionTable.generateFunctionLabel(
+         inst.getFunctionCode(), os_);
+     os_ << ", ";
+-    os_ << "&s_function_info_table["
++    os_ << '&';
++    moduleGen_.nativeFunctionTable.generateFunctionInfoTableLabel(os_);
++    os_ << '['
+         << moduleGen_.nativeFunctionTable.getIndex(inst.getFunctionCode())
+         << "]" << ", shUnit);\n";
+   }
+@@ -1914,7 +2011,9 @@ class InstrGen {
+     moduleGen_.nativeFunctionTable.generateFunctionLabel(
+         inst.getFunctionCode(), os_);
+     os_ << ", ";
+-    os_ << "&s_function_info_table["
++    os_ << '&';
++    moduleGen_.nativeFunctionTable.generateFunctionInfoTableLabel(os_);
++    os_ << '['
+         << moduleGen_.nativeFunctionTable.getIndex(inst.getFunctionCode())
+         << "]";
+     os_ << ", (SHUnit *)shUnit, ";
+@@ -1936,7 +2035,12 @@ class InstrGen {
+     if (!tryIDs_.empty()) {
+       os_ << "  _sh_end_try(shr, &jmpBuf);\n";
+     }
+-    os_ << "  _sh_leave(shr, &locals.head, frame);\n  return ";
++    os_ << "  _sh_leave(shr, &";
++    if (registerStorage_ == RegisterStorage::LocalsAndNonPtrVariables)
++      os_ << "locals.head";
++    else
++      os_ << "state->head";
++    os_ << ", frame);\n  return ";
+     generateValue(*inst.getValue());
+     os_ << ";\n";
+   }
+@@ -2769,6 +2873,10 @@ void generateFunction(
+   srcMgr.dumpCoords(OS, F.getSourceRange().Start);
+   OS << '\n';
+ 
++  llvh::DenseMap<BasicBlock *, TryStartInst *> enclosingTrys;
++  if (!tryIDs.empty())
++    enclosingTrys = *findEnclosingTrysPerBlock(&F);
++
+   InstrGen instrGen(
+       OS,
+       RA,
+@@ -2779,12 +2887,16 @@ void generateFunction(
+       nextWriteCacheIdx,
+       nextReadCacheIdx,
+       nextPrivateNameCacheIdx,
+-      tryIDs);
++      tryIDs,
++      enclosingTrys);
+ 
+   // Number of registers stored in the `locals` struct below.
+   uint32_t localsSize = RA.getMaxRegisterUsage(sh::RegClass::LocalPtr);
+ 
+-  OS << "static SHLegacyValue ";
++  if (options.emitCBundle)
++    OS << "SH_BUNDLE_HIDDEN SHLegacyValue ";
++  else
++    OS << "static SHLegacyValue ";
+   moduleGen.nativeFunctionTable.generateFunctionLabel(&F, OS);
+   OS << "(SHRuntime *shr) {\n";
+ 
+@@ -2835,7 +2947,9 @@ void generateFunction(
+      << (RA.getMaxArgumentRegisters() + hbc::StackFrameLayout::FirstLocal)
+      << ");\n"
+      << "  locals.head.count =" << localsSize << ";\n"
+-     << "  SHUnit *shUnit = shr->units[unit_index];\n";
++     << "  SHUnit *shUnit = shr->units[";
++  moduleGen.nativeFunctionTable.generateUnitIndexLabel(OS);
++  OS << "];\n";
+ 
+   if (emitNativeTraces) {
+     // Initialize the current SHUnit.
+@@ -2997,13 +3111,12 @@ L_catch:
+   OS << "}\n";
+ }
+ 
+-/// Collect all the native externs used in the module.
+-std::unique_ptr<llvh::DenseSet<NativeExtern *>> collectUsedExterns(Module *M) {
++/// Collect all the native externs used by \p functions.
++std::unique_ptr<llvh::DenseSet<NativeExtern *>> collectUsedExterns(
++    llvh::ArrayRef<Function *> functions) {
+   auto externs = llvh::make_unique<llvh::DenseSet<NativeExtern *>>();
+-  // Iterate all functions, basic blocks and operands, checking for
+-  // LiteralNativeExtern.
+-  for (auto &F : *M) {
+-    for (auto &BB : F) {
++  for (Function *F : functions) {
++    for (auto &BB : *F) {
+       for (auto &I : BB) {
+         for (unsigned i = 0, count = I.getNumOperands(); i != count; ++i) {
+           if (auto *ne = llvh::dyn_cast<LiteralNativeExtern>(I.getOperand(i))) {
+@@ -3016,6 +3129,15 @@ std::unique_ptr<llvh::DenseSet<NativeExtern *>> collectUsedExterns(Module *M) {
+   return externs;
+ }
+ 
++/// Collect all the native externs used in the module.
++std::unique_ptr<llvh::DenseSet<NativeExtern *>> collectUsedExterns(Module *M) {
++  std::vector<Function *> functions;
++  functions.reserve(M->size());
++  for (auto &F : *M)
++    functions.push_back(&F);
++  return collectUsedExterns(functions);
++}
++
+ /// Generate the include statements requested by native externs.
+ void generateExternCIncludes(
+     Module *M,
+@@ -3055,6 +3177,137 @@ void generateExternC(
+     OS << '\n';
+ }
+ 
++void generateUnitData(
++    Module *M,
++    llvh::raw_ostream &OS,
++    ModuleGen &moduleGen,
++    uint32_t nextWriteCacheIdx,
++    uint32_t nextReadCacheIdx,
++    uint32_t nextPrivateNameCacheIdx,
++    const BytecodeGenerationOptions &options) {
++  if (options.emitCBundle) {
++    OS << "SH_BUNDLE_HIDDEN uint32_t ";
++    moduleGen.nativeFunctionTable.generateUnitIndexLabel(OS);
++    OS << ";\n";
++  }
++
++  moduleGen.literalBuffers.generate(OS);
++  moduleGen.srcLocationTable.generate(
++      OS, M->getContext().getSourceErrorManager());
++  moduleGen.nativeFunctionTable.generate(OS);
++  // String table must be generated last because the other tables may add
++  // strings while they are emitted.
++  moduleGen.stringTable.generate(OS);
++
++  // Prefix the creator with sh_export_ to avoid conflicts between units.
++  OS << "#define CREATE_THIS_UNIT sh_export_" << options.unitName << "\n";
++
++  OS << "static const SHStaticABIDescriptor s_static_abi_descriptor =\n"
++     << "    SH_STATIC_ABI_DESCRIPTOR_INITIALIZER;\n"
++     << "struct UnitData {\n"
++     << "  SHUnit unit;\n"
++     << "  SHSymbolID symbol_data[" << moduleGen.stringTable.size() << "];\n"
++     << "  SHWritePropertyCacheEntry write_prop_cache_data["
++     << nextWriteCacheIdx << "];\n"
++     << "  SHReadPropertyCacheEntry read_prop_cache_data["
++     << nextReadCacheIdx << "];\n"
++     << "  SHPrivateNameCacheEntry private_name_cache_data["
++     << nextPrivateNameCacheIdx << "];\n"
++     << "  SHCompressedPointer object_literal_class_cache["
++     << moduleGen.literalBuffers.objShapeTable.size() << "];\n};\n"
++     << "SHUnit *CREATE_THIS_UNIT(void) {\n"
++     << "  _sh_check_abi(\n"
++     << "      &s_static_abi_descriptor, sizeof(s_static_abi_descriptor));\n"
++     << "  struct UnitData *unit_data = calloc(sizeof(struct UnitData), 1);\n"
++     << "  *unit_data = (struct UnitData){.unit = {.index = &";
++  moduleGen.nativeFunctionTable.generateUnitIndexLabel(OS);
++  OS << ",.num_symbols =" << moduleGen.stringTable.size()
++     << ", .num_write_prop_cache_entries = " << nextWriteCacheIdx
++     << ", .num_read_prop_cache_entries = " << nextReadCacheIdx
++     << ", .ascii_pool = s_ascii_pool, .u16_pool = s_u16_pool,"
++     << ".strings = s_strings, .symbols = unit_data->symbol_data,"
++     << ".write_prop_cache = unit_data->write_prop_cache_data,"
++     << ".read_prop_cache = unit_data->read_prop_cache_data, "
++     << ".private_name_cache = unit_data->private_name_cache_data, "
++     << ".obj_key_buffer = s_obj_key_buffer, .obj_key_buffer_size = "
++     << moduleGen.literalBuffers.objKeyBuffer.size() << ", "
++     << ".literal_val_buffer = s_literal_val_buffer, .literal_val_buffer_size = "
++     << moduleGen.literalBuffers.literalValueBuffer.size() << ", "
++     << ".obj_shape_table = s_obj_shape_table, "
++     << ".obj_shape_table_count = "
++     << moduleGen.literalBuffers.objShapeTable.size() << ", "
++     << ".object_literal_class_cache = unit_data->object_literal_class_cache, "
++     << ".source_locations = s_source_locations, "
++     << ".source_locations_size = " << moduleGen.srcLocationTable.size()
++     << ", " << ".unit_main = ";
++  if (options.emitCBundle)
++    moduleGen.nativeFunctionTable.generateFunctionLabel(
++        M->getTopLevelFunction(), OS);
++  else
++    OS << "_0_global";
++  OS << ", .unit_main_info = &";
++  moduleGen.nativeFunctionTable.generateFunctionInfoTableLabel(OS);
++  OS << "[0], "
++     << ".unit_name = \"sh_compiled\" }};\n"
++     << "  return (SHUnit *)unit_data;\n}\n";
++
++  if (!options.emitCBundle) {
++    OS << R"(
++SHSymbolID *get_symbols(SHUnit *unit) {
++  return ((struct UnitData *)unit)->symbol_data;
++}
++
++SHWritePropertyCacheEntry *get_write_prop_cache(SHUnit *unit) {
++  return ((struct UnitData *)unit)->write_prop_cache_data;
++}
++SHReadPropertyCacheEntry *get_read_prop_cache(SHUnit *unit) {
++  return ((struct UnitData *)unit)->read_prop_cache_data;
++}
++SHPrivateNameCacheEntry *get_private_name_cache(SHUnit *unit) {
++  return ((struct UnitData *)unit)->private_name_cache_data;
++}
++)";
++  }
++
++  if (options.emitMain) {
++    OS << R"(
++typedef struct SHConsoleContext SHConsoleContext;
++
++SHConsoleContext *init_console_bindings(
++    SHRuntime *shr, int scriptArgc, const char *const *scriptArgv);
++
++void free_console_context(SHConsoleContext *consoleContext);
++
++bool run_event_loop(
++    SHRuntime *shr,
++    SHConsoleContext *consoleContext);
++
++int main(int argc, char **argv) {
++  int scriptArgc = 0;
++  char **scriptArgv = NULL;
++  int clArgc = argc;
++  for (int i = 1; i < argc; ++i) {
++    if (argv[i][0] == '-' && argv[i][1] == '-' && argv[i][2] == '\0') {
++      scriptArgc = argc - i - 1;
++      scriptArgv = argv + i + 1;
++      clArgc = i;
++      break;
++    }
++  }
++  SHRuntime *shr = _sh_init(clArgc, argv);
++  SHConsoleContext *consoleContext =
++      init_console_bindings(shr, scriptArgc, (const char *const *)scriptArgv);
++  bool success =
++    _sh_initialize_units(shr, 1, CREATE_THIS_UNIT) &&
++    run_event_loop(shr, consoleContext);
++  free_console_context(consoleContext);
++  _sh_done(shr);
++  return success ? 0 : 1;
++}
++)";
++  }
++}
++
+ /// Converts Module \p M into valid C code and outputs it through \p OS.
+ /// Returns the cache size necessary to store all the cache indexes used.
+ void generateModule(
+@@ -3135,107 +3388,925 @@ static SHNativeFuncInfo s_function_info_table[];
+   }
+ 
+   if (options.format == DumpBytecode || options.format == EmitBundle) {
+-    moduleGen.literalBuffers.generate(OS);
+-    moduleGen.srcLocationTable.generate(
+-        OS, M->getContext().getSourceErrorManager());
+-    moduleGen.nativeFunctionTable.generate(OS);
+-    // String table should be generated last, because the generate calls to
+-    // other module components may add new entries to the string table.
+-    moduleGen.stringTable.generate(OS);
+-
+-    // Note that we prefix the unit name with sh_export_ to avoid potential
+-    // conflicts.
+-    OS << "#define CREATE_THIS_UNIT sh_export_" << options.unitName << "\n";
+-
+-    OS << "struct UnitData {\n"
+-       << "  SHUnit unit;\n"
+-       << "  SHSymbolID symbol_data[" << moduleGen.stringTable.size() << "];\n"
+-       << "  SHWritePropertyCacheEntry write_prop_cache_data["
+-       << nextWriteCacheIdx << "];\n"
+-       << "  SHReadPropertyCacheEntry read_prop_cache_data[" << nextReadCacheIdx
+-       << "];\n"
+-       << "  SHPrivateNameCacheEntry private_name_cache_data["
+-       << nextPrivateNameCacheIdx << "];\n"
+-       << "  SHCompressedPointer object_literal_class_cache["
+-       << moduleGen.literalBuffers.objShapeTable.size() << "];\n};\n"
+-       << "SHUnit *CREATE_THIS_UNIT(void) {\n"
+-       << "  struct UnitData *unit_data = calloc(sizeof(struct UnitData), 1);\n"
+-       << "  *unit_data = (struct UnitData){.unit = {.index = &unit_index,"
+-       << ".num_symbols =" << moduleGen.stringTable.size()
+-       << ", .num_write_prop_cache_entries = " << nextWriteCacheIdx
+-       << ", .num_read_prop_cache_entries = " << nextReadCacheIdx
+-       << ", .ascii_pool = s_ascii_pool, .u16_pool = s_u16_pool,"
+-       << ".strings = s_strings, .symbols = unit_data->symbol_data,"
+-       << ".write_prop_cache = unit_data->write_prop_cache_data,"
+-       << ".read_prop_cache = unit_data->read_prop_cache_data, "
+-       << ".private_name_cache = unit_data->private_name_cache_data, "
+-       << ".obj_key_buffer = s_obj_key_buffer, .obj_key_buffer_size = "
+-       << moduleGen.literalBuffers.objKeyBuffer.size() << ", "
+-       << ".literal_val_buffer = s_literal_val_buffer, .literal_val_buffer_size = "
+-       << moduleGen.literalBuffers.literalValueBuffer.size() << ", "
+-       << ".obj_shape_table = s_obj_shape_table, "
+-       << ".obj_shape_table_count = "
+-       << moduleGen.literalBuffers.objShapeTable.size() << ", "
+-       << ".object_literal_class_cache = unit_data->object_literal_class_cache, "
+-       << ".source_locations = s_source_locations, "
+-       << ".source_locations_size = " << moduleGen.srcLocationTable.size()
+-       << ", " << ".unit_main = _0_global, "
+-       << ".unit_main_info = &s_function_info_table[0], "
+-       << ".unit_name = \"sh_compiled\" }};\n"
+-       << "  return (SHUnit *)unit_data;\n}\n"
+-       << R"(
+-SHSymbolID *get_symbols(SHUnit *unit) {
+-  return ((struct UnitData *)unit)->symbol_data;
++    generateUnitData(
++        M,
++        OS,
++        moduleGen,
++        nextWriteCacheIdx,
++        nextReadCacheIdx,
++        nextPrivateNameCacheIdx,
++        options);
++  }
+ }
+ 
+-SHWritePropertyCacheEntry *get_write_prop_cache(SHUnit *unit) {
+-  return ((struct UnitData *)unit)->write_prop_cache_data;
++struct BufferedBundleFunction {
++  Function *function;
++  std::string source;
++  bool isolate{false};
++  uint32_t functionFragmentIndex{0};
++  uint32_t functionFragmentCount{0};
++  sh::SHCBundleCOptimizationLevel cOptimizationLevel{
++      sh::SHCBundleCOptimizationLevel::Default};
++  sh::SHCBundleOversizeReason oversizeReason{
++      sh::SHCBundleOversizeReason::None};
++  /// For function fragments, the exact JS function labels referenced by this
++  /// fragment. Ordinary shards discover references from their whole functions.
++  llvh::BitVector referencedFunctions;
++};
++
++struct BufferedOutlinedInstruction {
++  Instruction *instruction;
++  SMLoc effectiveLocation;
++  std::string source;
++};
++
++struct BufferedOutlinedBlock {
++  BasicBlock *block;
++  std::vector<BufferedOutlinedInstruction> instructions;
++};
++
++struct OutlinedPart {
++  uint32_t blockIndex;
++  size_t begin;
++  size_t end;
++};
++
++/// Avoid adding cross-translation-unit calls to small functions and small CFG
++/// paths when a very small shard target is used to exercise ordinary function
++/// sharding.
++constexpr size_t kMinOutlinedInstructionCount = 64;
++
++/// A single generated C function exercises native optimization passes much
++/// more heavily than the same bytes spread across independent functions. Keep
++/// outlined helpers below the aggregate translation-unit target.
++constexpr size_t kOutlinedPartTargetDivisor = 8;
++
++/// Optimizing larger generated C control-flow graphs can require excessive
++/// compile time and memory even when the source body is below the shard target.
++constexpr size_t kO0BasicBlockCount = 1024;
++
++/// Leave room in a 65,536-member bundle for the manifest, header, and
++/// metadata translation unit.
++constexpr size_t kMaxBundleFunctionShards = 65533;
++
++sh::SHCBundleCOptimizationLevel cOptimizationLevelForFunction(
++    Function *function) {
++  size_t basicBlockCount = 0;
++  for (auto &block : *function) {
++    (void)block;
++    ++basicBlockCount;
++  }
++  return basicBlockCount >= kO0BasicBlockCount
++      ? sh::SHCBundleCOptimizationLevel::O0
++      : sh::SHCBundleCOptimizationLevel::Default;
+ }
+-SHReadPropertyCacheEntry *get_read_prop_cache(SHUnit *unit) {
+-  return ((struct UnitData *)unit)->read_prop_cache_data;
++
++bool mustStayInOutlinedWrapper(Instruction *instruction) {
++  return llvh::isa<TerminatorInst>(instruction) ||
++      llvh::isa<CatchInst>(instruction);
+ }
+-SHPrivateNameCacheEntry *get_private_name_cache(SHUnit *unit) {
+-  return ((struct UnitData *)unit)->private_name_cache_data;
++
++void collectReferencedFunction(
++    Instruction *instruction,
++    const SHNativeJSFunctionTable &functionTable,
++    llvh::BitVector &referenced) {
++  auto mark = [&](Function *target) {
++    referenced.set(functionTable.getIndex(target));
++  };
++  if (auto *create = llvh::dyn_cast<CreateFunctionInst>(instruction))
++    mark(create->getFunctionCode());
++  if (auto *create = llvh::dyn_cast<CreateGeneratorInst>(instruction))
++    mark(create->getFunctionCode());
++  if (auto *create = llvh::dyn_cast<CreateClassInst>(instruction))
++    mark(create->getFunctionCode());
++  if (auto *call = llvh::dyn_cast<CallInst>(instruction)) {
++    if (auto *target = llvh::dyn_cast<Function>(call->getTarget()))
++      mark(target);
++  }
+ }
++
++bool canOutlineFunction(Function *function) {
++  size_t instructionCount = 0;
++  for (auto &block : *function) {
++    instructionCount += block.size();
++    if (instructionCount >= kMinOutlinedInstructionCount)
++      return true;
++  }
++  return false;
++}
++
++void generateOutlinedStateDefinition(
++    llvh::raw_ostream &OS,
++    Function *function,
++    const SHNativeJSFunctionTable &functionTable,
++    uint32_t localsSize,
++    uint32_t nonPtrSize) {
++  OS << "struct ";
++  functionTable.generateOutlinedStateLabel(function, OS);
++  OS << " {\n  SHLocals head;\n";
++  if (localsSize != 0)
++    OS << "  SHLegacyValue t[" << localsSize << "];\n";
++  if (nonPtrSize != 0)
++    OS << "  SHLegacyValue np[" << nonPtrSize << "];\n";
++  OS << "};\n";
++  if (localsSize != 0) {
++    OS << "_Static_assert(offsetof(struct ";
++    functionTable.generateOutlinedStateLabel(function, OS);
++    OS << ", t) == offsetof(SHLocals, locals), "
++          "\"outlined locals must use SHLocals layout\");\n";
++  }
++  OS << '\n';
++}
++
++void generateOutlinedPartDeclaration(
++    llvh::raw_ostream &OS,
++    Function *function,
++    uint32_t part,
++    const SHNativeJSFunctionTable &functionTable) {
++  OS << "SH_BUNDLE_HIDDEN SH_ATTRIBUTE_NOINLINE void ";
++  functionTable.generateOutlinedPartLabel(function, part, OS);
++  OS << "(SHRuntime *shr, struct ";
++  functionTable.generateOutlinedStateLabel(function, OS);
++  OS << " *state, SHLegacyValue *frame, SHUnit *shUnit)";
++}
++
++void emitOutlinedInstructions(
++    sh::LineDirectiveEmitter &OS,
++    llvh::ArrayRef<BufferedOutlinedInstruction> instructions,
++    SourceErrorManager &srcMgr,
++    bool emitLineDirectives) {
++  if (emitLineDirectives)
++    OS.enableLineDirectives();
++  for (const auto &instruction : instructions) {
++    OS.setDirectiveInfo(instruction.effectiveLocation, srcMgr);
++    OS << instruction.source;
++  }
++  OS.disableLineDirectives();
++}
++
++std::string generateOutlinedPart(
++    Function *function,
++    uint32_t part,
++    llvh::ArrayRef<BufferedOutlinedInstruction> instructions,
++    const SHNativeJSFunctionTable &functionTable,
++    uint32_t localsSize,
++    uint32_t nonPtrSize,
++    SourceErrorManager &srcMgr,
++    bool emitLineDirectives) {
++  std::string source;
++  llvh::raw_string_ostream sourceOS(source);
++  {
++    sh::LineDirectiveEmitter OS(sourceOS);
++    generateOutlinedStateDefinition(
++        OS, function, functionTable, localsSize, nonPtrSize);
++    generateOutlinedPartDeclaration(OS, function, part, functionTable);
++    OS << " {\n";
++    emitOutlinedInstructions(
++        OS, instructions, srcMgr, emitLineDirectives);
++    OS << "}\n";
++  }
++  sourceOS.flush();
++  return source;
++}
++
++/// Generate an independently compilable wrapper and zero or more C helpers.
++/// The wrapper retains every basic-block label and terminator. Helpers contain
++/// only same-block non-terminator instruction runs and operate on the wrapper's
++/// register state without entering a JavaScript frame.
++std::vector<BufferedBundleFunction> generateOutlinedBundleFunction(
++    Function &F,
++    ModuleGen &moduleGen,
++    uint32_t &nextWriteCacheIdx,
++    uint32_t &nextReadCacheIdx,
++    uint32_t &nextPrivateNameCacheIdx,
++    sh::SHCBundleCOptimizationLevel cOptimizationLevel,
++    const BytecodeGenerationOptions &options) {
++  auto PO = hermes::postOrderAnalysis(&F);
++  llvh::SmallVector<BasicBlock *, 16> order(PO.rbegin(), PO.rend());
++
++  sh::SHRegisterAllocator RA(&F);
++  RA.allocate(order);
++  lowerAllocatedFunctionIR(&F, RA, options.optimizationEnabled);
++
++  llvh::DenseMap<BasicBlock *, unsigned> bbMap;
++  for (uint32_t index = 0; index < order.size(); ++index)
++    bbMap[order[index]] = index;
++  llvh::MapVector<TryStartInst *, uint32_t> tryIDs;
++  uint32_t nextTryID = 1;
++  for (BasicBlock *block : order) {
++    if (auto *tryStart =
++            llvh::dyn_cast<TryStartInst>(block->getTerminator())) {
++      tryIDs[tryStart] = nextTryID++;
++    }
++  }
++  llvh::DenseMap<BasicBlock *, TryStartInst *> enclosingTrys;
++  if (!tryIDs.empty())
++    enclosingTrys = *findEnclosingTrysPerBlock(&F);
++  auto &srcMgr = F.getContext().getSourceErrorManager();
++  const uint32_t localsSize =
++      RA.getMaxRegisterUsage(sh::RegClass::LocalPtr);
++  const uint32_t nonPtrSize =
++      RA.getMaxRegisterUsage(sh::RegClass::LocalNonPtr);
++  const bool emitNativeTraces =
++      F.getContext().getDebugInfoSetting() >= DebugInfoSetting::THROWING;
++  const bool emitSrcLocComments =
++      options.emitSourceLocations && !options.emitLineDirectives;
++  std::vector<BufferedOutlinedBlock> blocks;
++  blocks.reserve(order.size());
++  uint64_t outlineableBytes = 0;
++  SMLoc effectiveLocation = F.getSourceRange().Start;
++  for (BasicBlock *block : order) {
++    BufferedOutlinedBlock bufferedBlock{block, {}};
++    bufferedBlock.instructions.reserve(block->size());
++    for (auto &I : *block) {
++      if (I.getLocation().isValid())
++        effectiveLocation = I.getLocation();
++      std::string source;
++      llvh::raw_string_ostream OS(source);
++      if (emitSrcLocComments) {
++        OS << "  // ";
++        if (effectiveLocation.isValid())
++          srcMgr.dumpCoords(OS, effectiveLocation);
++        else
++          OS << "no-src-info";
++        OS << '\n';
++      }
++      if (emitNativeTraces && I.getSideEffect().getThrow()) {
++        SHSrcLocationTable::IdxTy idx = SHSrcLocationTable::kInvalidLocIdx;
++        SMLoc curLoc = I.getLocation();
++        if (curLoc.isValid()) {
++          SourceErrorManager::SourceCoords coords;
++          if (srcMgr.findBufferLineAndLoc(curLoc, coords))
++            idx = moduleGen.srcLocationTable.getIndex(srcMgr, coords);
++        }
++        // Each helper is an independent C function, and wrapper control flow
++        // can enter a block without executing the previously emitted block.
++        OS << "  state->head.src_location_idx = " << idx << ";\n";
++      }
++      InstrGen instrGen(
++          OS,
++          RA,
++          options,
++          bbMap,
++          F,
++          moduleGen,
++          nextWriteCacheIdx,
++          nextReadCacheIdx,
++          nextPrivateNameCacheIdx,
++          tryIDs,
++          enclosingTrys,
++          RegisterStorage::StatePointer);
++      instrGen.generate(I);
++      OS.flush();
++      if (!mustStayInOutlinedWrapper(&I))
++        outlineableBytes += source.size();
++      bufferedBlock.instructions.push_back(
++          {&I, effectiveLocation, std::move(source)});
++    }
++    blocks.push_back(std::move(bufferedBlock));
++  }
++
++  // Keep a helper body below a fraction of its containing translation-unit
++  // target. The remaining space holds declarations for function references,
++  // the shared-state definition, and the C file prologue. A single generated
++  // instruction can still exceed the target. Keep the O0 singleton intact:
++  // dividing it would create non-O0 helper fragments.
++  const uint64_t partTargetBytes =
++      cOptimizationLevel == sh::SHCBundleCOptimizationLevel::O0
++      ? options.cBundleShardSize
++      : std::max<uint64_t>(
++            1, options.cBundleShardSize / kOutlinedPartTargetDivisor);
++  const std::string emptyPart = generateOutlinedPart(
++      &F,
++      0,
++      {},
++      moduleGen.nativeFunctionTable,
++      localsSize,
++      nonPtrSize,
++      srcMgr,
++      options.emitLineDirectives);
++  const uint64_t instructionTarget =
++      partTargetBytes > emptyPart.size()
++      ? partTargetBytes - emptyPart.size()
++      : 1;
++  const bool needsOutlining = outlineableBytes >= instructionTarget;
++  std::vector<OutlinedPart> parts;
++  if (needsOutlining) {
++    for (uint32_t blockIndex = 0; blockIndex < blocks.size(); ++blockIndex) {
++      const auto &instructions = blocks[blockIndex].instructions;
++      size_t index = 0;
++      while (index < instructions.size()) {
++        if (mustStayInOutlinedWrapper(instructions[index].instruction)) {
++          ++index;
++          continue;
++        }
++        const size_t begin = index;
++        uint64_t runBytes = 0;
++        while (index < instructions.size() &&
++               !mustStayInOutlinedWrapper(instructions[index].instruction)) {
++          runBytes += instructions[index].source.size();
++          ++index;
++        }
++        const size_t end = index;
++        if (end - begin < kMinOutlinedInstructionCount &&
++            runBytes < instructionTarget) {
++          continue;
++        }
++
++        size_t partBegin = begin;
++        while (partBegin < end) {
++          size_t partEnd = partBegin;
++          uint64_t partBytes = 0;
++          while (partEnd < end) {
++            const uint64_t instructionBytes =
++                instructions[partEnd].source.size();
++            if (partEnd != partBegin &&
++                (partBytes >= instructionTarget ||
++                 instructionBytes > instructionTarget - partBytes)) {
++              break;
++            }
++            partBytes += instructionBytes;
++            ++partEnd;
++          }
++          if (parts.size() >= kMaxBundleFunctionShards - 1) {
++            hermes_fatal(
++                "Static Hermes C bundle function has too many fragments");
++          }
++          parts.push_back({blockIndex, partBegin, partEnd});
++          partBegin = partEnd;
++        }
++      }
++    }
++  }
++  const bool outline = !parts.empty();
++  llvh::BitVector wrapperReferences(moduleGen.nativeFunctionTable.size());
++  std::string wrapperSource;
++  llvh::raw_string_ostream wrapperSourceOS(wrapperSource);
++  {
++    sh::LineDirectiveEmitter OS(wrapperSourceOS);
++    generateOutlinedStateDefinition(
++        OS, &F, moduleGen.nativeFunctionTable, localsSize, nonPtrSize);
++    if (outline) {
++      for (uint32_t part = 0; part < parts.size(); ++part) {
++        generateOutlinedPartDeclaration(
++            OS, &F, part, moduleGen.nativeFunctionTable);
++        OS << ";\n";
++      }
++      OS << '\n';
++    }
++
++    OS << "// ";
++    srcMgr.dumpCoords(OS, F.getSourceRange().Start);
++    OS << "\nSH_BUNDLE_HIDDEN SHLegacyValue ";
++    moduleGen.nativeFunctionTable.generateFunctionLabel(&F, OS);
++    OS << "(SHRuntime *shr) {\n";
++    OS.setDirectiveInfo(F.getSourceRange().Start, srcMgr);
++    if (options.emitLineDirectives)
++      OS.enableLineDirectives();
++
++    if (F.isGlobalScope())
++      OS << "  _SH_MODEL();\n";
++    OS << "  struct ";
++    moduleGen.nativeFunctionTable.generateOutlinedStateLabel(&F, OS);
++    OS << " stateStorage;\n"
++       << "  struct ";
++    moduleGen.nativeFunctionTable.generateOutlinedStateLabel(&F, OS);
++    OS << " *state = &stateStorage;\n";
++
++    if (F.getParent()
++            ->getContext()
++            .getNativeContext()
++            .settings.emitCheckNativeStack) {
++      OS << "  _sh_check_native_stack_overflow(shr);\n";
++    }
++    OS << "  SHLegacyValue *frame = _sh_enter(shr, &state->head, "
++       << (RA.getMaxArgumentRegisters() +
++           hbc::StackFrameLayout::FirstLocal)
++       << ");\n"
++       << "  state->head.count =" << localsSize << ";\n"
++       << "  SHUnit *shUnit = shr->units[";
++    moduleGen.nativeFunctionTable.generateUnitIndexLabel(OS);
++    OS << "];\n";
++
++    if (emitNativeTraces) {
++      OS << "  state->head.unit = shUnit;\n"
++         << "  state->head.src_location_idx = "
++         << SHSrcLocationTable::kInvalidLocIdx << ";\n";
++    }
++    if (localsSize != 0) {
++      OS << "  for (uint32_t index = 0; index < " << localsSize
++         << "; ++index)\n"
++         << "    state->t[index] = _sh_ljs_undefined();\n";
++    }
++    if (nonPtrSize != 0) {
++      OS << "  for (uint32_t index = 0; index < " << nonPtrSize
++         << "; ++index)\n"
++         << "    state->np[index] = _sh_ljs_undefined();\n";
++    }
++
++    switch (F.getProhibitInvoke()) {
++      case Function::ProhibitInvoke::ProhibitNone:
++        break;
++      case Function::ProhibitInvoke::ProhibitConstruct:
++        OS << "  if (!_sh_ljs_is_undefined(frame["
++           << hbc::StackFrameLayout::NewTarget << "]))\n"
++           << "    _sh_throw_type_error_ascii(shr, \"Function is not a "
++              "constructor\");\n";
++        break;
++      case Function::ProhibitInvoke::ProhibitCall:
++        OS << "  if (_sh_ljs_is_undefined(frame["
++           << hbc::StackFrameLayout::NewTarget << "]))\n"
++           << "    _sh_throw_type_error_ascii(shr, \"Class constructor "
++              "invoked without new\");\n";
++        break;
++    }
++    if (!tryIDs.empty()) {
++      OS << R"(
++  SHJmpBuf jmpBuf;
++  volatile uint32_t tryState = 0;
++  if (__builtin_expect(_sh_try(shr, &jmpBuf), 0) != 0) goto L_catch;
+ )";
+-    if (options.emitMain) {
++    }
++    if (emitNativeTraces) {
++      OS << "  frame[" << hbc::StackFrameLayout::SHLocals << "]"
++         << " = _sh_ljs_native_pointer(&state->head);\n";
++    }
++
++    uint32_t nextPart = 0;
++    for (uint32_t blockIndex = 0; blockIndex < blocks.size(); ++blockIndex) {
++      auto &block = blocks[blockIndex];
++      if (options.emitLineDirectives)
++        OS.enableLineDirectives();
++      OS.setDirectiveInfo(block.block->front().getLocation(), srcMgr);
++      OS << '\n';
++      generateBasicBlockLabel(block.block, OS, bbMap);
++      OS << ":\n  ;\n";
++      OS.disableLineDirectives();
++
++      size_t instructionIndex = 0;
++      while (instructionIndex < block.instructions.size()) {
++        if (outline && nextPart < parts.size() &&
++            parts[nextPart].blockIndex == blockIndex &&
++            parts[nextPart].begin == instructionIndex) {
++          OS << "  ";
++          moduleGen.nativeFunctionTable.generateOutlinedPartLabel(
++              &F, nextPart, OS);
++          OS << "(shr, state, frame, shUnit);\n";
++          instructionIndex = parts[nextPart].end;
++          ++nextPart;
++          continue;
++        }
++        collectReferencedFunction(
++            block.instructions[instructionIndex].instruction,
++            moduleGen.nativeFunctionTable,
++            wrapperReferences);
++        emitOutlinedInstructions(
++            OS,
++            llvh::ArrayRef<BufferedOutlinedInstruction>(
++                &block.instructions[instructionIndex], 1),
++            srcMgr,
++            options.emitLineDirectives);
++        ++instructionIndex;
++      }
++    }
++    assert(nextPart == parts.size() && "not all outlined parts were called");
++    if (!tryIDs.empty()) {
+       OS << R"(
+-typedef struct SHConsoleContext SHConsoleContext;
++L_catch:
++  if (tryState == 0) {
++    _sh_end_try(shr, &jmpBuf);
++    _sh_throw_current(shr);
++  }
++  )";
++      OS << "_sh_catch_no_pop(shr, (SHLocals*)state, frame, "
++         << (RA.getMaxArgumentRegisters() +
++             hbc::StackFrameLayout::FirstLocal)
++         << ");\n";
+ 
+-SHConsoleContext *init_console_bindings(
+-    SHRuntime *shr, int scriptArgc, const char *const *scriptArgv);
++      OS << R"(
++  switch (tryState) {
++    default:
++      abort();
++)";
++      for (const auto &[tryStart, id] : tryIDs) {
++        OS << "    case " << id << ":\n"
++           << "      goto ";
++        generateBasicBlockLabel(tryStart->getCatchTarget(), OS, bbMap);
++        OS << ";\n";
++      }
++      OS << "  }\n";
++    }
++    OS << "}\n";
++  }
++  wrapperSourceOS.flush();
++
++  // The wrapper keeps block labels and terminators while helpers replace
++  // outlineable instruction runs. A remaining singleton cannot be divided.
++  size_t wrapperInstructionCount = 0;
++  uint32_t nextWrapperPart = 0;
++  for (uint32_t blockIndex = 0; blockIndex < blocks.size(); ++blockIndex) {
++    const auto &instructions = blocks[blockIndex].instructions;
++    for (size_t instructionIndex = 0;
++         instructionIndex < instructions.size();) {
++      if (outline && nextWrapperPart < parts.size() &&
++          parts[nextWrapperPart].blockIndex == blockIndex &&
++          parts[nextWrapperPart].begin == instructionIndex) {
++        instructionIndex = parts[nextWrapperPart].end;
++        ++nextWrapperPart;
++      } else {
++        ++wrapperInstructionCount;
++        ++instructionIndex;
++      }
++    }
++  }
++  assert(
++      nextWrapperPart == parts.size() && "not all outlined parts were counted");
++
++  std::vector<BufferedBundleFunction> result;
++  auto wrapperOversizeReason = sh::SHCBundleOversizeReason::None;
++  if (wrapperSource.size() > options.cBundleShardSize) {
++    if (wrapperInstructionCount == 1)
++      wrapperOversizeReason = sh::SHCBundleOversizeReason::SingleInstruction;
++    else if (!outline)
++      wrapperOversizeReason =
++          sh::SHCBundleOversizeReason::NoOutlineableRun;
++  }
++  result.push_back({
++      &F,
++      std::move(wrapperSource),
++      outline ||
++          cOptimizationLevel == sh::SHCBundleCOptimizationLevel::O0,
++      0,
++      outline ? static_cast<uint32_t>(parts.size() + 1) : 0,
++      cOptimizationLevel,
++      wrapperOversizeReason,
++  });
++  if (outline)
++    result.back().referencedFunctions = std::move(wrapperReferences);
++  if (outline) {
++    for (uint32_t part = 0; part < parts.size(); ++part) {
++      const auto &outlinedPart = parts[part];
++      const auto &instructions = blocks[outlinedPart.blockIndex].instructions;
++      auto source = generateOutlinedPart(
++          &F,
++          part,
++          llvh::ArrayRef<BufferedOutlinedInstruction>(instructions).slice(
++              outlinedPart.begin, outlinedPart.end - outlinedPart.begin),
++          moduleGen.nativeFunctionTable,
++          localsSize,
++          nonPtrSize,
++          srcMgr,
++          options.emitLineDirectives);
++      auto oversizeReason = sh::SHCBundleOversizeReason::None;
++      if (source.size() > options.cBundleShardSize &&
++          outlinedPart.end - outlinedPart.begin == 1) {
++        oversizeReason = sh::SHCBundleOversizeReason::SingleInstruction;
++      }
++      result.push_back({
++          &F,
++          std::move(source),
++          true,
++          part + 1,
++          static_cast<uint32_t>(parts.size() + 1),
++          sh::SHCBundleCOptimizationLevel::Default,
++          oversizeReason,
++      });
++      auto &referencedFunctions = result.back().referencedFunctions;
++      referencedFunctions.resize(moduleGen.nativeFunctionTable.size());
++      for (const auto &instruction :
++           llvh::ArrayRef<BufferedOutlinedInstruction>(instructions)
++               .slice(
++                   outlinedPart.begin,
++                   outlinedPart.end - outlinedPart.begin)) {
++        collectReferencedFunction(
++            instruction.instruction,
++            moduleGen.nativeFunctionTable,
++            referencedFunctions);
++      }
++    }
++  }
++  return result;
++}
+ 
+-void free_console_context(SHConsoleContext *consoleContext);
++std::string bundleFilePath(
++    llvh::StringRef unitName,
++    llvh::StringRef suffix) {
++  return ("sh_" + unitName + suffix).str();
++}
+ 
+-bool run_event_loop(
+-    SHRuntime *shr,
+-    SHConsoleContext *consoleContext);
++void generateBundleHeader(
++    llvh::raw_ostream &OS,
++    ModuleGen &moduleGen,
++    llvh::StringRef unitName) {
++  OS << "#ifndef SH_" << unitName << "_INTERNAL_H\n"
++     << "#define SH_" << unitName << "_INTERNAL_H\n\n"
++     << "#include \"hermes/VM/static_h.h\"\n\n"
++     << "#include <stdlib.h>\n\n"
++     << "#if defined(_WIN32)\n"
++     << "#define SH_BUNDLE_HIDDEN\n"
++     << "#else\n"
++     << "#define SH_BUNDLE_HIDDEN __attribute__((visibility(\"hidden\")))\n"
++     << "#endif\n\n"
++     << "extern SH_BUNDLE_HIDDEN uint32_t ";
++  moduleGen.nativeFunctionTable.generateUnitIndexLabel(OS);
++  OS << ";\nextern SH_BUNDLE_HIDDEN SHNativeFuncInfo ";
++  moduleGen.nativeFunctionTable.generateFunctionInfoTableLabel(OS);
++  OS << "[];\n\n#endif\n";
++}
+ 
+-int main(int argc, char **argv) {
+-  int scriptArgc = 0;
+-  char **scriptArgv = NULL;
+-  int clArgc = argc;
+-  for (int i = 1; i < argc; ++i) {
+-    if (argv[i][0] == '-' && argv[i][1] == '-' && argv[i][2] == '\0') {
+-      scriptArgc = argc - i - 1;
+-      scriptArgv = argv + i + 1;
+-      clArgc = i;
+-      break;
++void collectReferencedFunctions(
++    Function *function,
++    const SHNativeJSFunctionTable &functionTable,
++    llvh::BitVector &referenced) {
++  for (auto &BB : *function) {
++    for (auto &I : BB)
++      collectReferencedFunction(&I, functionTable, referenced);
++  }
++}
++
++void generateBundleFunctionDeclaration(
++    llvh::raw_ostream &OS,
++    Function *function,
++    const SHNativeJSFunctionTable &functionTable) {
++  OS << "SH_BUNDLE_HIDDEN SHLegacyValue ";
++  functionTable.generateFunctionLabel(function, OS);
++  OS << "(SHRuntime *shr);\n";
++}
++
++bool generateBundleFunctionShard(
++    Module *M,
++    sh::SHCBundleWriteFile writeFile,
++    llvh::StringRef headerPath,
++    llvh::StringRef unitName,
++    ModuleGen &moduleGen,
++    const std::vector<Function *> &functionsByIndex,
++    const std::vector<BufferedBundleFunction> &functions,
++    uint64_t bodyBytes,
++    uint32_t shardIndex,
++    uint64_t targetBytes,
++    sh::SHCBundleFile &file) {
++  std::string path;
++  llvh::raw_string_ostream pathOS(path);
++  pathOS << "sh_" << unitName << "_functions_"
++         << llvh::format("%05u", shardIndex) << ".c";
++  pathOS.flush();
++
++  llvh::BitVector declarations(moduleGen.nativeFunctionTable.size());
++  std::vector<Function *> shardFunctions;
++  shardFunctions.reserve(functions.size());
++  for (const auto &function : functions) {
++    shardFunctions.push_back(function.function);
++    declarations.set(
++        moduleGen.nativeFunctionTable.getIndex(function.function));
++    if (function.functionFragmentCount != 0) {
++      assert(
++          function.referencedFunctions.size() == declarations.size() &&
++          "function fragments require exact declaration sets");
++      declarations |= function.referencedFunctions;
++    } else {
++      collectReferencedFunctions(
++          function.function, moduleGen.nativeFunctionTable, declarations);
+     }
+   }
+-  SHRuntime *shr = _sh_init(clArgc, argv);
+-  SHConsoleContext *consoleContext =
+-      init_console_bindings(shr, scriptArgc, (const char *const *)scriptArgv);
+-  bool success =
+-    _sh_initialize_units(shr, 1, CREATE_THIS_UNIT) &&
+-    run_event_loop(shr, consoleContext);
+-  free_console_context(consoleContext);
+-  _sh_done(shr);
+-  return success ? 0 : 1;
++  auto usedExterns = collectUsedExterns(shardFunctions);
++
++  assert(
++      (functions.size() == 1 ||
++       llvh::all_of(functions, [](const BufferedBundleFunction &function) {
++         return function.functionFragmentCount == 0 &&
++             function.cOptimizationLevel ==
++             sh::SHCBundleCOptimizationLevel::Default;
++       })) &&
++      "function fragments and compile-policy overrides require isolated "
++      "shards");
++
++  const bool oversize = functions.size() == 1 && bodyBytes > targetBytes;
++  const auto oversizeReason = functions.size() == 1
++      ? functions.front().oversizeReason
++      : sh::SHCBundleOversizeReason::None;
++  if (oversize && oversizeReason == sh::SHCBundleOversizeReason::None) {
++    M->getContext().getSourceErrorManager().error(
++        functions.front().function->getSourceRange().Start,
++        "Static Hermes C bundle could not outline an oversized function "
++        "shard");
++    return false;
++  }
++  if (!oversize && oversizeReason != sh::SHCBundleOversizeReason::None) {
++    M->getContext().getSourceErrorManager().error(
++        functions.front().function->getSourceRange().Start,
++        "Static Hermes C bundle assigned an oversize reason to a fitting "
++        "function shard");
++    return false;
++  }
++
++  if (!writeFile(path, [&](llvh::raw_ostream &OS) {
++        OS << "#include \"" << headerPath << "\"\n\n";
++        generateExternCIncludes(M, OS, *usedExterns);
++        generateExternC(M, OS, *usedExterns);
++        for (int index = declarations.find_first(); index >= 0;
++             index = declarations.find_next(index)) {
++          generateBundleFunctionDeclaration(
++              OS, functionsByIndex[index], moduleGen.nativeFunctionTable);
++        }
++        OS << '\n';
++        for (const auto &function : functions)
++          OS << function.source;
++      })) {
++    return false;
++  }
++
++  file = {
++      path,
++      sh::SHCBundleFileRole::Function,
++      moduleGen.nativeFunctionTable.getIndex(functions.front().function),
++      moduleGen.nativeFunctionTable.getIndex(functions.back().function),
++      static_cast<uint32_t>(functions.size()),
++      targetBytes,
++      oversize,
++      oversizeReason,
++      functions.size() == 1 ? functions.front().functionFragmentIndex : 0,
++      functions.size() == 1 ? functions.front().functionFragmentCount : 0,
++      functions.size() == 1
++          ? functions.front().cOptimizationLevel
++          : sh::SHCBundleCOptimizationLevel::Default,
++  };
++  return true;
+ }
+-)";
++
++bool generateModuleBundle(
++    Module *M,
++    sh::SHCBundleWriteFile writeFile,
++    std::vector<sh::SHCBundleFile> &files,
++    const BytecodeGenerationOptions &options) {
++  assert(options.emitCBundle && "bundle generation requires emitCBundle");
++  assert(options.cBundleShardSize > 0 && "bundle shard size must be positive");
++  assert(
++      (options.format == DumpBytecode || options.format == EmitBundle) &&
++      "bundle generation requires C output");
++  if (!lowerModuleIR(M, options.optimizationEnabled))
++    return false;
++
++  if (options.verifyIR &&
++      !verifyModule(*M, &llvh::errs(), VerificationMode::IR_LOWERED)) {
++    M->getContext().getSourceErrorManager().error(
++        SMLoc{}, "Lowered IR verification failed");
++    return false;
++  }
++  if (!isValidSHUnitName(options.unitName))
++    hermes_fatal("Invalid unit name passed to SH backend.");
++
++  uint32_t nextWriteCacheIdx = 0;
++  uint32_t nextReadCacheIdx = 0;
++  uint32_t nextPrivateNameCacheIdx = 0;
++  ModuleGen moduleGen{
++      M, options.optimizationEnabled, options.unitName};
++  const auto functionsByIndex =
++      moduleGen.nativeFunctionTable.functionsByIndex();
++  M->assignIndexToVariables();
++
++  const std::string headerPath =
++      bundleFilePath(options.unitName, "_internal.h");
++  if (!writeFile(headerPath, [&](llvh::raw_ostream &OS) {
++        generateBundleHeader(OS, moduleGen, options.unitName);
++      })) {
++    return false;
++  }
++
++  std::vector<sh::SHCBundleFile> functionFiles;
++  std::vector<BufferedBundleFunction> bufferedFunctions;
++  uint64_t bufferedBytes = 0;
++  uint32_t shardIndex = 0;
++  auto flushShard = [&]() {
++    if (bufferedFunctions.empty())
++      return true;
++    if (shardIndex >= kMaxBundleFunctionShards) {
++      hermes_fatal("Static Hermes C bundle has too many function shards");
++    }
++    sh::SHCBundleFile file;
++    if (!generateBundleFunctionShard(
++            M,
++            writeFile,
++            headerPath,
++            options.unitName,
++            moduleGen,
++            functionsByIndex,
++            bufferedFunctions,
++            bufferedBytes,
++            shardIndex++,
++            options.cBundleShardSize,
++            file)) {
++      return false;
++    }
++    functionFiles.push_back(std::move(file));
++    bufferedFunctions.clear();
++    bufferedBytes = 0;
++    return true;
++  };
++
++  // Keep function generation sequential. String, source-location, and cache
++  // indexes are allocated while bodies are emitted and are shared by all
++  // shards in this logical unit.
++  for (Function *function : functionsByIndex) {
++    const auto cOptimizationLevel =
++        cOptimizationLevelForFunction(function);
++    std::vector<BufferedBundleFunction> generatedFunctions;
++    if (canOutlineFunction(function)) {
++      generatedFunctions = generateOutlinedBundleFunction(
++          *function,
++          moduleGen,
++          nextWriteCacheIdx,
++          nextReadCacheIdx,
++          nextPrivateNameCacheIdx,
++          cOptimizationLevel,
++          options);
++    } else {
++      std::string source;
++      llvh::raw_string_ostream sourceOS(source);
++      {
++        sh::LineDirectiveEmitter emitter(sourceOS);
++        generateFunction(
++            *function,
++            emitter,
++            moduleGen,
++            nextWriteCacheIdx,
++            nextReadCacheIdx,
++            nextPrivateNameCacheIdx,
++            options);
++      }
++      sourceOS.flush();
++      size_t instructionCount = 0;
++      for (const auto &block : *function) {
++        for (const auto &instruction : block) {
++          (void)instruction;
++          ++instructionCount;
++        }
++      }
++      auto oversizeReason = sh::SHCBundleOversizeReason::None;
++      if (source.size() > options.cBundleShardSize) {
++        if (instructionCount == 1)
++          oversizeReason = sh::SHCBundleOversizeReason::SingleInstruction;
++        else
++          oversizeReason = sh::SHCBundleOversizeReason::NoOutlineableRun;
++      }
++      generatedFunctions.push_back({
++          function,
++          std::move(source),
++          cOptimizationLevel == sh::SHCBundleCOptimizationLevel::O0,
++          0,
++          0,
++          cOptimizationLevel,
++          oversizeReason,
++      });
++    }
++
++    for (auto &generated : generatedFunctions) {
++      const uint64_t functionBytes = generated.source.size();
++      const bool isolate = generated.isolate;
++      if (!bufferedFunctions.empty() &&
++          (isolate || bufferedBytes >= options.cBundleShardSize ||
++           functionBytes > options.cBundleShardSize - bufferedBytes)) {
++        if (!flushShard())
++          return false;
++      }
++      bufferedBytes += functionBytes;
++      bufferedFunctions.push_back(std::move(generated));
++      if ((isolate || functionBytes > options.cBundleShardSize) &&
++          !flushShard())
++        return false;
+     }
+   }
++  if (!flushShard())
++    return false;
++
++  // The metadata tables must be emitted after every body has allocated its
++  // shared indexes.
++  const std::string metadataPath =
++      bundleFilePath(options.unitName, "_metadata.c");
++  if (!writeFile(metadataPath, [&](llvh::raw_ostream &OS) {
++        OS << "#include \"" << headerPath << "\"\n\n";
++        generateBundleFunctionDeclaration(
++            OS, M->getTopLevelFunction(), moduleGen.nativeFunctionTable);
++        OS << '\n';
++        generateUnitData(
++            M,
++            OS,
++            moduleGen,
++            nextWriteCacheIdx,
++            nextReadCacheIdx,
++            nextPrivateNameCacheIdx,
++            options);
++      })) {
++    return false;
++  }
++
++  files.clear();
++  files.push_back({headerPath, sh::SHCBundleFileRole::Header});
++  files.push_back({metadataPath, sh::SHCBundleFileRole::Metadata});
++  files.insert(
++      files.end(),
++      std::make_move_iterator(functionFiles.begin()),
++      std::make_move_iterator(functionFiles.end()));
++  return true;
+ }
+ } // namespace
+ 
+@@ -3247,3 +4318,11 @@ void sh::generateSH(
+   LineDirectiveEmitter emitter{OS};
+   generateModule(M, emitter, options);
+ }
++
++bool sh::generateSHBundle(
++    Module *M,
++    SHCBundleWriteFile writeFile,
++    std::vector<SHCBundleFile> &files,
++    const BytecodeGenerationOptions &options) {
++  return generateModuleBundle(M, writeFile, files, options);
++}
+diff --git a/test/lit.cfg b/test/lit.cfg
+index e0caa880faac4b564cd287874f407199792ebed9..4af00fdcb5b7013b7ea7b3f3fe3abe301b3ec42c 100644
+--- a/test/lit.cfg
++++ b/test/lit.cfg
+@@ -158,6 +158,14 @@ if lit_config.params.get("FileCheckOrRegen"):
+   substitute(config, "FileCheckOrRegen")
+ if lit_config.params.get("FileCheck"):
+   substitute(config, "FileCheck", extra = os.environ.get("LIT_FILECHECK_FLAGS", ""))
++if lit_config.params.get("c_compiler"):
++  config.substitutions.append(("%c_compiler", '"' + lit_config.params["c_compiler"].replace('\\', '/') + '"'))
++if lit_config.params.get("hermesvm_lib_dir"):
++  config.substitutions.append(("%hermesvm_lib_dir", lit_config.params["hermesvm_lib_dir"].replace('\\', '/')))
++if lit_config.params.get("shermes_console_lib_dir"):
++  config.substitutions.append(("%shermes_console_lib_dir", lit_config.params["shermes_console_lib_dir"].replace('\\', '/')))
++if lit_config.params.get("static_h_config"):
++  config.substitutions.append(("%static_h_config", lit_config.params["static_h_config"].replace('\\', '/')))
+ if lit_config.params.get("hermesc"):
+   substitute(config, "hermesc")
+ if lit_config.params.get("hermes"):
+diff --git a/test/shermes/emit-c-bundle-outline.js b/test/shermes/emit-c-bundle-outline.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..14d53dd15f01f5bc97eef65c9d769f95a9722f22
+--- /dev/null
++++ b/test/shermes/emit-c-bundle-outline.js
+@@ -0,0 +1,47 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++// REQUIRES: linux
++// RUN: rm -rf %t.dir && mkdir %t.dir
++// RUN: env python3 -c "import pathlib; target=pathlib.Path(r'%t.dir/input.js'); maybe='function maybeThrow(flag) { \\\"noinline\\\"; if (flag) throw new Error(\\\"boom\\\"); }\n'; outlined='function outlined(flag) { \\\"noinline\\\"; var retained = {answer: 42}; var value = {}; var number = 40;\n'+''.join('value.p%d = %d;\n' % (i, i) for i in range(100))+'gc(); maybeThrow(flag);\n'+''.join('value.p%d = %d;\n' % (i, i) for i in range(100, 200))+'return retained.answer + number + value.p199; }\n'; branch='function branched(flag) { \\\"noinline\\\"; var value = {}; if (flag) {\n'+''.join('value.q%d = %d;\n' % (i, i) for i in range(200))+'} return value; }\n'; loop='function looped(input) { \\\"noinline\\\"; var retained = {sum: 0}; var filler = {};\n'+''.join('filler.r%d = %d;\n' % (i, i) for i in range(200))+'for (var key in input) { gc(); retained.sum += input[key]; } return retained.sum; }\n'; with_try='function withTry(flag) { \\\"noinline\\\"; var value = {}; try {\n'+''.join('value.t%d = %d;\n' % (i, i) for i in range(200))+'if (flag) throw new Error(\\\"caught\\\"); } catch (error) { value.caught = true; } return value; }\n'; complex_cfg='function complex(value) { \\\"noinline\\\"; var result = -1;\n'+''.join('if (value === %d) result = %d;\n' % (i, i) for i in range(1100))+'return result; }\n'; main='print(outlined(false)); try { outlined(true); } catch (error) { print(error.message); } print(\\\"after\\\"); print(branched(true).q199); print(branched(false).q199 === undefined); print(looped({a: 2, b: 3})); print(looped({})); print(withTry(false).t199); print(withTry(true).caught); print(complex(1099));\n'; target.write_text(maybe+outlined+branch+loop+with_try+complex_cfg+main)"
++// RUN: cd %t.dir && %shermes -O -emit-c -Xemit-c-bundle -Xemit-c-shard-size=65536 -exported-unit=outline -o unit.c.json input.js
++// RUN: cd %t.dir && env python3 -c "import json; raw=open('unit.c.json').read(); assert '\\\"cOptimizationLevel\\\":0,\\\"firstFunctionId\\\":' in raw and raw == json.dumps(json.loads(raw), separators=(',', ':'), sort_keys=True) + '\\n'"
++// RUN: cd %t.dir && env python3 -c "import json,pathlib,re; manifest=json.load(open('unit.c.json')); units=manifest['translationUnits']; function_units=[unit for unit in units if unit['role']=='function']; sources={unit['path']:pathlib.Path(unit['path']).read_text() for unit in function_units}; part_files={path:source for path,source in sources.items() if re.search(r'void sh_outline_f_[0-9]+_part_[0-9]+\\([^)]*\\) \\{',source)}; ids={int(match) for source in part_files.values() for match in re.findall(r'void sh_outline_f_([0-9]+)_part_[0-9]+',source)}; fragments=[unit for unit in function_units if 'functionFragmentCount' in unit]; fragment_ids={unit['firstFunctionId'] for unit in fragments}; wrappers=[sources[unit['path']] for unit in fragments if unit['functionFragmentIndex'] == 0]; o0_units=[unit for unit in function_units if unit.get('cOptimizationLevel') == 0]; assert len(part_files) >= 2 and len(ids) >= 2 and ids == fragment_ids; assert all('_sh_enter(' not in source and '_sh_leave(' not in source and 'SH_ATTRIBUTE_NOINLINE' in source and 'tryState' not in source and 'jmpBuf' not in source for source in part_files.values()); assert any('goto L' in source for source in wrappers); assert any('SHJmpBuf jmpBuf' in source and 'L_catch:' in source for source in wrappers); assert len(o0_units) == 1 and o0_units[0]['functionCount'] == 1 and 'functionFragmentCount' not in o0_units[0] and o0_units[0]['oversize'] and o0_units[0]['oversizeReason'] == 'no-outlineable-run'; assert all(not unit['oversize'] and 'oversizeReason' not in unit for unit in fragments); assert all(not unit.get('oversize') or unit is o0_units[0] for unit in function_units); assert all((lambda group: group[0]['functionFragmentCount'] == len(group) and {unit['functionFragmentIndex'] for unit in group} == set(range(len(group))) and all(unit['functionFragmentCount'] == len(group) and unit['firstFunctionId'] == function_id and unit['lastFunctionId'] == function_id for unit in group))([unit for unit in fragments if unit['firstFunctionId'] == function_id]) for function_id in fragment_ids)"
++// RUN: cd %t.dir && env python3 -c "import json; units=json.load(open('unit.c.json'))['translationUnits']; fragment_ids={unit['firstFunctionId'] for unit in units if 'functionFragmentCount' in unit}; groups={function_id:[index for index,unit in enumerate(units) if unit.get('firstFunctionId') == function_id and 'functionFragmentCount' in unit] for function_id in fragment_ids}; assert all(indexes == list(range(indexes[0], indexes[0] + len(indexes))) for indexes in groups.values())"
++// RUN: env python3 -c "import pathlib; target=pathlib.Path(r'%t.dir/initializers.js'); count=1500; target.write_text(''.join('var closure%d = function closure%d() { return %d; };\\nvar class%d = class Class%d {};\\n' % (i, i, i, i, i) for i in range(count)) + 'print(typeof closure1499, typeof class1499);\\n')"
++// RUN: cd %t.dir && %shermes -O -emit-c -Xemit-c-bundle -Xemit-c-shard-size=65536 -exported-unit=initializers -o initializers.c.json initializers.js
++// RUN: cd %t.dir && env python3 -c "import json,pathlib,re; target=65536; manifest=json.load(open('initializers.c.json')); fragments=[unit for unit in manifest['translationUnits'] if unit['role']=='function' and unit.get('firstFunctionId') == 0 and 'functionFragmentCount' in unit]; assert len(fragments) > 1; assert fragments[0]['functionFragmentCount'] == len(fragments); assert {unit['functionFragmentIndex'] for unit in fragments} == set(range(len(fragments))); assert all(unit['functionCount'] == 1 and unit['lastFunctionId'] == 0 and not unit.get('oversize', False) and unit['size'] <= target for unit in fragments); sources=[pathlib.Path(unit['path']).read_text() for unit in fragments]; assert sum(source.count('_sh_ljs_create_closure') + source.count('_sh_ljs_create_class') for source in sources) >= 2 * 1500; assert any(re.search(r'void sh_initializers_f_0_part_[0-9]+\\(', source) for source in sources)"
++// RUN: env python3 -c "import pathlib; target=pathlib.Path(r'%t.dir/single.js'); target.write_text('function single() { \\\"noinline\\\"; var object = {};\n'+''.join('object.p%d = %d;\n' % (i, i) for i in range(100))+'return object; }\nprint(single().p99);\n')"
++// RUN: cd %t.dir && %shermes -O -emit-c -Xemit-c-bundle -Xemit-c-shard-size=1 -exported-unit=single -o single.c.json single.js
++// RUN: cd %t.dir && env python3 -c "import json; units=json.load(open('single.c.json'))['translationUnits']; groups={function_id:[unit for unit in units if unit.get('firstFunctionId') == function_id and 'functionFragmentCount' in unit] for function_id in {unit['firstFunctionId'] for unit in units if 'functionFragmentCount' in unit}}; assert any(len(group) > 1 and all(unit['oversize'] and unit['oversizeReason'] == 'single-instruction' for unit in group) for group in groups.values())"
++// RUN: env python3 -c "import pathlib; target=pathlib.Path(r'%t.dir/invariant.js'); linear='function mixed(value) { \\\"noinline\\\"; var object = {};\n'+''.join('object.p%d = %d;\n' % (i, i) for i in range(64)); cfg=''.join('if (value === %d) object.q%d = %d;\n' % (i, i, i) for i in range(1100)); target.write_text(linear+cfg+'return object; }\nprint(mixed(1099).q1099);\n')"
++// RUN: cd %t.dir && (! %shermes -O -emit-c -Xemit-c-bundle -Xemit-c-shard-size=65536 -exported-unit=invariant -o invariant.c.json invariant.js 2>&1) | %FileCheck --check-prefix=INVARIANT %s
++// RUN: cd %t.dir && test ! -e invariant.c.json
++// RUN: env python3 -c "import pathlib; pathlib.Path(r'%t.dir/initializers-main.c').write_text('#include \"hermes/VM/static_h.h\"\\n\\ntypedef struct SHConsoleContext SHConsoleContext;\\n\\nSHConsoleContext *init_console_bindings(SHRuntime *shr, int scriptArgc, const char *const *scriptArgv);\\nvoid free_console_context(SHConsoleContext *consoleContext);\\nbool run_event_loop(SHRuntime *shr, SHConsoleContext *consoleContext);\\nextern SHUnit *sh_export_initializers(void);\\n\\nint main(void) {\\n  SHRuntime *shr = _sh_init(0, NULL);\\n  SHConsoleContext *consoleContext = init_console_bindings(shr, 0, NULL);\\n  bool success = _sh_initialize_units(shr, 1, sh_export_initializers) && run_event_loop(shr, consoleContext);\\n  free_console_context(consoleContext);\\n  _sh_done(shr);\\n  return success ? 0 : 1;\\n}\\n')"
++// RUN: cd %t.dir && for source in sh_initializers_*.c; do %c_compiler -DNDEBUG -I%static_h_config -I%S/../../include -c "$source" -o "${source%.c}.o" || exit; done
++// RUN: cd %t.dir && %c_compiler -DNDEBUG -I%static_h_config -I%S/../../include initializers-main.c sh_initializers_*.o -L%hermesvm_lib_dir -L%shermes_console_lib_dir -Wl,-rpath,%hermesvm_lib_dir -Wl,-rpath,%shermes_console_lib_dir -lshermes_console -lhermesvm -lm -o initializers
++// RUN: cd %t.dir && ./initializers | env python3 -c "import sys; assert sys.stdin.read() == 'function function\\n'"
++// RUN: cd %t.dir && for source in sh_outline_*.c; do %c_compiler -I%static_h_config -I%S/../../include -c "$source" -o "${source%.c}.o" || exit; done
++// RUN: cd %t.dir && %c_compiler -r sh_outline_*.o -o unit.o
++// RUN: cd %t.dir && ! nm -u unit.o | grep sh_outline
++// RUN: cd %t.dir && %shermes -O -emit-c -Xemit-c-bundle -Xemit-c-shard-size=65536 -o executable.c.json input.js
++// RUN: cd %t.dir && for source in sh_this_unit_*.c; do %c_compiler -DNDEBUG -I%static_h_config -I%S/../../include -c "$source" -o "${source%.c}.o" || exit; done
++// RUN: cd %t.dir && %c_compiler sh_this_unit_*.o -L%hermesvm_lib_dir -L%shermes_console_lib_dir -Wl,-rpath,%hermesvm_lib_dir -Wl,-rpath,%shermes_console_lib_dir -lshermes_console -lhermesvm -lm -o executable
++// RUN: cd %t.dir && ./executable | %FileCheck %s
++
++// CHECK: 281
++// CHECK-NEXT: boom
++// CHECK-NEXT: after
++// CHECK-NEXT: 199
++// CHECK-NEXT: true
++// CHECK-NEXT: 5
++// CHECK-NEXT: 0
++// CHECK-NEXT: 199
++// CHECK-NEXT: true
++// CHECK-NEXT: 1099
++
++// INVARIANT: Static Hermes C bundle could not outline an oversized function shard
+diff --git a/test/shermes/emit-c-bundle.js b/test/shermes/emit-c-bundle.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..f58bcb253831e61cf1c2c2128383e590c3e91ea5
+--- /dev/null
++++ b/test/shermes/emit-c-bundle.js
+@@ -0,0 +1,33 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++// REQUIRES: linux
++// RUN: rm -rf %t.dir && mkdir %t.dir
++// RUN: cd %t.dir && %shermes -O -emit-c -Xemit-c-bundle -Xemit-c-shard-size=1 -exported-unit=bundle_test -o unit.c.json %s
++// RUN: cd %t.dir && %shermes -O -emit-c -Xemit-c-bundle -Xemit-c-shard-size=1 -exported-unit=bundle_other -o other.c.json %s
++// RUN: %FileCheck --input-file=%t.dir/unit.c.json %s
++// RUN: cd %t.dir && %python -c "import hashlib,json,pathlib; manifest=json.load(open('unit.c.json')); members=[manifest['header'],*manifest['translationUnits']]; assert all(hashlib.sha256(pathlib.Path(member['path']).read_bytes()).hexdigest() == member['sha256'] and pathlib.Path(member['path']).stat().st_size == member['size'] for member in members)"
++// RUN: cd %t.dir && %python -c "import pathlib; source=pathlib.Path('sh_bundle_test_metadata.c').read_text(); assert 'SH_STATIC_ABI_DESCRIPTOR_INITIALIZER' in source and '&s_static_abi_descriptor, sizeof(s_static_abi_descriptor)' in source and source.index('_sh_check_abi') < source.index('calloc')"
++// RUN: cd %t.dir && for source in sh_bundle_*.c; do %c_compiler -I%static_h_config -I%S/../../include -c "$source" -o "${source%.c}.o" || exit; done
++// RUN: cd %t.dir && %c_compiler -r sh_bundle_test_*.o sh_bundle_other_*.o -o unit.o
++// RUN: cd %t.dir && ! nm -u unit.o | grep 'sh_bundle_\(test\|other\)'
++
++// CHECK: {"header":{"path":"sh_bundle_test_internal.h","role":"header","sha256":"{{[0-9a-f][0-9a-f]+}}","size":{{[1-9][0-9]*}}},"kind":"static-hermes-c-bundle-v1","schemaVersion":1,"translationUnits":[{"path":"sh_bundle_test_metadata.c","role":"metadata","sha256":"{{[0-9a-f][0-9a-f]+}}","size":{{[1-9][0-9]*}}},{"firstFunctionId":0,"functionCount":1,"lastFunctionId":0,"oversize":true,"oversizeReason":"no-outlineable-run","path":"sh_bundle_test_functions_00000.c"
++// CHECK-SAME: {"firstFunctionId":1,"functionCount":1,"lastFunctionId":1,"oversize":true,"oversizeReason":"no-outlineable-run","path":"sh_bundle_test_functions_00001.c"
++// CHECK-SAME: {"firstFunctionId":2,"functionCount":1,"lastFunctionId":2,"oversize":true,"oversizeReason":"no-outlineable-run","path":"sh_bundle_test_functions_00002.c"
++
++function child() {
++  "noinline";
++  return 1;
++}
++
++function parent() {
++  "noinline";
++  return child();
++}
++
++print(parent());
+diff --git a/tools/shermes/compile.cpp b/tools/shermes/compile.cpp
+index 28079459d70ff58507f6d6e16d9a91952087cad7..a4d24980ad966bfddf463f54b672180cc2de5434 100644
+--- a/tools/shermes/compile.cpp
++++ b/tools/shermes/compile.cpp
+@@ -13,10 +13,14 @@
+ #include "hermes/BCGen/SH/SH.h"
+ 
+ #include "llvh/ADT/ScopeExit.h"
++#include "llvh/Support/MemoryBuffer.h"
+ #include "llvh/Support/Path.h"
+ #include "llvh/Support/Program.h"
+ #include "llvh/Support/Signals.h"
+ 
++#include <algorithm>
++#include <array>
++
+ #ifdef _WIN32
+ #define WIN32_LEAN_AND_MEAN
+ #define NOMINMAX
+@@ -31,6 +35,153 @@ using namespace hermes;
+ 
+ namespace {
+ 
++class SHA256 {
++  std::array<uint8_t, 64> data_{};
++  size_t dataLength_{0};
++  uint64_t bitLength_{0};
++  std::array<uint32_t, 8> state_{
++      0x6a09e667,
++      0xbb67ae85,
++      0x3c6ef372,
++      0xa54ff53a,
++      0x510e527f,
++      0x9b05688c,
++      0x1f83d9ab,
++      0x5be0cd19,
++  };
++
++  static uint32_t rotateRight(uint32_t value, uint32_t count) {
++    return (value >> count) | (value << (32 - count));
++  }
++
++  void transform() {
++    static constexpr std::array<uint32_t, 64> constants{
++        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b,
++        0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01,
++        0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7,
++        0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
++        0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152,
++        0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
++        0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
++        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
++        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819,
++        0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08,
++        0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f,
++        0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
++        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
++    };
++    std::array<uint32_t, 64> words{};
++    for (size_t i = 0; i < 16; ++i) {
++      words[i] = (static_cast<uint32_t>(data_[i * 4]) << 24) |
++          (static_cast<uint32_t>(data_[i * 4 + 1]) << 16) |
++          (static_cast<uint32_t>(data_[i * 4 + 2]) << 8) |
++          static_cast<uint32_t>(data_[i * 4 + 3]);
++    }
++    for (size_t i = 16; i < words.size(); ++i) {
++      const uint32_t s0 = rotateRight(words[i - 15], 7) ^
++          rotateRight(words[i - 15], 18) ^ (words[i - 15] >> 3);
++      const uint32_t s1 = rotateRight(words[i - 2], 17) ^
++          rotateRight(words[i - 2], 19) ^ (words[i - 2] >> 10);
++      words[i] = words[i - 16] + s0 + words[i - 7] + s1;
++    }
++
++    uint32_t a = state_[0];
++    uint32_t b = state_[1];
++    uint32_t c = state_[2];
++    uint32_t d = state_[3];
++    uint32_t e = state_[4];
++    uint32_t f = state_[5];
++    uint32_t g = state_[6];
++    uint32_t h = state_[7];
++    for (size_t i = 0; i < words.size(); ++i) {
++      const uint32_t sum1 =
++          rotateRight(e, 6) ^ rotateRight(e, 11) ^ rotateRight(e, 25);
++      const uint32_t choice = (e & f) ^ (~e & g);
++      const uint32_t temp1 = h + sum1 + choice + constants[i] + words[i];
++      const uint32_t sum0 =
++          rotateRight(a, 2) ^ rotateRight(a, 13) ^ rotateRight(a, 22);
++      const uint32_t majority = (a & b) ^ (a & c) ^ (b & c);
++      const uint32_t temp2 = sum0 + majority;
++      h = g;
++      g = f;
++      f = e;
++      e = d + temp1;
++      d = c;
++      c = b;
++      b = a;
++      a = temp1 + temp2;
++    }
++    state_[0] += a;
++    state_[1] += b;
++    state_[2] += c;
++    state_[3] += d;
++    state_[4] += e;
++    state_[5] += f;
++    state_[6] += g;
++    state_[7] += h;
++  }
++
++ public:
++  void update(llvh::StringRef bytes) {
++    for (uint8_t byte : bytes.bytes()) {
++      data_[dataLength_++] = byte;
++      if (dataLength_ == data_.size()) {
++        transform();
++        bitLength_ += 512;
++        dataLength_ = 0;
++      }
++    }
++  }
++
++  std::string finalHex() {
++    size_t index = dataLength_;
++    data_[index++] = 0x80;
++    if (index > 56) {
++      std::fill(data_.begin() + index, data_.end(), 0);
++      transform();
++      index = 0;
++    }
++    std::fill(data_.begin() + index, data_.begin() + 56, 0);
++    bitLength_ += dataLength_ * 8;
++    for (size_t i = 0; i < 8; ++i)
++      data_[63 - i] = static_cast<uint8_t>(bitLength_ >> (i * 8));
++    transform();
++
++    static constexpr char hex[] = "0123456789abcdef";
++    std::string result(64, '0');
++    for (size_t i = 0; i < state_.size(); ++i) {
++      for (size_t byte = 0; byte < 4; ++byte) {
++        const uint8_t value =
++            static_cast<uint8_t>(state_[i] >> (24 - byte * 8));
++        result[(i * 4 + byte) * 2] = hex[value >> 4];
++        result[(i * 4 + byte) * 2 + 1] = hex[value & 0x0f];
++      }
++    }
++    return result;
++  }
++};
++
++struct BundleFileIdentity {
++  uint64_t size;
++  std::string sha256;
++};
++
++llvh::Optional<BundleFileIdentity> identifyBundleFile(
++    llvh::StringRef path) {
++  auto file = llvh::MemoryBuffer::getFile(path, -1, false, false);
++  if (!file) {
++    llvh::errs() << "Failed to read generated bundle file " << path << ": "
++                 << file.getError().message() << '\n';
++    return llvh::None;
++  }
++  SHA256 hash;
++  hash.update(file.get()->getBuffer());
++  return BundleFileIdentity{
++      file.get()->getBufferSize(),
++      hash.finalHex(),
++  };
++}
++
+ /// Invoke the backend with the specified options. If the backend generates
+ /// an error (unlikely, but possible), print the number of errors and return
+ /// false.
+@@ -118,6 +269,212 @@ bool compileToC(
+   return fileOS.close();
+ }
+ 
++const char *bundleFileRoleName(sh::SHCBundleFileRole role) {
++  switch (role) {
++    case sh::SHCBundleFileRole::Header:
++      return "header";
++    case sh::SHCBundleFileRole::Metadata:
++      return "metadata";
++    case sh::SHCBundleFileRole::Function:
++      return "function";
++  }
++  llvm_unreachable("invalid Static Hermes C bundle file role");
++}
++
++const char *bundleOversizeReasonName(sh::SHCBundleOversizeReason reason) {
++  switch (reason) {
++    case sh::SHCBundleOversizeReason::None:
++      return "none";
++    case sh::SHCBundleOversizeReason::SingleInstruction:
++      return "single-instruction";
++    case sh::SHCBundleOversizeReason::NoOutlineableRun:
++      return "no-outlineable-run";
++  }
++  llvm_unreachable("invalid Static Hermes C bundle oversize reason");
++}
++
++bool compileToCBundle(
++    hermes::Context *context,
++    hermes::Module &M,
++    const ShermesCompileParams &params,
++    llvh::StringRef inputFilename,
++    llvh::StringRef outputFilename) {
++  llvh::SmallString<32> outputPathBuf{};
++  if (outputFilename.empty())
++    outputFilename = deriveFilename(inputFilename, outputPathBuf, ".c.json");
++  if (outputFilename == "-") {
++    llvh::errs() << "A generated C bundle requires a manifest file path\n";
++    return false;
++  }
++  const std::string generatedFilePrefix =
++      ("sh_" + params.genOptions.unitName + "_").str();
++  if (llvh::sys::path::filename(outputFilename).startswith(
++          generatedFilePrefix)) {
++    llvh::errs()
++        << "The generated C bundle manifest name conflicts with its members\n";
++    return false;
++  }
++
++  const llvh::StringRef outputDirectory =
++      llvh::sys::path::parent_path(outputFilename);
++  std::vector<sh::SHCBundleFile> files;
++  const auto writeFile = [&](llvh::StringRef path,
++                             llvh::function_ref<void(llvh::raw_ostream &)>
++                                 emit) {
++    llvh::SmallString<128> fullPath(outputDirectory);
++    llvh::sys::path::append(fullPath, path);
++    OutputStream output;
++    if (!output.open(fullPath, llvh::sys::fs::F_None))
++      return false;
++    emit(output.os());
++    return output.close();
++  };
++
++  assert(
++      context->getSourceErrorManager().getErrorCount() == 0 &&
++      "backend invocation with non-zero errors");
++  const bool generated =
++      sh::generateSHBundle(&M, writeFile, files, params.genOptions);
++  if (auto count = context->getSourceErrorManager().getErrorCount()) {
++    llvh::errs() << "Emitted " << count << " errors. exiting.\n";
++    return false;
++  }
++  if (!generated)
++    return false;
++  if (files.size() < 3 || files[0].role != sh::SHCBundleFileRole::Header ||
++      files[1].role != sh::SHCBundleFileRole::Metadata) {
++    llvh::errs() << "Static Hermes emitted an invalid C bundle file list\n";
++    return false;
++  }
++  uint32_t nextFunctionId = 0;
++  for (size_t index = 2; index < files.size();) {
++    const auto &file = files[index];
++    if (file.role != sh::SHCBundleFileRole::Function) {
++      llvh::errs() << "Static Hermes emitted an invalid C bundle file role\n";
++      return false;
++    }
++    const bool invalidShard =
++        file.functionCount == 0 ||
++        file.lastFunctionId < file.firstFunctionId ||
++        file.lastFunctionId - file.firstFunctionId + 1 !=
++            file.functionCount ||
++        file.firstFunctionId != nextFunctionId ||
++        (file.oversize &&
++         (file.functionCount != 1 ||
++          file.oversizeReason == sh::SHCBundleOversizeReason::None)) ||
++        (!file.oversize &&
++         file.oversizeReason != sh::SHCBundleOversizeReason::None);
++    if (invalidShard) {
++      llvh::errs() << "Static Hermes emitted invalid function shard "
++                      "oversize metadata\n";
++      return false;
++    }
++    if (file.functionFragmentCount == 0) {
++      nextFunctionId = file.lastFunctionId + 1;
++      ++index;
++      continue;
++    }
++    if (file.role != sh::SHCBundleFileRole::Function ||
++        file.firstFunctionId != file.lastFunctionId ||
++        file.functionCount != 1 ||
++        file.functionFragmentIndex != 0 ||
++        file.functionFragmentCount < 2) {
++      llvh::errs() << "Static Hermes emitted invalid function fragments\n";
++      return false;
++    }
++    if (file.functionFragmentCount > files.size() - index) {
++      llvh::errs() << "Static Hermes emitted incomplete function fragments\n";
++      return false;
++    }
++
++    // The backend emits a wrapper immediately followed by its helpers. Check
++    // that group once: checking every fragment against the whole file list
++    // would be quadratic at the 65,533-shard bundle limit.
++    for (uint32_t part = 0; part < file.functionFragmentCount; ++part) {
++      const auto &candidate = files[index + part];
++      if (candidate.role != sh::SHCBundleFileRole::Function ||
++          candidate.firstFunctionId != file.firstFunctionId ||
++          candidate.lastFunctionId != file.firstFunctionId ||
++          candidate.functionCount != 1 ||
++          candidate.functionFragmentCount != file.functionFragmentCount ||
++          candidate.functionFragmentIndex != part ||
++          (candidate.oversize &&
++           candidate.oversizeReason !=
++               sh::SHCBundleOversizeReason::SingleInstruction) ||
++          (!candidate.oversize &&
++           candidate.oversizeReason != sh::SHCBundleOversizeReason::None)) {
++        llvh::errs() << "Static Hermes emitted invalid function fragments\n";
++        return false;
++      }
++    }
++    nextFunctionId = file.firstFunctionId + 1;
++    index += file.functionFragmentCount;
++  }
++  if (nextFunctionId != static_cast<uint32_t>(M.size())) {
++    llvh::errs() << "Static Hermes emitted incomplete function shard coverage\n";
++    return false;
++  }
++
++  std::vector<BundleFileIdentity> identities;
++  identities.reserve(files.size());
++  for (const auto &file : files) {
++    llvh::SmallString<128> fullPath(outputDirectory);
++    llvh::sys::path::append(fullPath, file.path);
++    auto identity = identifyBundleFile(fullPath);
++    if (!identity)
++      return false;
++    identities.push_back(std::move(*identity));
++  }
++
++  OutputStream manifest;
++  if (!manifest.open(outputFilename, llvh::sys::fs::F_None))
++    return false;
++  auto &OS = manifest.os();
++  const auto emitCommonFields = [&](size_t index) {
++    const auto &file = files[index];
++    const auto &identity = identities[index];
++    OS << "\"path\":\"" << file.path << "\",\"role\":\""
++       << bundleFileRoleName(file.role) << "\",\"sha256\":\""
++       << identity.sha256 << "\",\"size\":" << identity.size;
++  };
++  OS << "{\"header\":{";
++  emitCommonFields(0);
++  OS << "},\"kind\":\"static-hermes-c-bundle-v1\",\"schemaVersion\":1,"
++        "\"translationUnits\":[";
++  for (size_t index = 1; index < files.size(); ++index) {
++    if (index != 1)
++      OS << ',';
++    OS << '{';
++    if (files[index].role == sh::SHCBundleFileRole::Function) {
++      if (files[index].cOptimizationLevel ==
++          sh::SHCBundleCOptimizationLevel::O0) {
++        OS << "\"cOptimizationLevel\":0,";
++      }
++      OS << "\"firstFunctionId\":" << files[index].firstFunctionId
++         << ",\"functionCount\":" << files[index].functionCount;
++      if (files[index].functionFragmentCount != 0) {
++        OS << ",\"functionFragmentCount\":"
++           << files[index].functionFragmentCount
++           << ",\"functionFragmentIndex\":"
++           << files[index].functionFragmentIndex;
++      }
++      OS << ",\"lastFunctionId\":" << files[index].lastFunctionId
++         << ",\"oversize\":" << (files[index].oversize ? "true" : "false")
++         << ',';
++      if (files[index].oversize) {
++        OS << "\"oversizeReason\":\""
++           << bundleOversizeReasonName(files[index].oversizeReason) << "\",";
++      }
++    }
++    emitCommonFields(index);
++    if (files[index].role == sh::SHCBundleFileRole::Function)
++      OS << ",\"targetBytes\":" << files[index].targetBytes;
++    OS << '}';
++  }
++  OS << "]}\n";
++  return manifest.close();
++}
++
+ /// Configuration for invoking the C compiler.
+ struct CCCfg {
+   std::string cc;
+@@ -535,6 +892,10 @@ bool shermesCompile(
+     return compileToDump(context, M, params, outputFilename);
+   }
+   if (outputLevel == OutputLevelKind::C) {
++    if (params.genOptions.emitCBundle) {
++      return compileToCBundle(
++          context, M, params, inputFilename, outputFilename);
++    }
+     return compileToC(context, M, params, inputFilename, outputFilename);
+   }
+   if (outputLevel <= OutputLevelKind::Executable) {
+diff --git a/tools/shermes/shermes.cpp b/tools/shermes/shermes.cpp
+index c6a403df9302e79bfc313690b06cc47c5dd15997..5db8804e8cddc6ec859f6260263f71956042f8ca 100644
+--- a/tools/shermes/shermes.cpp
++++ b/tools/shermes/shermes.cpp
+@@ -127,6 +127,16 @@ static cl::opt<bool> SmallC(
+     cl::init(false),
+     cl::desc("Optimize output native code for size instead of performance"));
+ 
++static cl::opt<bool> EmitCBundle(
++    "Xemit-c-bundle",
++    cl::init(false),
++    cl::desc("Emit generated C as a manifest and multiple translation units"));
++
++static cl::opt<unsigned> EmitCShardSize(
++    "Xemit-c-shard-size",
++    cl::init(2 * 1024 * 1024),
++    cl::desc("Target function-body bytes per generated C translation unit"));
++
+ cl::opt<DebugLevel> DebugInfoLevel(
+     cl::desc("Choose debug info level:"),
+     cl::init(DebugLevel::g0),
+@@ -915,6 +925,14 @@ bool compileFromCommandLineOptions() {
+     llvh::errs() << "Error: unused exec arguments\n";
+     return false;
+   }
++  if (cli::EmitCBundle && cli::OutputLevel != OutputLevelKind::C) {
++    llvh::errs() << "Error: -Xemit-c-bundle requires -emit-c.\n";
++    return false;
++  }
++  if (cli::EmitCBundle && cli::EmitCShardSize == 0) {
++    llvh::errs() << "Error: -Xemit-c-shard-size must be positive.\n";
++    return false;
++  }
+   if (!cli::ExportedUnit.empty()) {
+     if (cli::OutputLevel == OutputLevelKind::Run ||
+         cli::OutputLevel == OutputLevelKind::Executable) {
+@@ -1063,6 +1081,8 @@ bool compileFromCommandLineOptions() {
+     genOptions.unitName = cli::ExportedUnit;
+ 
+   genOptions.smallC = cli::SmallC;
++  genOptions.emitCBundle = cli::EmitCBundle;
++  genOptions.cBundleShardSize = cli::EmitCShardSize;
+ 
+   genOptions.emitSourceLocations =
+       cli::DumpSourceLocation != LocationDumpMode::None;

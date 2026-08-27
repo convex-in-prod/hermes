@@ -1,0 +1,178 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Thu, 27 Aug 2026 13:49:51 +0800
+Subject: [PATCH 5/5] StaticH: fix typed string and FastArray builtins
+
+Expose String.prototype.charCodeAt in the typed library and give FastArray a dedicated prototype with the standard iterator when values cross into dynamic JavaScript. Add semantic and execution coverage for both surfaces.
+---
+ lib/TypedLib/02-string.js                   |  5 ++
+ lib/VM/JSLib/GlobalObject.cpp               | 19 ++++++-
+ test/Sema/flow/builtin-string-charCodeAt.js | 46 +++++++++++++++++
+ test/shermes/array-spread-fast-array.js     | 55 +++++++++++++++++++++
+ 4 files changed, 123 insertions(+), 2 deletions(-)
+ create mode 100644 test/Sema/flow/builtin-string-charCodeAt.js
+ create mode 100644 test/shermes/array-spread-fast-array.js
+
+diff --git a/lib/TypedLib/02-string.js b/lib/TypedLib/02-string.js
+index 1a2696ad69bbe01f44cf370ddc97469222847177..d83431e3f1b63b947c7cac06f94c8bb71d231f8b 100644
+--- a/lib/TypedLib/02-string.js
++++ b/lib/TypedLib/02-string.js
+@@ -9,3 +9,8 @@ function charAt(this: string, pos: number): string {
+   return this[pos];
+ }
+ Hermes.decorate(charAt, Hermes.builtin);
++
++function charCodeAt(this: string, pos: number): number {
++  return globalThis.String.prototype.charCodeAt.call(this, pos) as number;
++}
++Hermes.decorate(charCodeAt, Hermes.builtin);
+diff --git a/lib/VM/JSLib/GlobalObject.cpp b/lib/VM/JSLib/GlobalObject.cpp
+index d15928b1934191cbcb3ac5bb3233bd0d02e6856b..965665ab7ecab806fbba97ad5b5fa46b06e4c35b 100644
+--- a/lib/VM/JSLib/GlobalObject.cpp
++++ b/lib/VM/JSLib/GlobalObject.cpp
+@@ -461,8 +461,10 @@ void initGlobalObject(Runtime &runtime, const JSLibFlags &jsLibFlags) {
+   // Declare the array class.
+   runtime.arrayClass = JSArray::createClass(runtime, runtime.arrayPrototype);
+ 
+-  // TODO: Give FastArray its own prototype so methods like push will work.
+-  runtime.fastArrayPrototype = *runtime.objectPrototype;
++  // FastArray needs its own prototype for methods that bridge typed arrays to
++  // dynamic JavaScript without adding those methods to Object.prototype.
++  runtime.fastArrayPrototype =
++      JSObject::create(runtime, runtime.objectPrototype);
+ 
+   // Declare the fast array class.
+   runtime.fastArrayClass =
+@@ -596,6 +598,19 @@ void initGlobalObject(Runtime &runtime, const JSLibFlags &jsLibFlags) {
+   runtime.arrayConstructor.castAndSetHermesValue<NativeConstructor>(
+       createArrayConstructor(runtime));
+ 
++  // FastArray uses the standard generic array iterator when it crosses into
++  // dynamic JavaScript. FastArray instances are sealed, so the method lives on
++  // their shared prototype.
++  DefinePropertyFlags fastArrayIteratorDPF =
++      DefinePropertyFlags::getNewNonEnumerableFlags();
++  runtime.ignoreAllocationFailure(
++      JSObject::defineOwnProperty(
++          Handle<JSObject>::vmcast(&runtime.fastArrayPrototype),
++          runtime,
++          Predefined::getSymbolID(Predefined::SymbolIterator),
++          fastArrayIteratorDPF,
++          runtime.arrayPrototypeValues));
++
+   // ArrayBuffer constructor.
+   runtime.arrayBufferConstructor.castAndSetHermesValue<NativeConstructor>(
+       createArrayBufferConstructor(runtime));
+diff --git a/test/Sema/flow/builtin-string-charCodeAt.js b/test/Sema/flow/builtin-string-charCodeAt.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..da82e11bd7079dc30f5c3f23d087ffcbaef14c0c
+--- /dev/null
++++ b/test/Sema/flow/builtin-string-charCodeAt.js
+@@ -0,0 +1,46 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++// RUN: %shermes -typed -dump-sema %s | %FileCheckOrRegen %s --match-full-lines
++
++// Test that string.charCodeAt builtin method is correctly typechecked.
++
++function test(s: string): number {
++  return s.charCodeAt(0);
++}
++
++// Auto-generated content below. Please do not modify manually.
++
++// CHECK:%untyped_function.1 = untyped_function()
++// CHECK-NEXT:%function.2 = function(s: string): number
++// CHECK-NEXT:%function.3 = function(this: string, pos: number): number
++
++// CHECK:SemContext
++// CHECK-NEXT:Func strict
++// CHECK-NEXT:    Scope %s.1
++// CHECK-NEXT:        Decl %d.1 'exports' Parameter : any
++// CHECK-NEXT:        Decl %d.2 'test' Var : %function.2
++// CHECK-NEXT:        Decl %d.3 'arguments' Var Arguments
++// CHECK-NEXT:        hoistedFunction test
++// CHECK-NEXT:    Func strict
++// CHECK-NEXT:        Scope %s.2
++// CHECK-NEXT:            Decl %d.4 's' Parameter : string
++// CHECK-NEXT:            Decl %d.5 'arguments' Var Arguments
++
++// CHECK:FunctionExpression : %untyped_function.1
++// CHECK-NEXT:    Id 'exports' [D:E:%d.1 'exports']
++// CHECK-NEXT:    BlockStatement
++// CHECK-NEXT:        FunctionDeclaration : %function.2
++// CHECK-NEXT:            Id 'test' [D:E:%d.2 'test']
++// CHECK-NEXT:            Id 's' [D:E:%d.4 's']
++// CHECK-NEXT:            BlockStatement
++// CHECK-NEXT:                ReturnStatement
++// CHECK-NEXT:                    CallExpression : number
++// CHECK-NEXT:                        MemberExpression : %function.3
++// CHECK-NEXT:                            Id 's' [D:E:%d.4 's'] : string
++// CHECK-NEXT:                            Id 'charCodeAt'
++// CHECK-NEXT:                        NumericLiteral : number
+diff --git a/test/shermes/array-spread-fast-array.js b/test/shermes/array-spread-fast-array.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..bc81d58b62209632824c013bc0aa4bf159035f1e
+--- /dev/null
++++ b/test/shermes/array-spread-fast-array.js
+@@ -0,0 +1,55 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++// RUN: %shermes -typed -exec %s | %FileCheck --match-full-lines %s
++
++'use strict';
++
++const pathSymbol: any = Symbol.for('path');
++
++function createPath(pathParts: Array<string> = []): any {
++  const handler: any = {
++    get(_target: any, property: any): any {
++      if (typeof property === 'string') {
++        return createPath([...pathParts, property]);
++      }
++      if (property === pathSymbol) {
++        return pathParts.join('.');
++      }
++      return undefined;
++    },
++  };
++  return new Proxy({}, handler);
++}
++
++function resolvePath(): string {
++  return createPath().first.second[pathSymbol];
++}
++
++print(resolvePath());
++// CHECK: first.second
++print(resolvePath());
++// CHECK-NEXT: first.second
++
++function joinDynamic(values: any): string {
++  let result = '';
++  for (const value of values) {
++    result += value;
++  }
++  return result;
++}
++
++const values: Array<string> = ['third', '.', 'fourth'];
++print(joinDynamic(values));
++// CHECK-NEXT: third.fourth
++
++function collectRest(...values: Array<string>): Array<string> {
++  return values;
++}
++
++print(joinDynamic(collectRest('fifth', '.', 'sixth')));
++// CHECK-NEXT: fifth.sixth

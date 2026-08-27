@@ -1,0 +1,361 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Thu, 27 Aug 2026 13:49:27 +0800
+Subject: [PATCH 2/5] StaticH: publish runtime registry and ABI descriptor
+
+Expose a bounded application-unit registry and an explicit descriptor for every generated/runtime layout used by Static Hermes. Validate the descriptor at unit initialization and cover capacity and mismatch behavior with VM runtime tests.
+---
+ include/hermes/VM/sh_runtime.h          |  13 ++-
+ include/hermes/VM/static_h.h            | 102 +++++++++++++++++++++++
+ lib/VM/StaticHUnit.cpp                  |  53 ++++++++++++
+ unittests/VMRuntime/CMakeLists.txt      |   1 +
+ unittests/VMRuntime/StaticHUnitTest.cpp | 106 ++++++++++++++++++++++++
+ 5 files changed, 273 insertions(+), 2 deletions(-)
+ create mode 100644 unittests/VMRuntime/StaticHUnitTest.cpp
+
+diff --git a/include/hermes/VM/sh_runtime.h b/include/hermes/VM/sh_runtime.h
+index 1da30e2bd56ce4684963df45096e23c8f3373a67..c925166f05762c0a2720c625a32eedbab8764a8f 100644
+--- a/include/hermes/VM/sh_runtime.h
++++ b/include/hermes/VM/sh_runtime.h
+@@ -24,6 +24,14 @@ extern "C" {
+ typedef struct SHUnit SHUnit;
+ typedef struct SHLocals SHLocals;
+ 
++enum {
++  SH_UNIT_REGISTRY_RESERVED_SLOTS = 1,
++  SH_UNIT_REGISTRY_SHARED_SLOTS = 2,
++  SH_UNIT_REGISTRY_MAX_APPLICATION_UNITS = 1024,
++  SH_UNIT_REGISTRY_CAPACITY = SH_UNIT_REGISTRY_RESERVED_SLOTS +
++      SH_UNIT_REGISTRY_SHARED_SLOTS + SH_UNIT_REGISTRY_MAX_APPLICATION_UNITS,
++};
++
+ /// This struct represents an element in the exception handler stack. This
+ /// represents a try, and contains the information necessary to jump to its
+ /// associated catch in the event of an exception.
+@@ -73,8 +81,9 @@ typedef struct SHRuntime {
+   uint8_t dummy;
+ #endif
+ 
+-  /// The active SHUnits in this runtime.
+-  SHUnit *units[8];
++  /// The active SHUnits in this runtime. Slot zero is reserved, followed by
++  /// two shared runtime units and a bounded application-unit registry.
++  SHUnit *units[SH_UNIT_REGISTRY_CAPACITY];
+ 
+   /// The current top of the exception handler stack.
+   SHJmpBuf *shCurJmpBuf;
+diff --git a/include/hermes/VM/static_h.h b/include/hermes/VM/static_h.h
+index 63046eed81d852af3951fe997bd4a21bd9c12605..13246ec2f260f05df9b71a8810ec1049faf179fd 100644
+--- a/include/hermes/VM/static_h.h
++++ b/include/hermes/VM/static_h.h
+@@ -173,6 +173,97 @@ typedef struct SHLocals {
+   SHLegacyValue locals[0];
+ } SHLocals;
+ 
++/// Version for Static Hermes ABI contracts that are not represented by C
++/// structure layout. Increment this when changing value encodings, calling
++/// conventions, or other shared semantics without changing a field below.
++#define SH_STATIC_ABI_VERSION 1
++
++/// Every field shared between generated C and the runtime archive. Keeping the
++/// values in one list makes additions to this descriptor participate in both
++/// its declaration and initialization.
++#define SH_STATIC_ABI_DESCRIPTOR_FIELDS(V)                                   \
++  V(version, SH_STATIC_ABI_VERSION)                                          \
++  V(descriptor_size, sizeof(SHStaticABIDescriptor))                          \
++  V(legacy_value_size, sizeof(SHLegacyValue))                                \
++  V(compressed_pointer_size, sizeof(SHCompressedPointer))                    \
++  V(jmp_buf_size, sizeof(SHJmpBuf))                                          \
++  V(jmp_buf_prev_offset, offsetof(SHJmpBuf, prev))                           \
++  V(jmp_buf_storage_offset, offsetof(SHJmpBuf, buf))                         \
++  V(runtime_size, sizeof(SHRuntime))                                         \
++  V(runtime_units_offset, offsetof(SHRuntime, units))                        \
++  V(runtime_units_capacity, SH_UNIT_REGISTRY_CAPACITY)                       \
++  V(runtime_jmp_buf_offset, offsetof(SHRuntime, shCurJmpBuf))                 \
++  V(runtime_stack_pointer_offset, offsetof(SHRuntime, stackPointer))         \
++  V(runtime_stack_start_offset, offsetof(SHRuntime, registerStackStart))     \
++  V(runtime_stack_end_offset, offsetof(SHRuntime, registerStackEnd))         \
++  V(runtime_current_frame_offset, offsetof(SHRuntime, currentFrame))         \
++  V(runtime_locals_offset, offsetof(SHRuntime, shLocals))                    \
++  V(runtime_global_offset, offsetof(SHRuntime, global_))                     \
++  V(shape_table_entry_size, sizeof(SHShapeTableEntry))                       \
++  V(shape_table_key_offset, offsetof(SHShapeTableEntry, key_buffer_offset))  \
++  V(shape_table_count_offset, offsetof(SHShapeTableEntry, num_props))        \
++  V(source_location_size, sizeof(SHSrcLoc))                                  \
++  V(source_location_filename_offset, offsetof(SHSrcLoc, filename_idx))       \
++  V(source_location_line_offset, offsetof(SHSrcLoc, line))                   \
++  V(source_location_column_offset, offsetof(SHSrcLoc, column))               \
++  V(function_info_size, sizeof(SHNativeFuncInfo))                            \
++  V(function_info_name_offset, offsetof(SHNativeFuncInfo, name_index))       \
++  V(function_info_arg_count_offset, offsetof(SHNativeFuncInfo, arg_count))   \
++  V(unit_size, sizeof(SHUnit))                                               \
++  V(unit_index_offset, offsetof(SHUnit, index))                              \
++  V(unit_script_id_offset, offsetof(SHUnit, script_id))                      \
++  V(unit_num_symbols_offset, offsetof(SHUnit, num_symbols))                  \
++  V(unit_num_read_cache_offset,                                              \
++    offsetof(SHUnit, num_read_prop_cache_entries))                           \
++  V(unit_num_write_cache_offset,                                             \
++    offsetof(SHUnit, num_write_prop_cache_entries))                          \
++  V(unit_num_private_cache_offset,                                           \
++    offsetof(SHUnit, num_private_name_cache_entries))                        \
++  V(unit_ascii_pool_offset, offsetof(SHUnit, ascii_pool))                    \
++  V(unit_u16_pool_offset, offsetof(SHUnit, u16_pool))                        \
++  V(unit_strings_offset, offsetof(SHUnit, strings))                          \
++  V(unit_symbols_offset, offsetof(SHUnit, symbols))                          \
++  V(unit_write_cache_offset, offsetof(SHUnit, write_prop_cache))             \
++  V(unit_read_cache_offset, offsetof(SHUnit, read_prop_cache))               \
++  V(unit_private_cache_offset, offsetof(SHUnit, private_name_cache))         \
++  V(unit_object_key_buffer_offset, offsetof(SHUnit, obj_key_buffer))         \
++  V(unit_object_key_buffer_size_offset,                                      \
++    offsetof(SHUnit, obj_key_buffer_size))                                   \
++  V(unit_literal_value_buffer_offset,                                        \
++    offsetof(SHUnit, literal_val_buffer))                                    \
++  V(unit_literal_value_buffer_size_offset,                                   \
++    offsetof(SHUnit, literal_val_buffer_size))                               \
++  V(unit_shape_table_offset, offsetof(SHUnit, obj_shape_table))              \
++  V(unit_shape_table_count_offset, offsetof(SHUnit, obj_shape_table_count))  \
++  V(unit_object_class_cache_offset,                                          \
++    offsetof(SHUnit, object_literal_class_cache))                            \
++  V(unit_module_exports_offset, offsetof(SHUnit, moduleExports))             \
++  V(unit_source_locations_offset, offsetof(SHUnit, source_locations))        \
++  V(unit_source_locations_size_offset,                                       \
++    offsetof(SHUnit, source_locations_size))                                 \
++  V(unit_main_offset, offsetof(SHUnit, unit_main))                           \
++  V(unit_main_info_offset, offsetof(SHUnit, unit_main_info))                 \
++  V(unit_name_offset, offsetof(SHUnit, unit_name))                           \
++  V(unit_runtime_extension_offset, offsetof(SHUnit, runtime_ext))            \
++  V(locals_size, sizeof(SHLocals))                                           \
++  V(locals_prev_offset, offsetof(SHLocals, prev))                            \
++  V(locals_count_offset, offsetof(SHLocals, count))                          \
++  V(locals_unit_offset, offsetof(SHLocals, unit))                            \
++  V(locals_source_location_offset, offsetof(SHLocals, src_location_idx))     \
++  V(locals_values_offset, offsetof(SHLocals, locals))
++
++typedef struct SHStaticABIDescriptor {
++#define SH_STATIC_ABI_DECLARE_FIELD(name, value) uint32_t name;
++  SH_STATIC_ABI_DESCRIPTOR_FIELDS(SH_STATIC_ABI_DECLARE_FIELD)
++#undef SH_STATIC_ABI_DECLARE_FIELD
++} SHStaticABIDescriptor;
++
++#define SH_STATIC_ABI_INITIALIZE_FIELD(name, value) (uint32_t)(value),
++#define SH_STATIC_ABI_DESCRIPTOR_INITIALIZER                              \
++  {                                                                      \
++    SH_STATIC_ABI_DESCRIPTOR_FIELDS(SH_STATIC_ABI_INITIALIZE_FIELD)       \
++  }
++
+ /// Utility to concatenate a prefix with HERMESVM_MODEL.
+ #define _HERMESVM_JOIN_TOKENS(x, y) _HERMESVM_JOIN_HELPER(x, y)
+ /// This helper is needed due to how the preprocessor works.
+@@ -184,6 +275,17 @@ typedef struct SHLocals {
+ /// A dummy export to ensure correct library is linked.
+ SHERMES_EXPORT void _SH_MODEL(void);
+ 
++/// Descriptor compiled into the runtime library. It is public so build tools
++/// can include the Static Hermes ABI in artifact identity.
++extern SHERMES_EXPORT const SHStaticABIDescriptor _sh_static_abi_descriptor;
++
++/// Abort unless \p expected exactly matches the descriptor compiled into the
++/// runtime library. Passing the caller's descriptor size lets a newer runtime
++/// reject an older, shorter descriptor before reading beyond it.
++SHERMES_EXPORT void _sh_check_abi(
++    const SHStaticABIDescriptor *expected,
++    uint32_t expectedSize);
++
+ #ifndef HERMES_IS_MOBILE_BUILD
+ /// Parse the command line flags, if provided. If not provided, the VM command
+ /// line options receive their default values specified in cli::RuntimeFlags.
+diff --git a/lib/VM/StaticHUnit.cpp b/lib/VM/StaticHUnit.cpp
+index 32996f12f76449e615378d8e5b8304763f824917..4cce9f599fb00e6e868fedd669cf0399d9e55c16 100644
+--- a/lib/VM/StaticHUnit.cpp
++++ b/lib/VM/StaticHUnit.cpp
+@@ -14,6 +14,7 @@
+ #include "hermes/VM/StaticHUtils.h"
+ 
+ #include <cstdarg>
++#include <cstdio>
+ 
+ using namespace hermes;
+ using namespace hermes::vm;
+@@ -21,6 +22,58 @@ using namespace hermes::vm;
+ static void sh_unit_init_symbols(Runtime &runtime, SHUnit *unit);
+ static SHLegacyValue sh_unit_run(SHRuntime *shr, SHUnit *unit);
+ 
++extern "C" const SHStaticABIDescriptor _sh_static_abi_descriptor =
++    SH_STATIC_ABI_DESCRIPTOR_INITIALIZER;
++
++extern "C" void _sh_check_abi(
++    const SHStaticABIDescriptor *expected,
++    uint32_t expectedSize) {
++  bool matches = expected != nullptr &&
++      expectedSize == sizeof(SHStaticABIDescriptor);
++#define SH_STATIC_ABI_COMPARE_FIELD(name, value)                            \
++  matches = matches &&                                                     \
++      expected->name == _sh_static_abi_descriptor.name;
++  if (matches) {
++    SH_STATIC_ABI_DESCRIPTOR_FIELDS(SH_STATIC_ABI_COMPARE_FIELD)
++  }
++#undef SH_STATIC_ABI_COMPARE_FIELD
++
++  if (matches)
++    return;
++
++  if (expected && expectedSize == sizeof(SHStaticABIDescriptor)) {
++    fprintf(
++        stderr,
++        "Static Hermes ABI mismatch: generated unit version %u, runtime "
++        "size %u, unit capacity %u; runtime archive version %u, runtime "
++        "size %u, unit capacity %u. Rebuild generated units and the runtime "
++        "archive together.\n",
++        expected->version,
++        expected->runtime_size,
++        expected->runtime_units_capacity,
++        _sh_static_abi_descriptor.version,
++        _sh_static_abi_descriptor.runtime_size,
++        _sh_static_abi_descriptor.runtime_units_capacity);
++  } else if (expected && expectedSize >= 2 * sizeof(uint32_t)) {
++    fprintf(
++        stderr,
++        "Static Hermes ABI mismatch: generated descriptor version %u, size "
++        "%u; runtime archive descriptor version %u, size %u. Rebuild "
++        "generated units and the runtime archive together.\n",
++        expected->version,
++        expectedSize,
++        _sh_static_abi_descriptor.version,
++        (uint32_t)sizeof(SHStaticABIDescriptor));
++  } else {
++    fprintf(
++        stderr,
++        "Static Hermes ABI mismatch: generated descriptor is missing or "
++        "shorter than the required ABI prefix. Rebuild generated units and "
++        "the runtime archive together.\n");
++  }
++  abort();
++}
++
+ extern "C" bool _sh_initialize_units(SHRuntime *shr, uint32_t count, ...) {
+   Runtime &runtime = getRuntime(shr);
+   bool success = true;
+diff --git a/unittests/VMRuntime/CMakeLists.txt b/unittests/VMRuntime/CMakeLists.txt
+index f04563b749ec04fa45b1cad536a40b0c4d0da91d..5fd814e54d6c931c7f1593861960aca1b78a8206 100644
+--- a/unittests/VMRuntime/CMakeLists.txt
++++ b/unittests/VMRuntime/CMakeLists.txt
+@@ -62,6 +62,7 @@ set(RTSources
+   SmallHermesValueTest.cpp
+   SmallXStringTest.cpp
+   StaticBuiltinsTest.cpp
++  StaticHUnitTest.cpp
+   StackTracesTreeTest.cpp
+   StorageProviderTest.cpp
+   StringBuilderTest.cpp
+diff --git a/unittests/VMRuntime/StaticHUnitTest.cpp b/unittests/VMRuntime/StaticHUnitTest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..87be113a8a12acd4320fe516958a9a9846701db2
+--- /dev/null
++++ b/unittests/VMRuntime/StaticHUnitTest.cpp
+@@ -0,0 +1,106 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++#include "VMRuntimeTestHelpers.h"
++
++#include "hermes/VM/StaticHUtils.h"
++#include "hermes/VM/static_h.h"
++
++#include "gtest/gtest.h"
++
++#include <array>
++#include <cstdlib>
++#include <utility>
++
++using namespace hermes::vm;
++
++namespace {
++
++uint32_t unitMainCallCount;
++
++SHLegacyValue unitMain(SHRuntime *) {
++  ++unitMainCallCount;
++  return _sh_ljs_undefined();
++}
++
++const SHNativeFuncInfo unitMainInfo{};
++const uint32_t unitStrings[]{0, 0, 0};
++
++struct TestUnitData {
++  SHUnit unit;
++  SHSymbolID symbols[1];
++};
++
++template <size_t UnitNumber>
++SHUnit *createUnit() {
++  static uint32_t index;
++  auto *data =
++      static_cast<TestUnitData *>(std::calloc(1, sizeof(TestUnitData)));
++  if (!data) {
++    std::abort();
++  }
++
++  data->unit.index = &index;
++  data->unit.num_symbols = 1;
++  data->unit.ascii_pool = "";
++  data->unit.strings = unitStrings;
++  data->unit.symbols = data->symbols;
++  data->unit.unit_main = unitMain;
++  data->unit.unit_main_info = &unitMainInfo;
++  data->unit.unit_name = "test";
++  return &data->unit;
++}
++
++template <size_t... UnitNumbers>
++constexpr auto createUnitFactories(std::index_sequence<UnitNumbers...>) {
++  return std::array<SHUnitCreator, sizeof...(UnitNumbers)>{
++      createUnit<UnitNumbers>...};
++}
++
++TEST(StaticHUnitTest, InitializesAllUsableUnitSlots) {
++  constexpr auto creators = createUnitFactories(
++      std::make_index_sequence<SH_UNIT_REGISTRY_CAPACITY>{});
++
++  unitMainCallCount = 0;
++  auto runtime = Runtime::create(kTestRTConfig);
++  SHRuntime *shRuntime = getSHRuntime(*runtime);
++  for (size_t i = 0; i < SH_UNIT_REGISTRY_CAPACITY - 1; ++i) {
++    SHLegacyValue result;
++    ASSERT_TRUE(_sh_unit_init_guarded(shRuntime, creators[i], &result));
++    ASSERT_NE(nullptr, shRuntime->units[i + 1]);
++    EXPECT_EQ(i + 1, *shRuntime->units[i + 1]->index);
++  }
++  EXPECT_EQ(SH_UNIT_REGISTRY_CAPACITY - 1, unitMainCallCount);
++
++  // Runtime owns a concurrent GC thread, so re-execute the test binary in the
++  // death test child instead of continuing directly after fork.
++  const auto previousDeathTestStyle = ::testing::FLAGS_gtest_death_test_style;
++  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
++  EXPECT_DEATH_IF_SUPPORTED(
++      {
++        SHLegacyValue result;
++        _sh_unit_init_guarded(
++            shRuntime, creators[SH_UNIT_REGISTRY_CAPACITY - 1], &result);
++      },
++      "Too many SH units registered");
++  ::testing::FLAGS_gtest_death_test_style = previousDeathTestStyle;
++}
++
++TEST(StaticHUnitTest, AcceptsMatchingStaticABI) {
++  _sh_check_abi(
++      &_sh_static_abi_descriptor, sizeof(_sh_static_abi_descriptor));
++}
++
++TEST(StaticHUnitTest, RejectsMismatchedStaticABI) {
++  SHStaticABIDescriptor mismatched = _sh_static_abi_descriptor;
++  ++mismatched.runtime_units_capacity;
++  EXPECT_DEATH_IF_SUPPORTED(
++      _sh_check_abi(&mismatched, sizeof(mismatched)),
++      "Static Hermes ABI mismatch: generated.*runtime archive");
++}
++
++} // namespace
