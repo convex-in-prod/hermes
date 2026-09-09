@@ -6,22 +6,36 @@ Subject: [PATCH 1/6] Support: run serial tasks inline on single-threaded
 
 Avoid creating the executor thread when Emscripten is built without pthreads. Running the task inline preserves SerialExecutor ordering while allowing the single-threaded runtime to complete finalizers.
 ---
- lib/Support/SerialExecutor.cpp | 5 +++++
- 1 file changed, 5 insertions(+)
+ include/hermes/Support/SerialExecutor.h | 1 +
+ lib/Support/SerialExecutor.cpp          | 6 ++++++
+ 2 files changed, 7 insertions(+)
 
+diff --git a/include/hermes/Support/SerialExecutor.h b/include/hermes/Support/SerialExecutor.h
+index 26e65e3a946a77da04b024225196f74d4002ea31..6bf0448b768a25e04700240292344d6fab33fc56 100644
+--- a/include/hermes/Support/SerialExecutor.h
++++ b/include/hermes/Support/SerialExecutor.h
+@@ -123,6 +123,7 @@ class SerialExecutor {
+ 
+   /// Push a task to the back of the queue, lazily creating the worker thread if
+   /// it does not exist.
++  /// Single-threaded Emscripten instead runs and destroys the task inline.
+   ///
+   /// Ownership of \p task transfers to the queue before this returns, so the
+   /// task and everything it captures are destroyed on the worker thread after
 diff --git a/lib/Support/SerialExecutor.cpp b/lib/Support/SerialExecutor.cpp
-index bd9b4788cd69d88a84350375baf060a988b79cbc..b60727994aaa33972021fda861d4d00c75720b43 100644
+index 513282319a614bc7a6680118a2c4d82265d4d2de..2b255d4d0975cbdafa8e6deec5051cba3bfa2d07 100644
 --- a/lib/Support/SerialExecutor.cpp
 +++ b/lib/Support/SerialExecutor.cpp
-@@ -32,6 +32,11 @@ SerialExecutor::~SerialExecutor() {
+@@ -32,6 +32,12 @@ SerialExecutor::~SerialExecutor() {
  }
  
- void SerialExecutor::add(std::function<void()> task) {
+ void SerialExecutor::add(llvh::unique_function<void()> task) {
 +#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
++  // No worker exists in this configuration; keep task ownership on this thread.
 +  task();
 +  return;
 +#endif
 +
    std::unique_lock<std::mutex> lock(mutex_);
-   assert(
-       threadState_ != ThreadState::Terminating &&
+   // Draining inside ~SerialExecutor destroys tasks, and a task's captured
+   // state may enqueue more work from its destructor. That is fine: the drain

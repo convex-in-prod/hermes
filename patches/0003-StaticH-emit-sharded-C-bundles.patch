@@ -1783,7 +1783,7 @@ index 0000000000000000000000000000000000000000..f58bcb253831e61cf1c2c2128383e590
 +
 +print(parent());
 diff --git a/tools/shermes/compile.cpp b/tools/shermes/compile.cpp
-index 28079459d70ff58507f6d6e16d9a91952087cad7..a4d24980ad966bfddf463f54b672180cc2de5434 100644
+index fb405cb733dd3c4cebf163a06226624ccd48e1ce..760cc1918c5ca699c7ae9e52f8749634613c126b 100644
 --- a/tools/shermes/compile.cpp
 +++ b/tools/shermes/compile.cpp
 @@ -13,10 +13,14 @@
@@ -2168,7 +2168,7 @@ index 28079459d70ff58507f6d6e16d9a91952087cad7..a4d24980ad966bfddf463f54b672180c
  /// Configuration for invoking the C compiler.
  struct CCCfg {
    std::string cc;
-@@ -535,6 +892,10 @@ bool shermesCompile(
+@@ -537,6 +894,10 @@ bool shermesCompile(
      return compileToDump(context, M, params, outputFilename);
    }
    if (outputLevel == OutputLevelKind::C) {

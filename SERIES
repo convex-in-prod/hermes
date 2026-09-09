@@ -1,7 +1,7 @@
 # patch-file source-commit
-0001-Support-run-serial-tasks-inline-on-single-threaded-E.patch 03820543eadecb534873b3d2d05c0264576d1700
-0002-StaticH-publish-runtime-registry-and-ABI-descriptor.patch 39115407787f9082b1f6e0b7a622f6cfa4cf2c1e
-0003-StaticH-emit-sharded-C-bundles.patch cb4b29e059bde2d668a9840f059bc01add9027c8
-0004-Flow-support-typed-class-expressions-and-computed-me.patch b4ecb1511ef3f882eb1018755844c5bcb9aea2e2
-0005-StaticH-fix-typed-string-and-FastArray-builtins.patch a331a1a2349af533575c5a8c48f7d1be6cccca44
-0006-Docs-describe-Static-Hermes-fork-branches.patch b4f7e9232f3eb9282ad00785beb690ad00950cc3
+0001-Support-run-serial-tasks-inline-on-single-threaded-E.patch 401c1075ce9ca5c5212fe8735048c466c761f8a0
+0002-StaticH-publish-runtime-registry-and-ABI-descriptor.patch 0c5b49f6e37aae3ea1d3499a694c406c20e227a8
+0003-StaticH-emit-sharded-C-bundles.patch 3976a9ce319d279f6f330389d550927e7fb8385e
+0004-Flow-support-typed-class-expressions-and-computed-me.patch 72114afa24f8bf4464eafc91c23bd405871cf7b2
+0005-StaticH-fix-typed-string-and-FastArray-builtins.patch 471e9f2ea3e38ea4c87ae5369a5f771e5750bf87
+0006-Docs-describe-Static-Hermes-fork-branches.patch 6a88295a6f508c85cbca229056e1688255b1ed4e
