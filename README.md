@@ -8,8 +8,8 @@ Hermes is a JavaScript engine optimized for fast start-up of [React Native](http
 
 ## Downstream static_h fork
 
-This fork keeps the upstream `static_h` branch mirrored and maintains its
-downstream changes on `main`. The downstream series targets reproducible
+This fork maintains its downstream changes on `static_h`, based on the upstream
+`static_h` branch. The downstream series targets reproducible
 Static Hermes C-bundle builds and compatibility needed by self-hosted
 deployments on constrained hosts. Changes are kept in small commits with
 focused tests so isolated fixes can be proposed upstream independently.
