@@ -34,6 +34,7 @@ class EnqueueOnDestruction {
   std::atomic<bool> &followUpRan_;
 };
 
+#if !defined(__EMSCRIPTEN__) || defined(__EMSCRIPTEN_PTHREADS__)
 /// Destroy \p executor on another thread, giving up after \p limit. Returns
 /// false if the destructor is still running by then, which means it
 /// deadlocked. The caller must not touch \p executor afterwards: the wedged
@@ -71,6 +72,7 @@ bool waitFor(Predicate predicate) {
   }
   return true;
 }
+#endif
 
 TEST(SerialExecutorTest, TestBasic) {
   hermes::SerialExecutor executor;
@@ -94,6 +96,39 @@ TEST(SerialExecutorTest, DestructorDrainsTasks) {
   ASSERT_EQ(counter, 100);
 }
 
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+TEST(SerialExecutorTest, InlineTaskOwnsAndDestroysMoveOnlyCapture) {
+  bool runnerCalled = false;
+  bool taskRan = false;
+  bool nestedTaskRan = false;
+  std::atomic<bool> followUpRan{false};
+  {
+    hermes::SerialExecutor executor{
+        0,
+        hermes::SerialExecutor::kDefaultTimeout,
+        [&runnerCalled](std::function<void()> run) {
+          runnerCalled = true;
+          run();
+        }};
+    // A move-only capture must be destroyed before add() returns, and its
+    // destructor must be able to call add() without a worker or a queue.
+    executor.add([&,
+                  owner = std::make_unique<EnqueueOnDestruction>(
+                      executor, followUpRan)] {
+      taskRan = true;
+      EXPECT_FALSE(followUpRan.load());
+      executor.add([&nestedTaskRan] { nestedTaskRan = true; });
+      EXPECT_TRUE(nestedTaskRan);
+    });
+    EXPECT_TRUE(taskRan);
+    EXPECT_TRUE(followUpRan.load());
+    EXPECT_FALSE(runnerCalled);
+  }
+  EXPECT_FALSE(runnerCalled);
+}
+#else
+// These tests depend on a background worker. The inline path cannot wait for
+// another thread to release a task or observe worker timeout and teardown.
 TEST(SerialExecutorTest, TestTimeout) {
   // Set up an executor with a short timeout.
   constexpr std::chrono::milliseconds timeout{10};
@@ -296,5 +331,7 @@ TEST(SerialExecutorTest, TaskDestroyedOnWorkerThread) {
   EXPECT_NE(destroyedOn.load(), std::this_thread::get_id())
       << "the task was destroyed on the thread that called add()";
 }
+
+#endif
 
 } // end anonymous namespace
