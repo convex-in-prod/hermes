@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Thu, 10 Sep 2026 03:16:59 +0800
+Subject: [PATCH 7/8] support: test inline SerialExecutor ownership without
+ pthreads
+
+Separate worker-dependent tests from single-threaded Emscripten coverage. Verify that move-only task captures are destroyed before add returns, nested work runs inline, and no worker runner is invoked. Describe the threaded and inline ownership contracts without contradictory lifecycle claims.
+---
+ include/hermes/Support/SerialExecutor.h  | 18 ++++++++----
+ unittests/Support/SerialExecutorTest.cpp | 37 ++++++++++++++++++++++++
+ 2 files changed, 49 insertions(+), 6 deletions(-)
+
+diff --git a/include/hermes/Support/SerialExecutor.h b/include/hermes/Support/SerialExecutor.h
+index 6bf0448b768a25e04700240292344d6fab33fc56..17a5ff8630a0c9a539a99bcfd04f1cf7b8a182ca 100644
+--- a/include/hermes/Support/SerialExecutor.h
++++ b/include/hermes/Support/SerialExecutor.h
+@@ -81,8 +81,8 @@ class SerialExecutor {
+   /// ThreadRunner defined in RuntimeConfig.h.
+   std::function<void(std::function<void()>)> threadRunner_;
+ 
+-  /// This is executed on a new thread. It will run forever, executing tasks as
+-  /// they are posted. This stops running when shouldStop_ is set to true.
++  /// Execute queued tasks on the worker until it times out or finishes
++  /// draining during teardown. Not used by single-threaded Emscripten.
+   void run();
+ 
+   /// Main function of the new thread.
+@@ -100,6 +100,8 @@ class SerialExecutor {
+   /// satisfy the contract documented on vm::ThreadRunner. In addition, it must
+   /// not block after run() returns. \p timeout can not be too large, otherwise
+   /// `steady_clock::now() + timeout` may overflow.
++  /// Single-threaded Emscripten creates no worker and does not invoke
++  /// \p threadRunner; stack size and idle timeout have no execution effect.
+   SerialExecutor(
+       size_t stackSize = 0,
+       std::chrono::nanoseconds timeout = kDefaultTimeout,
+@@ -118,12 +120,12 @@ class SerialExecutor {
+   }
+ 
+   /// Make sure that the spawned thread has terminated. Will block if there is a
+-  /// long-running task currently being executed.
++  /// long-running task currently being executed. Single-threaded Emscripten
++  /// has no worker to join or queued tasks to drain.
+   ~SerialExecutor();
+ 
+-  /// Push a task to the back of the queue, lazily creating the worker thread if
+-  /// it does not exist.
+-  /// Single-threaded Emscripten instead runs and destroys the task inline.
++  /// On threaded builds, push a task to the back of the queue, lazily creating
++  /// the worker thread if it does not exist.
+   ///
+   /// Ownership of \p task transfers to the queue before this returns, so the
+   /// task and everything it captures are destroyed on the worker thread after
+@@ -133,6 +135,10 @@ class SerialExecutor {
+   /// call add(). Once ~SerialExecutor has begun draining, only the worker
+   /// thread may do so: the drain loop picks up whatever it enqueues, whereas a
+   /// task enqueued from another thread at that point may never run at all.
++  ///
++  /// Single-threaded Emscripten instead runs and destroys the task inline on
++  /// the calling thread, without using a queue or worker. Nested add() calls
++  /// run immediately, including calls from a task's captured destructors.
+   void add(llvh::unique_function<void()> task);
+ };
+ } // namespace hermes
+diff --git a/unittests/Support/SerialExecutorTest.cpp b/unittests/Support/SerialExecutorTest.cpp
+index dcc31ac2ed08a506ca63569a4f9f58acdfd5e709..a252756c3fa33b9f66e06585eba13f51a2f1a948 100644
+--- a/unittests/Support/SerialExecutorTest.cpp
++++ b/unittests/Support/SerialExecutorTest.cpp
+@@ -34,6 +34,7 @@ class EnqueueOnDestruction {
+   std::atomic<bool> &followUpRan_;
+ };
+ 
++#if !defined(__EMSCRIPTEN__) || defined(__EMSCRIPTEN_PTHREADS__)
+ /// Destroy \p executor on another thread, giving up after \p limit. Returns
+ /// false if the destructor is still running by then, which means it
+ /// deadlocked. The caller must not touch \p executor afterwards: the wedged
+@@ -71,6 +72,7 @@ bool waitFor(Predicate predicate) {
+   }
+   return true;
+ }
++#endif
+ 
+ TEST(SerialExecutorTest, TestBasic) {
+   hermes::SerialExecutor executor;
+@@ -94,6 +96,39 @@ TEST(SerialExecutorTest, DestructorDrainsTasks) {
+   ASSERT_EQ(counter, 100);
+ }
+ 
++#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
++TEST(SerialExecutorTest, InlineTaskOwnsAndDestroysMoveOnlyCapture) {
++  bool runnerCalled = false;
++  bool taskRan = false;
++  bool nestedTaskRan = false;
++  std::atomic<bool> followUpRan{false};
++  {
++    hermes::SerialExecutor executor{
++        0,
++        hermes::SerialExecutor::kDefaultTimeout,
++        [&runnerCalled](std::function<void()> run) {
++          runnerCalled = true;
++          run();
++        }};
++    // A move-only capture must be destroyed before add() returns, and its
++    // destructor must be able to call add() without a worker or a queue.
++    executor.add([&,
++                  owner = std::make_unique<EnqueueOnDestruction>(
++                      executor, followUpRan)] {
++      taskRan = true;
++      EXPECT_FALSE(followUpRan.load());
++      executor.add([&nestedTaskRan] { nestedTaskRan = true; });
++      EXPECT_TRUE(nestedTaskRan);
++    });
++    EXPECT_TRUE(taskRan);
++    EXPECT_TRUE(followUpRan.load());
++    EXPECT_FALSE(runnerCalled);
++  }
++  EXPECT_FALSE(runnerCalled);
++}
++#else
++// These tests depend on a background worker. The inline path cannot wait for
++// another thread to release a task or observe worker timeout and teardown.
+ TEST(SerialExecutorTest, TestTimeout) {
+   // Set up an executor with a short timeout.
+   constexpr std::chrono::milliseconds timeout{10};
+@@ -297,4 +332,6 @@ TEST(SerialExecutorTest, TaskDestroyedOnWorkerThread) {
+       << "the task was destroyed on the thread that called add()";
+ }
+ 
++#endif
++
+ } // end anonymous namespace
