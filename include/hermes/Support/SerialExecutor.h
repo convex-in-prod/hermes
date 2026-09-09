@@ -81,8 +81,8 @@ class SerialExecutor {
   /// ThreadRunner defined in RuntimeConfig.h.
   std::function<void(std::function<void()>)> threadRunner_;
 
-  /// This is executed on a new thread. It will run forever, executing tasks as
-  /// they are posted. This stops running when shouldStop_ is set to true.
+  /// Execute queued tasks on the worker until it times out or finishes
+  /// draining during teardown. Not used by single-threaded Emscripten.
   void run();
 
   /// Main function of the new thread.
@@ -100,6 +100,8 @@ class SerialExecutor {
   /// satisfy the contract documented on vm::ThreadRunner. In addition, it must
   /// not block after run() returns. \p timeout can not be too large, otherwise
   /// `steady_clock::now() + timeout` may overflow.
+  /// Single-threaded Emscripten creates no worker and does not invoke
+  /// \p threadRunner; stack size and idle timeout have no execution effect.
   SerialExecutor(
       size_t stackSize = 0,
       std::chrono::nanoseconds timeout = kDefaultTimeout,
@@ -118,12 +120,12 @@ class SerialExecutor {
   }
 
   /// Make sure that the spawned thread has terminated. Will block if there is a
-  /// long-running task currently being executed.
+  /// long-running task currently being executed. Single-threaded Emscripten
+  /// has no worker to join or queued tasks to drain.
   ~SerialExecutor();
 
-  /// Push a task to the back of the queue, lazily creating the worker thread if
-  /// it does not exist.
-  /// Single-threaded Emscripten instead runs and destroys the task inline.
+  /// On threaded builds, push a task to the back of the queue, lazily creating
+  /// the worker thread if it does not exist.
   ///
   /// Ownership of \p task transfers to the queue before this returns, so the
   /// task and everything it captures are destroyed on the worker thread after
@@ -133,6 +135,10 @@ class SerialExecutor {
   /// call add(). Once ~SerialExecutor has begun draining, only the worker
   /// thread may do so: the drain loop picks up whatever it enqueues, whereas a
   /// task enqueued from another thread at that point may never run at all.
+  ///
+  /// Single-threaded Emscripten instead runs and destroys the task inline on
+  /// the calling thread, without using a queue or worker. Nested add() calls
+  /// run immediately, including calls from a task's captured destructors.
   void add(llvh::unique_function<void()> task);
 };
 } // namespace hermes
