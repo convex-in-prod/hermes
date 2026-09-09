@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Thu, 27 Aug 2026 13:52:31 +0800
-Subject: [PATCH 6/8] Docs: describe Static Hermes fork branches
+Subject: [PATCH 6/9] Docs: describe Static Hermes fork branches
 
 Document the mirrored static_h base, downstream main branch, and generated patch-history workflow for maintainers and upstream reviewers.
 ---

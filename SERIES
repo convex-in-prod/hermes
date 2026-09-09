@@ -7,3 +7,4 @@
 0006-Docs-describe-Static-Hermes-fork-branches.patch 6a88295a6f508c85cbca229056e1688255b1ed4e
 0007-support-test-inline-SerialExecutor-ownership-without.patch f18f1c652fea7f550c08ad7d38a2abd71b8afdfe
 0008-docs-identify-static_h-as-the-maintained-source-bran.patch d8a75d01584fc115045aeded4dbce3cc60a68cf1
+0009-tests-update-charCodeAt-semantic-return-annotations.patch 38358df2f4e19cc1a8670e7c113458c22d36564d

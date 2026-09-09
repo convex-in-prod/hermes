@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Thu, 10 Sep 2026 03:33:53 +0800
+Subject: [PATCH 9/9] tests: update charCodeAt semantic return annotations
+
+The upstream semantic dump now records whether a function can reach an implicit return. Match those annotations in the typed charCodeAt fixture without changing its type or runtime assertions.
+---
+ test/Sema/flow/builtin-string-charCodeAt.js | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/test/Sema/flow/builtin-string-charCodeAt.js b/test/Sema/flow/builtin-string-charCodeAt.js
+index da82e11bd7079dc30f5c3f23d087ffcbaef14c0c..7298c3ff3854336dd93ac3dbbe5ba9485b561b79 100644
+--- a/test/Sema/flow/builtin-string-charCodeAt.js
++++ b/test/Sema/flow/builtin-string-charCodeAt.js
+@@ -20,13 +20,13 @@ function test(s: string): number {
+ // CHECK-NEXT:%function.3 = function(this: string, pos: number): number
+ 
+ // CHECK:SemContext
+-// CHECK-NEXT:Func strict
++// CHECK-NEXT:Func strict mayReachImplicitReturn
+ // CHECK-NEXT:    Scope %s.1
+ // CHECK-NEXT:        Decl %d.1 'exports' Parameter : any
+ // CHECK-NEXT:        Decl %d.2 'test' Var : %function.2
+ // CHECK-NEXT:        Decl %d.3 'arguments' Var Arguments
+ // CHECK-NEXT:        hoistedFunction test
+-// CHECK-NEXT:    Func strict
++// CHECK-NEXT:    Func strict noImplicitReturn
+ // CHECK-NEXT:        Scope %s.2
+ // CHECK-NEXT:            Decl %d.4 's' Parameter : string
+ // CHECK-NEXT:            Decl %d.5 'arguments' Var Arguments
