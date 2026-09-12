@@ -1,10 +1,10 @@
 # patch-file source-commit
-0001-Support-run-serial-tasks-inline-on-single-threaded-E.patch 401c1075ce9ca5c5212fe8735048c466c761f8a0
-0002-StaticH-publish-runtime-registry-and-ABI-descriptor.patch 0c5b49f6e37aae3ea1d3499a694c406c20e227a8
-0003-StaticH-emit-sharded-C-bundles.patch 3976a9ce319d279f6f330389d550927e7fb8385e
-0004-Flow-support-typed-class-expressions-and-computed-me.patch 72114afa24f8bf4464eafc91c23bd405871cf7b2
-0005-StaticH-fix-typed-string-and-FastArray-builtins.patch 471e9f2ea3e38ea4c87ae5369a5f771e5750bf87
-0006-Docs-describe-Static-Hermes-fork-branches.patch 6a88295a6f508c85cbca229056e1688255b1ed4e
-0007-support-test-inline-SerialExecutor-ownership-without.patch f18f1c652fea7f550c08ad7d38a2abd71b8afdfe
-0008-docs-identify-static_h-as-the-maintained-source-bran.patch d8a75d01584fc115045aeded4dbce3cc60a68cf1
-0009-tests-update-charCodeAt-semantic-return-annotations.patch 38358df2f4e19cc1a8670e7c113458c22d36564d
+0001-Support-run-serial-tasks-inline-on-single-threaded-E.patch 4a59f7fdc8eca1fe1f28dae5233efdc582445fcf
+0002-StaticH-publish-runtime-registry-and-ABI-descriptor.patch 2bc6ac960e1f5442b6c7d4de2a2c93b857bffcc2
+0003-StaticH-emit-sharded-C-bundles.patch 57dd97cf519da5607c1d40e87d2bd36a8b3b8047
+0004-Flow-support-typed-class-expressions-and-computed-me.patch 06608ca2609fe64088e370c7101d8e3462b1d506
+0005-StaticH-fix-typed-string-and-FastArray-builtins.patch 1e435005d4fa38666825f67384c0b58bd39b0858
+0006-Docs-describe-Static-Hermes-fork-branches.patch 7916b5aba66a4f2549edcdbcce6e184290c16bb0
+0007-support-test-inline-SerialExecutor-ownership-without.patch a84c24b328f98254b1b119d9f7cb2557a94060ee
+0008-docs-identify-static_h-as-the-maintained-source-bran.patch 77d40210499baceaedb64857ffc938cb783f8e1e
+0009-tests-update-charCodeAt-semantic-return-annotations.patch 0ecc9d1a9b2d389fe09342b983ab8798b60ab81c

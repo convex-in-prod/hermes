@@ -27,10 +27,10 @@ index 1a2696ad69bbe01f44cf370ddc97469222847177..d83431e3f1b63b947c7cac06f94c8bb7
 +}
 +Hermes.decorate(charCodeAt, Hermes.builtin);
 diff --git a/lib/VM/JSLib/GlobalObject.cpp b/lib/VM/JSLib/GlobalObject.cpp
-index d15928b1934191cbcb3ac5bb3233bd0d02e6856b..965665ab7ecab806fbba97ad5b5fa46b06e4c35b 100644
+index d3bee7f3e5678574a866c477468223b215a654c6..7e87288addfbe2256104f3978a56ef70a66539ba 100644
 --- a/lib/VM/JSLib/GlobalObject.cpp
 +++ b/lib/VM/JSLib/GlobalObject.cpp
-@@ -461,8 +461,10 @@ void initGlobalObject(Runtime &runtime, const JSLibFlags &jsLibFlags) {
+@@ -474,8 +474,10 @@ void initGlobalObject(Runtime &runtime, const JSLibFlags &jsLibFlags) {
    // Declare the array class.
    runtime.arrayClass = JSArray::createClass(runtime, runtime.arrayPrototype);
  
@@ -43,7 +43,7 @@ index d15928b1934191cbcb3ac5bb3233bd0d02e6856b..965665ab7ecab806fbba97ad5b5fa46b
  
    // Declare the fast array class.
    runtime.fastArrayClass =
-@@ -596,6 +598,19 @@ void initGlobalObject(Runtime &runtime, const JSLibFlags &jsLibFlags) {
+@@ -609,6 +611,19 @@ void initGlobalObject(Runtime &runtime, const JSLibFlags &jsLibFlags) {
    runtime.arrayConstructor.castAndSetHermesValue<NativeConstructor>(
        createArrayConstructor(runtime));
  
