@@ -3689,7 +3689,12 @@ std::vector<BufferedBundleFunction> generateOutlinedBundleFunction(
       partTargetBytes > emptyPart.size()
       ? partTargetBytes - emptyPart.size()
       : 1;
-  const bool needsOutlining = outlineableBytes >= instructionTarget;
+  // The O0 policy is selected for block count, not source bytes. Move even
+  // short same-block runs out of a structural O0 wrapper so the wrapper keeps
+  // control-flow authority without retaining the full generated body.
+  const bool structuralO0 =
+      cOptimizationLevel == sh::SHCBundleCOptimizationLevel::O0;
+  const bool needsOutlining = structuralO0 || outlineableBytes >= instructionTarget;
   std::vector<OutlinedPart> parts;
   if (needsOutlining) {
     for (uint32_t blockIndex = 0; blockIndex < blocks.size(); ++blockIndex) {
@@ -3708,7 +3713,7 @@ std::vector<BufferedBundleFunction> generateOutlinedBundleFunction(
           ++index;
         }
         const size_t end = index;
-        if (end - begin < kMinOutlinedInstructionCount &&
+        if (!structuralO0 && end - begin < kMinOutlinedInstructionCount &&
             runBytes < instructionTarget) {
           continue;
         }
@@ -3927,7 +3932,7 @@ L_catch:
   if (wrapperSource.size() > options.cBundleShardSize) {
     if (wrapperInstructionCount == 1)
       wrapperOversizeReason = sh::SHCBundleOversizeReason::SingleInstruction;
-    else if (!outline)
+    else if (!outline || structuralO0)
       wrapperOversizeReason =
           sh::SHCBundleOversizeReason::NoOutlineableRun;
   }

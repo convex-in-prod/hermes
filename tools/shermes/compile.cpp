@@ -399,8 +399,12 @@ bool compileToCBundle(
           candidate.functionFragmentCount != file.functionFragmentCount ||
           candidate.functionFragmentIndex != part ||
           (candidate.oversize &&
-           candidate.oversizeReason !=
-               sh::SHCBundleOversizeReason::SingleInstruction) ||
+           ((part == 0 && candidate.oversizeReason !=
+                 sh::SHCBundleOversizeReason::NoOutlineableRun &&
+             candidate.oversizeReason !=
+                 sh::SHCBundleOversizeReason::SingleInstruction) ||
+            (part != 0 && candidate.oversizeReason !=
+                 sh::SHCBundleOversizeReason::SingleInstruction))) ||
           (!candidate.oversize &&
            candidate.oversizeReason != sh::SHCBundleOversizeReason::None)) {
         llvh::errs() << "Static Hermes emitted invalid function fragments\n";
