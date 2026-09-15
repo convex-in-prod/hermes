@@ -234,7 +234,7 @@ set(HERMES_USE_STATIC_ICU OFF CACHE BOOL
   "Force static linking of ICU. May only work on GNU/Linux.")
 
 set(HERMES_UNICODE_LITE OFF CACHE BOOL
-  "Enable to use internal no-op unicode functionality instead of relying on underlying system libraries")
+  "Use internal Unicode support with default casing and no locale data instead of system libraries")
 
 set(HERMES_CHECK_NATIVE_STACK ON CACHE BOOL
   "Check the native stack for stack overflow")
