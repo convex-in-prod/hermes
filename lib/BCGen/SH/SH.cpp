@@ -3441,6 +3441,11 @@ constexpr size_t kMinOutlinedInstructionCount = 64;
 /// outlined helpers below the aggregate translation-unit target.
 constexpr size_t kOutlinedPartTargetDivisor = 8;
 
+/// Share a C frontend among small helpers without making one changed helper
+/// invalidate an unbounded number of others. The byte target still bounds
+/// groups containing larger helpers.
+constexpr size_t kMaxOutlinedPartsPerFragment = 64;
+
 /// Optimizing larger generated C control-flow graphs can require excessive
 /// compile time and memory even when the source body is below the shard target.
 constexpr size_t kO0BasicBlockCount = 1024;
@@ -3549,16 +3554,12 @@ std::string generateOutlinedPart(
     uint32_t part,
     llvh::ArrayRef<BufferedOutlinedInstruction> instructions,
     const SHNativeJSFunctionTable &functionTable,
-    uint32_t localsSize,
-    uint32_t nonPtrSize,
     SourceErrorManager &srcMgr,
     bool emitLineDirectives) {
   std::string source;
   llvh::raw_string_ostream sourceOS(source);
   {
     sh::LineDirectiveEmitter OS(sourceOS);
-    generateOutlinedStateDefinition(
-        OS, function, functionTable, localsSize, nonPtrSize);
     generateOutlinedPartDeclaration(OS, function, part, functionTable);
     OS << " {\n";
     emitOutlinedInstructions(
@@ -3567,6 +3568,21 @@ std::string generateOutlinedPart(
   }
   sourceOS.flush();
   return source;
+}
+
+std::string bundleFilePath(
+    llvh::StringRef unitName,
+    llvh::StringRef suffix) {
+  return ("sh_" + unitName + suffix).str();
+}
+
+void generateBundleFunctionDeclaration(
+    llvh::raw_ostream &OS,
+    Function *function,
+    const SHNativeJSFunctionTable &functionTable) {
+  OS << "SH_BUNDLE_HIDDEN SHLegacyValue ";
+  functionTable.generateFunctionLabel(function, OS);
+  OS << "(SHRuntime *shr);\n";
 }
 
 /// Generate an independently compilable wrapper and zero or more C helpers.
@@ -3676,18 +3692,22 @@ std::vector<BufferedBundleFunction> generateOutlinedBundleFunction(
       ? options.cBundleShardSize
       : std::max<uint64_t>(
             1, options.cBundleShardSize / kOutlinedPartTargetDivisor);
+  std::string stateDefinition;
+  llvh::raw_string_ostream stateOS(stateDefinition);
+  generateOutlinedStateDefinition(
+      stateOS, &F, moduleGen.nativeFunctionTable, localsSize, nonPtrSize);
+  stateOS.flush();
   const std::string emptyPart = generateOutlinedPart(
       &F,
       0,
       {},
       moduleGen.nativeFunctionTable,
-      localsSize,
-      nonPtrSize,
       srcMgr,
       options.emitLineDirectives);
+  const uint64_t emptyPartBytes = stateDefinition.size() + emptyPart.size();
   const uint64_t instructionTarget =
-      partTargetBytes > emptyPart.size()
-      ? partTargetBytes - emptyPart.size()
+      partTargetBytes > emptyPartBytes
+      ? partTargetBytes - emptyPartBytes
       : 1;
   // The O0 policy is selected for block count, not source bytes. Move even
   // short same-block runs out of a structural O0 wrapper so the wrapper keeps
@@ -3949,6 +3969,58 @@ L_catch:
   if (outline)
     result.back().referencedFunctions = std::move(wrapperReferences);
   if (outline) {
+    const auto &functionTable = moduleGen.nativeFunctionTable;
+    const auto functionsByIndex = functionTable.functionsByIndex();
+    const auto ownerIndex = functionTable.getIndex(&F);
+    auto usedExterns = collectUsedExterns({&F});
+    std::string prologue;
+    llvh::raw_string_ostream prologueOS(prologue);
+    prologueOS << "#include \""
+               << bundleFilePath(options.unitName, "_internal.h") << "\"\n\n";
+    generateExternCIncludes(F.getParent(), prologueOS, *usedExterns);
+    generateExternC(F.getParent(), prologueOS, *usedExterns);
+    generateBundleFunctionDeclaration(prologueOS, &F, functionTable);
+    prologueOS << '\n';
+    prologueOS.flush();
+
+    std::string groupedSource = stateDefinition;
+    llvh::BitVector groupedReferences(functionTable.size());
+    groupedReferences.set(ownerIndex);
+    uint64_t declarationBytes = 0;
+    size_t groupedParts = 0;
+    auto groupOversizeReason = sh::SHCBundleOversizeReason::None;
+    auto flushHelpers = [&]() {
+      if (groupedParts == 0)
+        return;
+      result.push_back({
+          &F,
+          std::move(groupedSource),
+          true,
+          0,
+          0,
+          sh::SHCBundleCOptimizationLevel::Default,
+          groupOversizeReason,
+      });
+      result.back().referencedFunctions = std::move(groupedReferences);
+      groupedSource = stateDefinition;
+      groupedReferences = llvh::BitVector(functionTable.size());
+      groupedReferences.set(ownerIndex);
+      declarationBytes = 0;
+      groupedParts = 0;
+      groupOversizeReason = sh::SHCBundleOversizeReason::None;
+    };
+    auto additionalDeclarationBytes = [&](const llvh::BitVector &references) {
+      std::string declarations;
+      llvh::raw_string_ostream OS(declarations);
+      for (int index = references.find_first(); index >= 0;
+           index = references.find_next(index)) {
+        if (!groupedReferences.test(index))
+          generateBundleFunctionDeclaration(
+              OS, functionsByIndex[index], functionTable);
+      }
+      OS.flush();
+      return declarations.size();
+    };
     for (uint32_t part = 0; part < parts.size(); ++part) {
       const auto &outlinedPart = parts[part];
       const auto &instructions = blocks[outlinedPart.blockIndex].instructions;
@@ -3958,26 +4030,9 @@ L_catch:
           llvh::ArrayRef<BufferedOutlinedInstruction>(instructions).slice(
               outlinedPart.begin, outlinedPart.end - outlinedPart.begin),
           moduleGen.nativeFunctionTable,
-          localsSize,
-          nonPtrSize,
           srcMgr,
           options.emitLineDirectives);
-      auto oversizeReason = sh::SHCBundleOversizeReason::None;
-      if (source.size() > options.cBundleShardSize &&
-          outlinedPart.end - outlinedPart.begin == 1) {
-        oversizeReason = sh::SHCBundleOversizeReason::SingleInstruction;
-      }
-      result.push_back({
-          &F,
-          std::move(source),
-          true,
-          part + 1,
-          static_cast<uint32_t>(parts.size() + 1),
-          sh::SHCBundleCOptimizationLevel::Default,
-          oversizeReason,
-      });
-      auto &referencedFunctions = result.back().referencedFunctions;
-      referencedFunctions.resize(moduleGen.nativeFunctionTable.size());
+      llvh::BitVector referencedFunctions(functionTable.size());
       for (const auto &instruction :
            llvh::ArrayRef<BufferedOutlinedInstruction>(instructions)
                .slice(
@@ -3988,15 +4043,37 @@ L_catch:
             moduleGen.nativeFunctionTable,
             referencedFunctions);
       }
+      auto addedDeclarationBytes =
+          additionalDeclarationBytes(referencedFunctions);
+      if (groupedParts != 0 &&
+          (groupedParts == kMaxOutlinedPartsPerFragment ||
+           prologue.size() + groupedSource.size() + source.size() +
+                   declarationBytes + addedDeclarationBytes >
+               options.cBundleShardSize)) {
+        flushHelpers();
+        addedDeclarationBytes =
+            additionalDeclarationBytes(referencedFunctions);
+      }
+      // Group translation units, not the functions themselves. Each helper
+      // retains its no-inline boundary and the wrapper alone owns control flow,
+      // exception handling, and the rooted register state.
+      groupedSource += source;
+      groupedReferences |= referencedFunctions;
+      declarationBytes += addedDeclarationBytes;
+      ++groupedParts;
+      if (groupedSource.size() > options.cBundleShardSize &&
+          outlinedPart.end - outlinedPart.begin == 1) {
+        assert(groupedParts == 1 && "oversized helper must remain isolated");
+        groupOversizeReason = sh::SHCBundleOversizeReason::SingleInstruction;
+      }
+    }
+    flushHelpers();
+    for (uint32_t index = 0; index < result.size(); ++index) {
+      result[index].functionFragmentIndex = index;
+      result[index].functionFragmentCount = result.size();
     }
   }
   return result;
-}
-
-std::string bundleFilePath(
-    llvh::StringRef unitName,
-    llvh::StringRef suffix) {
-  return ("sh_" + unitName + suffix).str();
 }
 
 void generateBundleHeader(
@@ -4027,15 +4104,6 @@ void collectReferencedFunctions(
     for (auto &I : BB)
       collectReferencedFunction(&I, functionTable, referenced);
   }
-}
-
-void generateBundleFunctionDeclaration(
-    llvh::raw_ostream &OS,
-    Function *function,
-    const SHNativeJSFunctionTable &functionTable) {
-  OS << "SH_BUNDLE_HIDDEN SHLegacyValue ";
-  functionTable.generateFunctionLabel(function, OS);
-  OS << "(SHRuntime *shr);\n";
 }
 
 bool generateBundleFunctionShard(

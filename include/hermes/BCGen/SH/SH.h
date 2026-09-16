@@ -57,9 +57,9 @@ struct SHCBundleFile {
   bool oversize{false};
   SHCBundleOversizeReason oversizeReason{SHCBundleOversizeReason::None};
   /// Fragment fields are zero for ordinary function shards. For an outlined
-  /// function, index 0 is the wrapper and later indexes are helpers in
-  /// deterministic wrapper call-site emission order. Every fragment has the
-  /// same positive count.
+  /// function, index 0 is the wrapper and later indexes are translation units
+  /// containing one or more no-inline helpers in deterministic wrapper
+  /// call-site emission order. Every fragment has the same positive count.
   uint32_t functionFragmentIndex{0};
   uint32_t functionFragmentCount{0};
   /// Default leaves optimization policy to the bundle consumer. O0 is an

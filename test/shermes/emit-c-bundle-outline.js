@@ -29,9 +29,13 @@
 // RUN: cd %t.dir && %c_compiler -r sh_outline_*.o -o unit.o
 // RUN: cd %t.dir && ! nm -u unit.o | grep sh_outline
 // RUN: cd %t.dir && %shermes -O -emit-c -Xemit-c-bundle -Xemit-c-shard-size=65536 -o executable.c.json input.js
-// RUN: cd %t.dir && for source in sh_this_unit_*.c; do %c_compiler -DNDEBUG -I%static_h_config -I%S/../../include -c "$source" -o "${source%.c}.o" || exit; done
+// RUN: cd %t.dir && env C_COMPILER=%c_compiler python3 -c "import json,os,subprocess; units=json.load(open('executable.c.json'))['translationUnits']; [subprocess.run([os.environ['C_COMPILER'], '-DNDEBUG', '-O0' if unit.get('cOptimizationLevel') == 0 else '-Oz', '-I%static_h_config', '-I%S/../../include', '-c', unit['path'], '-o', unit['path'][:-2]+'.o'], check=True) for unit in units]"
 // RUN: cd %t.dir && %c_compiler sh_this_unit_*.o -L%hermesvm_lib_dir -L%shermes_console_lib_dir -Wl,-rpath,%hermesvm_lib_dir -Wl,-rpath,%shermes_console_lib_dir -lshermes_console -lhermesvm -lm -o executable
 // RUN: cd %t.dir && ./executable | %FileCheck %s
+
+// Small no-inline helpers share translation units; wrapper calls, rooted state,
+// and the explicit O0 wrapper remain separate from that packaging decision.
+// RUN: cd %t.dir && env python3 -c "import json,pathlib,re; units=json.load(open('unit.c.json'))['translationUnits']; fragments=[unit for unit in units if unit.get('functionFragmentIndex', 0) > 0]; sources=[pathlib.Path(unit['path']).read_text() for unit in fragments]; helpers=[re.findall(r'SH_ATTRIBUTE_NOINLINE void (sh_outline_f_[0-9]+_part_[0-9]+)\\([^)]*\\) \\{', source) for source in sources]; assert any(len(group) == 64 for group in helpers); assert all(1 <= len(group) <= 64 for group in helpers); assert all(len(re.findall(r'^struct sh_outline_f_[0-9]+_state \\{', source, re.M)) == 1 for source in sources); names=[name for group in helpers for name in group]; wrappers=[pathlib.Path(unit['path']).read_text() for unit in units if unit.get('functionFragmentIndex') == 0]; calls=[name for source in wrappers for name in re.findall(r'(sh_outline_f_[0-9]+_part_[0-9]+)\\(shr, state, frame, shUnit\\);', source)]; assert len(names) == len(set(names)) and sorted(names) == sorted(calls)"
 
 // CHECK: 281
 // CHECK-NEXT: boom
