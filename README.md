@@ -13,22 +13,27 @@ The generated snapshot contains:
 - `RESULT_TREE`: the exact tree produced by applying the series; and
 - `patches/`: stable `git format-patch` files with commit messages and authors.
 
-Run `scripts/update.sh` from this branch before rebasing or amending `static_h`,
-and again after the rewrite. The updater requires a clean source worktree from
-the same repository with `static_h` checked out and tracking
-`convex-in-prod/static_h`. It derives the upstream base from
-`upstream/static_h`,
-regenerates the complete series, applies every patch to a temporary index, and
-verifies that the resulting tree equals the source tree:
+Run the canonical updater at `$HOME/.local/lib/patch-history/update.sh` from
+this branch before rebasing or amending `static_h`, and again after the rewrite.
+The updater requires a clean source worktree from the same repository with
+`static_h` checked out and tracking `convex-in-prod/static_h`. It derives the
+upstream base from `upstream/static_h`, regenerates the complete series, applies
+every patch to a temporary index, and verifies that the resulting tree equals
+the source tree. Use `--history-root` when invoking it from another directory:
 
 Configure the `upstream` remote to point at `facebook/hermes` and fetch its
 `static_h` branch before updating the snapshot. Configure the `convex-in-prod`
 remote to point at this fork and fetch its `static_h` branch.
 
 ```sh
-./scripts/update.sh /path/to/hermes-static-h-worktree
-./scripts/update.sh --push convex-in-prod /path/to/hermes-static-h-worktree
+"$HOME/.local/lib/patch-history/update.sh" --message "refresh the static_h downstream train" /path/to/hermes-static-h-worktree
+"$HOME/.local/lib/patch-history/update.sh" --push convex-in-prod --message "refresh the static_h downstream train" /path/to/hermes-static-h-worktree
 ```
+
+The required `--message` is a concise human summary of why this snapshot is
+being recorded; it becomes the subject of the history commit. Use `--no-commit`
+only to inspect generated changes before recording them; it does not accept
+`--message`.
 
 To reconstruct the source commits on a clean checkout at `UPSTREAM`:
 
