@@ -1,20 +1,20 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Thu, 27 Aug 2026 13:49:36 +0800
-Subject: [PATCH 3/9] StaticH: emit sharded C bundles
+Subject: [PATCH 03/13] StaticH: emit sharded C bundles
 
 Add an authenticated C-bundle output mode with deterministic manifests, metadata, function shards, per-unit optimization policy, and safe straight-line outlining for oversized functions. Expose the mode through shermes and lit, and exercise manifest integrity, shard invariants, compilation, and execution.
 ---
  CMakeLists.txt                        |    4 +
  include/hermes/BCGen/SH/SH.h          |   63 ++
  include/hermes/Utils/Options.h        |   12 +
- lib/BCGen/SH/SH.cpp                   | 1301 ++++++++++++++++++++++---
+ lib/BCGen/SH/SH.cpp                   | 1302 ++++++++++++++++++++++---
  test/lit.cfg                          |    8 +
  test/shermes/emit-c-bundle-outline.js |   47 +
  test/shermes/emit-c-bundle.js         |   33 +
  tools/shermes/compile.cpp             |  361 +++++++
  tools/shermes/shermes.cpp             |   20 +
- 9 files changed, 1738 insertions(+), 111 deletions(-)
+ 9 files changed, 1737 insertions(+), 113 deletions(-)
  create mode 100644 test/shermes/emit-c-bundle-outline.js
  create mode 100644 test/shermes/emit-c-bundle.js
 
@@ -152,7 +152,7 @@ index 9b13460d0f70356dd1cab898df06adc3973f3678..c4d27a5671c29cdb8278ff3fac9bb90d
    bool stripDebugInfoSection = false;
  
 diff --git a/lib/BCGen/SH/SH.cpp b/lib/BCGen/SH/SH.cpp
-index 8856857441adadcf674f5816929a7ab0fc1b63cf..ad866f07e1c0f10bb41a77b26b27f050e0d163f5 100644
+index 9916e12b6910a79aa13ae51fa8d70e296f2a62bd..ad866f07e1c0f10bb41a77b26b27f050e0d163f5 100644
 --- a/lib/BCGen/SH/SH.cpp
 +++ b/lib/BCGen/SH/SH.cpp
 @@ -35,6 +35,8 @@
@@ -648,7 +648,7 @@ index 8856857441adadcf674f5816929a7ab0fc1b63cf..ad866f07e1c0f10bb41a77b26b27f050
  /// Converts Module \p M into valid C code and outputs it through \p OS.
  /// Returns the cache size necessary to store all the cache indexes used.
  void generateModule(
-@@ -3135,107 +3388,925 @@ static SHNativeFuncInfo s_function_info_table[];
+@@ -3135,110 +3388,925 @@ static SHNativeFuncInfo s_function_info_table[];
    }
  
    if (options.format == DumpBytecode || options.format == EmitBundle) {
@@ -1313,16 +1313,14 @@ index 8856857441adadcf674f5816929a7ab0fc1b63cf..ad866f07e1c0f10bb41a77b26b27f050
 +  return result;
 +}
  
--void free_console_context(SHConsoleContext *consoleContext);
+-void release_console_bindings(SHConsoleContext *consoleContext);
 +std::string bundleFilePath(
 +    llvh::StringRef unitName,
 +    llvh::StringRef suffix) {
 +  return ("sh_" + unitName + suffix).str();
 +}
  
--bool run_event_loop(
--    SHRuntime *shr,
--    SHConsoleContext *consoleContext);
+-void free_console_context(SHConsoleContext *consoleContext);
 +void generateBundleHeader(
 +    llvh::raw_ostream &OS,
 +    ModuleGen &moduleGen,
@@ -1343,6 +1341,19 @@ index 8856857441adadcf674f5816929a7ab0fc1b63cf..ad866f07e1c0f10bb41a77b26b27f050
 +  OS << "[];\n\n#endif\n";
 +}
  
+-bool run_event_loop(
+-    SHRuntime *shr,
+-    SHConsoleContext *consoleContext);
++void collectReferencedFunctions(
++    Function *function,
++    const SHNativeJSFunctionTable &functionTable,
++    llvh::BitVector &referenced) {
++  for (auto &BB : *function) {
++    for (auto &I : BB)
++      collectReferencedFunction(&I, functionTable, referenced);
++  }
++}
+ 
 -int main(int argc, char **argv) {
 -  int scriptArgc = 0;
 -  char **scriptArgv = NULL;
@@ -1353,16 +1364,6 @@ index 8856857441adadcf674f5816929a7ab0fc1b63cf..ad866f07e1c0f10bb41a77b26b27f050
 -      scriptArgv = argv + i + 1;
 -      clArgc = i;
 -      break;
-+void collectReferencedFunctions(
-+    Function *function,
-+    const SHNativeJSFunctionTable &functionTable,
-+    llvh::BitVector &referenced) {
-+  for (auto &BB : *function) {
-+    for (auto &I : BB)
-+      collectReferencedFunction(&I, functionTable, referenced);
-+  }
-+}
-+
 +void generateBundleFunctionDeclaration(
 +    llvh::raw_ostream &OS,
 +    Function *function,
@@ -1413,8 +1414,9 @@ index 8856857441adadcf674f5816929a7ab0fc1b63cf..ad866f07e1c0f10bb41a77b26b27f050
 -  bool success =
 -    _sh_initialize_units(shr, 1, CREATE_THIS_UNIT) &&
 -    run_event_loop(shr, consoleContext);
--  free_console_context(consoleContext);
+-  release_console_bindings(consoleContext);
 -  _sh_done(shr);
+-  free_console_context(consoleContext);
 -  return success ? 0 : 1;
 +  auto usedExterns = collectUsedExterns(shardFunctions);
 +
@@ -1659,7 +1661,7 @@ index 8856857441adadcf674f5816929a7ab0fc1b63cf..ad866f07e1c0f10bb41a77b26b27f050
  }
  } // namespace
  
-@@ -3247,3 +4318,11 @@ void sh::generateSH(
+@@ -3250,3 +4318,11 @@ void sh::generateSH(
    LineDirectiveEmitter emitter{OS};
    generateModule(M, emitter, options);
  }

@@ -1,31 +1,17 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Thu, 27 Aug 2026 13:49:51 +0800
-Subject: [PATCH 5/9] StaticH: fix typed string and FastArray builtins
+Subject: [PATCH 05/13] StaticH: fix typed string and FastArray builtins
 
 Expose String.prototype.charCodeAt in the typed library and give FastArray a dedicated prototype with the standard iterator when values cross into dynamic JavaScript. Add semantic and execution coverage for both surfaces.
 ---
- lib/TypedLib/02-string.js                   |  5 ++
  lib/VM/JSLib/GlobalObject.cpp               | 19 ++++++-
  test/Sema/flow/builtin-string-charCodeAt.js | 46 +++++++++++++++++
  test/shermes/array-spread-fast-array.js     | 55 +++++++++++++++++++++
- 4 files changed, 123 insertions(+), 2 deletions(-)
+ 3 files changed, 118 insertions(+), 2 deletions(-)
  create mode 100644 test/Sema/flow/builtin-string-charCodeAt.js
  create mode 100644 test/shermes/array-spread-fast-array.js
 
-diff --git a/lib/TypedLib/02-string.js b/lib/TypedLib/02-string.js
-index 1a2696ad69bbe01f44cf370ddc97469222847177..d83431e3f1b63b947c7cac06f94c8bb71d231f8b 100644
---- a/lib/TypedLib/02-string.js
-+++ b/lib/TypedLib/02-string.js
-@@ -9,3 +9,8 @@ function charAt(this: string, pos: number): string {
-   return this[pos];
- }
- Hermes.decorate(charAt, Hermes.builtin);
-+
-+function charCodeAt(this: string, pos: number): number {
-+  return globalThis.String.prototype.charCodeAt.call(this, pos) as number;
-+}
-+Hermes.decorate(charCodeAt, Hermes.builtin);
 diff --git a/lib/VM/JSLib/GlobalObject.cpp b/lib/VM/JSLib/GlobalObject.cpp
 index d3bee7f3e5678574a866c477468223b215a654c6..7e87288addfbe2256104f3978a56ef70a66539ba 100644
 --- a/lib/VM/JSLib/GlobalObject.cpp

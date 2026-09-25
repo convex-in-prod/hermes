@@ -1,10 +1,14 @@
 # patch-file source-commit
-0001-Support-run-serial-tasks-inline-on-single-threaded-E.patch 4a59f7fdc8eca1fe1f28dae5233efdc582445fcf
-0002-StaticH-publish-runtime-registry-and-ABI-descriptor.patch 2bc6ac960e1f5442b6c7d4de2a2c93b857bffcc2
-0003-StaticH-emit-sharded-C-bundles.patch 57dd97cf519da5607c1d40e87d2bd36a8b3b8047
-0004-Flow-support-typed-class-expressions-and-computed-me.patch 06608ca2609fe64088e370c7101d8e3462b1d506
-0005-StaticH-fix-typed-string-and-FastArray-builtins.patch 1e435005d4fa38666825f67384c0b58bd39b0858
-0006-Docs-describe-Static-Hermes-fork-branches.patch 7916b5aba66a4f2549edcdbcce6e184290c16bb0
-0007-support-test-inline-SerialExecutor-ownership-without.patch a84c24b328f98254b1b119d9f7cb2557a94060ee
-0008-docs-identify-static_h-as-the-maintained-source-bran.patch 77d40210499baceaedb64857ffc938cb783f8e1e
-0009-tests-update-charCodeAt-semantic-return-annotations.patch 0ecc9d1a9b2d389fe09342b983ab8798b60ab81c
+0001-Support-run-serial-tasks-inline-on-single-threaded-E.patch e8d7da1b3ad6ce7f445029f56a6e2fc2b20ce5ab
+0002-StaticH-publish-runtime-registry-and-ABI-descriptor.patch ac1e9bebad7b6a7b6c099879cb176c989e62ea3c
+0003-StaticH-emit-sharded-C-bundles.patch 63292870fedb62632bc3c8b0e54051d6cc7513d6
+0004-Flow-support-typed-class-expressions-and-computed-me.patch cf42dbc8a388d67d732d5c9adaba104e4baffb27
+0005-StaticH-fix-typed-string-and-FastArray-builtins.patch 1248fe1b0d22445c94e9e2d48b259507fdd4b932
+0006-Docs-describe-Static-Hermes-fork-branches.patch ea7594b60a5c2f79562efc735df244c4efc1186c
+0007-support-test-inline-SerialExecutor-ownership-without.patch 109f23f1fcc06c9d4c6a0ac5e538dad5d36d0393
+0008-docs-identify-static_h-as-the-maintained-source-bran.patch 2995e5dc96efcdd9f5b47f2a778b155dd22b4b97
+0009-tests-update-charCodeAt-semantic-return-annotations.patch 0db9d09a249b0b0e8f4fb13c3eaa7d4c36950dd1
+0010-shermes-fragment-structural-O0-functions.patch c3d6fb142c312a91df22505af2fd3458d8a29a3a
+0011-unicode-implement-default-case-conversion-in-Unicode.patch 689f91586878d4b1bd7d25a3654bcb6045e63969
+0012-shermes-group-outlined-helpers-into-bounded-C-transl.patch 9db5a8bcea231f7bf063964fd1ca0f7716450f8a
+0013-wasm-define-fast-floating-point-integer-conversions.patch 5354e994a64a52e883f0c4cda8743b20f10a1f08

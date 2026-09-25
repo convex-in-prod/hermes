@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Thu, 27 Aug 2026 13:49:45 +0800
-Subject: [PATCH 4/9] Flow: support typed class expressions and computed
+Subject: [PATCH 04/13] Flow: support typed class expressions and computed
  methods
 
 Generate typed class expressions through the class pipeline, evaluate computed keys once in source order, preserve home-object semantics, and keep dynamic property access sound when computed methods can collide with named members. Validate supported behavior and explicit unsupported combinations in Flow and Hermes tests.
@@ -828,10 +828,10 @@ index 954995871e72436b9656edbe043d80b103fe8a08..02391acd52292a51fb63d0a11e56b60a
    /// Return the default init value for the specified type.
    Value *getDefaultInitValue(flow::Type *type);
 diff --git a/lib/Sema/FlowChecker.cpp b/lib/Sema/FlowChecker.cpp
-index f36a9698d2a16765ba78eaafcb0d64d43d9374c5..7e8fcbea9ac19e89b8ce4ecc35bf7711aaa1defc 100644
+index 90be4732d716a30a57629bf551292c185d80c09e..906abb989fdd4c7e69ad5ac2e56a2b2fd03d0c31 100644
 --- a/lib/Sema/FlowChecker.cpp
 +++ b/lib/Sema/FlowChecker.cpp
-@@ -392,6 +392,8 @@ class FlowChecker::ParseClassType {
+@@ -394,6 +394,8 @@ class FlowChecker::ParseClassType {
  
    size_t nextFieldLayoutSlotIR = 0;
    size_t nextMethodLayoutSlotIR = 0;
@@ -840,7 +840,7 @@ index f36a9698d2a16765ba78eaafcb0d64d43d9374c5..7e8fcbea9ac19e89b8ce4ecc35bf7711
  
   public:
    ParseClassType(
-@@ -460,6 +462,10 @@ class FlowChecker::ParseClassType {
+@@ -462,6 +464,10 @@ class FlowChecker::ParseClassType {
          outer_.setNodeType(&node, fieldType);
        } else if (
            auto *method = llvh::dyn_cast<ESTree::MethodDefinitionNode>(&node)) {
@@ -851,7 +851,7 @@ index f36a9698d2a16765ba78eaafcb0d64d43d9374c5..7e8fcbea9ac19e89b8ce4ecc35bf7711
          Type *methodType = parseMethodDefinition(classType, classBody, method);
          // Methods have FunctionExpression values.
          // Associate the same type with both the outer and inner nodes.
-@@ -474,32 +480,44 @@ class FlowChecker::ParseClassType {
+@@ -476,32 +482,44 @@ class FlowChecker::ParseClassType {
  
      Type *homeObjectType = outer_.flowContext_.createType(
          outer_.flowContext_.createClass(Identifier{}));
@@ -915,7 +915,7 @@ index f36a9698d2a16765ba78eaafcb0d64d43d9374c5..7e8fcbea9ac19e89b8ce4ecc35bf7711
      }
  
      llvh::cast<ClassType>(classType->info)
-@@ -785,6 +803,56 @@ class FlowChecker::ParseClassType {
+@@ -787,6 +805,56 @@ class FlowChecker::ParseClassType {
            method->_decorators,
            {outer_.kw_.identHermes, outer_.kw_.identOverload});
  
@@ -972,7 +972,7 @@ index f36a9698d2a16765ba78eaafcb0d64d43d9374c5..7e8fcbea9ac19e89b8ce4ecc35bf7711
        // @Hermes.overload requires @Hermes.final.
        if (overloadMethod && !finalMethod) {
          outer_.sm_.error(
-@@ -826,12 +894,6 @@ class FlowChecker::ParseClassType {
+@@ -828,12 +896,6 @@ class FlowChecker::ParseClassType {
          return outer_.flowContext_.getAny();
        }
  
@@ -985,7 +985,7 @@ index f36a9698d2a16765ba78eaafcb0d64d43d9374c5..7e8fcbea9ac19e89b8ce4ecc35bf7711
        if (fe->_async || fe->_generator) {
          outer_.sm_.error(
              method->getStartLoc(), "ft: async/generator methods unsupported");
-@@ -1250,6 +1312,45 @@ void FlowChecker::visit(ESTree::MethodDefinitionNode *node) {
+@@ -1252,6 +1314,45 @@ void FlowChecker::visit(ESTree::MethodDefinitionNode *node) {
      return;
    }
  
@@ -1031,7 +1031,7 @@ index f36a9698d2a16765ba78eaafcb0d64d43d9374c5..7e8fcbea9ac19e89b8ce4ecc35bf7711
    if (node->_kind == kw_.identConstructor) {
      FunctionContext functionContext(
          *this,
-@@ -1259,6 +1360,12 @@ void FlowChecker::visit(ESTree::MethodDefinitionNode *node) {
+@@ -1261,6 +1362,12 @@ void FlowChecker::visit(ESTree::MethodDefinitionNode *node) {
          curClassContext_->newTargetType);
      visitFunctionLike(fe, fe->_body, fe->_params);
    } else if (node->_key) {
@@ -1044,7 +1044,7 @@ index f36a9698d2a16765ba78eaafcb0d64d43d9374c5..7e8fcbea9ac19e89b8ce4ecc35bf7711
      Identifier name;
      OptValue<ClassType::FieldLookupEntry> optField;
      if (auto *privateName =
-@@ -1345,43 +1452,7 @@ void FlowChecker::visit(ESTree::MethodDefinitionNode *node) {
+@@ -1347,43 +1454,7 @@ void FlowChecker::visit(ESTree::MethodDefinitionNode *node) {
        }
      }
  

@@ -1,0 +1,146 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Wed, 16 Sep 2026 22:59:20 +0800
+Subject: [PATCH 13/13] wasm: define fast floating-point integer conversions
+
+Ordinary C floating-point casts have undefined behavior for out-of-range inputs, even when their Wasm instructions saturate. LLVM can remove the integer round-trip range check and accept a negative number as unsigned zero. Dynamic unsigned right shift then produces incorrect results.
+
+Use the defined Wasm saturating conversion builtins for all four signed and unsigned helpers. Preserve the established 64-bit mitigation against saturated integers rounding back to the overflowing double. Add dynamic conversion and JavaScript boundary regressions, including negative values, fractions, large magnitudes, infinities, and NaN.
+
+Validation: the complete Wasm runtime rebuilt successfully, ten focused conversion/support tests passed, and optimized Wasm conversion and seeded-hash witnesses agree with V8.
+---
+ include/hermes/Support/sh_tryfast_fp_cvt.h  | 17 ++++++---
+ test/shermes/unsigned-integer-conversion.js | 42 +++++++++++++++++++++
+ unittests/Support/ConversionsTest.cpp       | 31 +++++++++++++++
+ 3 files changed, 84 insertions(+), 6 deletions(-)
+ create mode 100644 test/shermes/unsigned-integer-conversion.js
+
+diff --git a/include/hermes/Support/sh_tryfast_fp_cvt.h b/include/hermes/Support/sh_tryfast_fp_cvt.h
+index ec474aba05875cd18ffd4bd187d85b41fdc1a8f8..b0d921bc84004ec198d433517ca95084effc5049 100644
+--- a/include/hermes/Support/sh_tryfast_fp_cvt.h
++++ b/include/hermes/Support/sh_tryfast_fp_cvt.h
+@@ -709,23 +709,28 @@ static inline unsigned _sh_tryfast_f64_to_u32_cvt(double x) {
+ //
+ // Wasm
+ //
+-// Fortunately Clang avoids UB when compiling the conversion to Wasm, so we
+-// don't need to do anything special.
++// A C cast is undefined for out-of-range values even if the final Wasm
++// instruction saturates. LLVM can consequently remove the range check from
++// the conversion's round trip, accepting negative inputs as unsigned zero.
++// Use defined saturating intrinsics so that the round-trip check is preserved.
+ 
+ static inline int32_t _sh_tryfast_f64_to_i32_cvt(double x) {
+-  return (int32_t)x;
++  return __builtin_wasm_trunc_saturate_s_i32_f64(x);
+ }
+ static inline uint32_t _sh_tryfast_f64_to_u32_cvt(double x) {
+-  return (uint32_t)x;
++  return __builtin_wasm_trunc_saturate_u_i32_f64(x);
+ }
+ 
+ #define HERMES_TRYFAST_F64_TO_64_IS_FAST 1
+ 
+ static inline int64_t _sh_tryfast_f64_to_i64_cvt(double x) {
+-  return (int64_t)x;
++  int64_t result = __builtin_wasm_trunc_saturate_s_i64_f64(x);
++  // Reject saturated values that round back to the overflowing input double.
++  // See the file doc-comment for the same mitigation on other architectures.
++  return (int64_t)((uint64_t)result << 1) >> 1;
+ }
+ static inline uint64_t _sh_tryfast_f64_to_u64_cvt(double x) {
+-  return (uint64_t)x;
++  return __builtin_wasm_trunc_saturate_u_i64_f64(x) & ~(1ull << 63);
+ }
+ 
+ #else
+diff --git a/test/shermes/unsigned-integer-conversion.js b/test/shermes/unsigned-integer-conversion.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..d913230f2935126f3c14d03e2c40cd28b751818a
+--- /dev/null
++++ b/test/shermes/unsigned-integer-conversion.js
+@@ -0,0 +1,42 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++// RUN: %shermes -exec -O %s | %FileCheck %s
++// RUN: %shermes -exec -O0 %s | %FileCheck %s
++
++function unsigned(value, shift) {
++  return value >>> shift;
++}
++
++var cases = [
++  [-1, 4294967295],
++  [-2147483648, 2147483648],
++  [-4294967297, 4294967295],
++  [-1.5, 4294967295],
++  [0, 0],
++  [4294967295, 4294967295],
++  [4294967296, 0],
++  [9007199254740991, 4294967295],
++  [9223372036854775808, 0],
++  [-9223372036854775808, 0],
++  [18446744073709551616, 0],
++  [1e20, 1661992960],
++  [-1e20, 2632974336],
++  [Infinity, 0],
++  [-Infinity, 0],
++  [NaN, 0],
++];
++for (var i = 0; i < cases.length; ++i) {
++  // Calls through an array keep the inputs dynamic, exercising the runtime
++  // conversion rather than only the compiler's constant folder.
++  if (unsigned(cases[i][0], 0) !== cases[i][1] ||
++      unsigned(cases[i][0], 16) !== Math.floor(cases[i][1] / 65536)) {
++    throw new Error('Unsigned conversion failed at case ' + i);
++  }
++}
++print('unsigned conversions passed');
++// CHECK: unsigned conversions passed
+diff --git a/unittests/Support/ConversionsTest.cpp b/unittests/Support/ConversionsTest.cpp
+index 04394781e395052ab598574541fd437a9ed03234..871f22b508c8a883c97f2d52a029a50359a4bd4b 100644
+--- a/unittests/Support/ConversionsTest.cpp
++++ b/unittests/Support/ConversionsTest.cpp
+@@ -15,6 +15,37 @@ using namespace hermes;
+ 
+ namespace {
+ 
++TEST(ConversionsTest, DynamicTruncateBoundaries) {
++  const struct {
++    double input;
++    uint32_t expected;
++  } cases[] = {
++      {-1, 0xffffffffu},
++      {-2147483648.0, 0x80000000u},
++      {-4294967297.0, 0xffffffffu},
++      {-1.5, 0xffffffffu},
++      {4294967295.0, 0xffffffffu},
++      {4294967296.0, 0},
++      {9007199254740991.0, 0xffffffffu},
++      {9223372036854775808.0, 0},
++      {-9223372036854775808.0, 0},
++      {18446744073709551616.0, 0},
++      {1e20, 1661992960u},
++      {-1e20, 2632974336u},
++      {std::numeric_limits<double>::infinity(), 0},
++      {-std::numeric_limits<double>::infinity(), 0},
++      {std::numeric_limits<double>::quiet_NaN(), 0},
++  };
++  for (const auto &test : cases) {
++    // Bypass the constant-folding shortcut to exercise the dynamic conversion
++    // and its round-trip rejection of out-of-range floating-point values.
++    volatile double input = test.input;
++    EXPECT_EQ(test.expected, hermes::truncateToUInt32(input));
++    EXPECT_EQ(
++        static_cast<int32_t>(test.expected), hermes::truncateToInt32(input));
++  }
++}
++
+ TEST(ConversionsTest, toInt32Test) {
+   EXPECT_EQ(0, hermes::truncateToInt32(0));
+   EXPECT_EQ(0, hermes::truncateToInt32(-0.1));

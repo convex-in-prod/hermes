@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Mon, 14 Sep 2026 04:08:23 +0800
+Subject: [PATCH 10/13] shermes: fragment structural O0 functions
+
+Outline structural O0 functions even when their linear instruction runs are short, keeping control-flow wrappers small enough for C bundle consumers. Mark wrappers that contain no outlineable runs explicitly and accept that reason only for fragment zero. Update the regression test to cover the fragmented wrapper contract.
+---
+ lib/BCGen/SH/SH.cpp                   | 11 ++++++++---
+ test/shermes/emit-c-bundle-outline.js |  8 +++-----
+ tools/shermes/compile.cpp             |  8 ++++++--
+ 3 files changed, 17 insertions(+), 10 deletions(-)
+
+diff --git a/lib/BCGen/SH/SH.cpp b/lib/BCGen/SH/SH.cpp
+index ad866f07e1c0f10bb41a77b26b27f050e0d163f5..e9295808d355a9cd65d91b585efb4fcc79840a51 100644
+--- a/lib/BCGen/SH/SH.cpp
++++ b/lib/BCGen/SH/SH.cpp
+@@ -3689,7 +3689,12 @@ std::vector<BufferedBundleFunction> generateOutlinedBundleFunction(
+       partTargetBytes > emptyPart.size()
+       ? partTargetBytes - emptyPart.size()
+       : 1;
+-  const bool needsOutlining = outlineableBytes >= instructionTarget;
++  // The O0 policy is selected for block count, not source bytes. Move even
++  // short same-block runs out of a structural O0 wrapper so the wrapper keeps
++  // control-flow authority without retaining the full generated body.
++  const bool structuralO0 =
++      cOptimizationLevel == sh::SHCBundleCOptimizationLevel::O0;
++  const bool needsOutlining = structuralO0 || outlineableBytes >= instructionTarget;
+   std::vector<OutlinedPart> parts;
+   if (needsOutlining) {
+     for (uint32_t blockIndex = 0; blockIndex < blocks.size(); ++blockIndex) {
+@@ -3708,7 +3713,7 @@ std::vector<BufferedBundleFunction> generateOutlinedBundleFunction(
+           ++index;
+         }
+         const size_t end = index;
+-        if (end - begin < kMinOutlinedInstructionCount &&
++        if (!structuralO0 && end - begin < kMinOutlinedInstructionCount &&
+             runBytes < instructionTarget) {
+           continue;
+         }
+@@ -3927,7 +3932,7 @@ L_catch:
+   if (wrapperSource.size() > options.cBundleShardSize) {
+     if (wrapperInstructionCount == 1)
+       wrapperOversizeReason = sh::SHCBundleOversizeReason::SingleInstruction;
+-    else if (!outline)
++    else if (!outline || structuralO0)
+       wrapperOversizeReason =
+           sh::SHCBundleOversizeReason::NoOutlineableRun;
+   }
+diff --git a/test/shermes/emit-c-bundle-outline.js b/test/shermes/emit-c-bundle-outline.js
+index 14d53dd15f01f5bc97eef65c9d769f95a9722f22..6d8c34450dc88ca0a2a0ba18db39bdbd373967cc 100644
+--- a/test/shermes/emit-c-bundle-outline.js
++++ b/test/shermes/emit-c-bundle-outline.js
+@@ -10,7 +10,7 @@
+ // RUN: env python3 -c "import pathlib; target=pathlib.Path(r'%t.dir/input.js'); maybe='function maybeThrow(flag) { \\\"noinline\\\"; if (flag) throw new Error(\\\"boom\\\"); }\n'; outlined='function outlined(flag) { \\\"noinline\\\"; var retained = {answer: 42}; var value = {}; var number = 40;\n'+''.join('value.p%d = %d;\n' % (i, i) for i in range(100))+'gc(); maybeThrow(flag);\n'+''.join('value.p%d = %d;\n' % (i, i) for i in range(100, 200))+'return retained.answer + number + value.p199; }\n'; branch='function branched(flag) { \\\"noinline\\\"; var value = {}; if (flag) {\n'+''.join('value.q%d = %d;\n' % (i, i) for i in range(200))+'} return value; }\n'; loop='function looped(input) { \\\"noinline\\\"; var retained = {sum: 0}; var filler = {};\n'+''.join('filler.r%d = %d;\n' % (i, i) for i in range(200))+'for (var key in input) { gc(); retained.sum += input[key]; } return retained.sum; }\n'; with_try='function withTry(flag) { \\\"noinline\\\"; var value = {}; try {\n'+''.join('value.t%d = %d;\n' % (i, i) for i in range(200))+'if (flag) throw new Error(\\\"caught\\\"); } catch (error) { value.caught = true; } return value; }\n'; complex_cfg='function complex(value) { \\\"noinline\\\"; var result = -1;\n'+''.join('if (value === %d) result = %d;\n' % (i, i) for i in range(1100))+'return result; }\n'; main='print(outlined(false)); try { outlined(true); } catch (error) { print(error.message); } print(\\\"after\\\"); print(branched(true).q199); print(branched(false).q199 === undefined); print(looped({a: 2, b: 3})); print(looped({})); print(withTry(false).t199); print(withTry(true).caught); print(complex(1099));\n'; target.write_text(maybe+outlined+branch+loop+with_try+complex_cfg+main)"
+ // RUN: cd %t.dir && %shermes -O -emit-c -Xemit-c-bundle -Xemit-c-shard-size=65536 -exported-unit=outline -o unit.c.json input.js
+ // RUN: cd %t.dir && env python3 -c "import json; raw=open('unit.c.json').read(); assert '\\\"cOptimizationLevel\\\":0,\\\"firstFunctionId\\\":' in raw and raw == json.dumps(json.loads(raw), separators=(',', ':'), sort_keys=True) + '\\n'"
+-// RUN: cd %t.dir && env python3 -c "import json,pathlib,re; manifest=json.load(open('unit.c.json')); units=manifest['translationUnits']; function_units=[unit for unit in units if unit['role']=='function']; sources={unit['path']:pathlib.Path(unit['path']).read_text() for unit in function_units}; part_files={path:source for path,source in sources.items() if re.search(r'void sh_outline_f_[0-9]+_part_[0-9]+\\([^)]*\\) \\{',source)}; ids={int(match) for source in part_files.values() for match in re.findall(r'void sh_outline_f_([0-9]+)_part_[0-9]+',source)}; fragments=[unit for unit in function_units if 'functionFragmentCount' in unit]; fragment_ids={unit['firstFunctionId'] for unit in fragments}; wrappers=[sources[unit['path']] for unit in fragments if unit['functionFragmentIndex'] == 0]; o0_units=[unit for unit in function_units if unit.get('cOptimizationLevel') == 0]; assert len(part_files) >= 2 and len(ids) >= 2 and ids == fragment_ids; assert all('_sh_enter(' not in source and '_sh_leave(' not in source and 'SH_ATTRIBUTE_NOINLINE' in source and 'tryState' not in source and 'jmpBuf' not in source for source in part_files.values()); assert any('goto L' in source for source in wrappers); assert any('SHJmpBuf jmpBuf' in source and 'L_catch:' in source for source in wrappers); assert len(o0_units) == 1 and o0_units[0]['functionCount'] == 1 and 'functionFragmentCount' not in o0_units[0] and o0_units[0]['oversize'] and o0_units[0]['oversizeReason'] == 'no-outlineable-run'; assert all(not unit['oversize'] and 'oversizeReason' not in unit for unit in fragments); assert all(not unit.get('oversize') or unit is o0_units[0] for unit in function_units); assert all((lambda group: group[0]['functionFragmentCount'] == len(group) and {unit['functionFragmentIndex'] for unit in group} == set(range(len(group))) and all(unit['functionFragmentCount'] == len(group) and unit['firstFunctionId'] == function_id and unit['lastFunctionId'] == function_id for unit in group))([unit for unit in fragments if unit['firstFunctionId'] == function_id]) for function_id in fragment_ids)"
++// RUN: cd %t.dir && env python3 -c "import json,pathlib,re; manifest=json.load(open('unit.c.json')); units=manifest['translationUnits']; function_units=[unit for unit in units if unit['role']=='function']; sources={unit['path']:pathlib.Path(unit['path']).read_text() for unit in function_units}; part_files={path:source for path,source in sources.items() if re.search(r'void sh_outline_f_[0-9]+_part_[0-9]+\\([^)]*\\) \\{',source)}; ids={int(match) for source in part_files.values() for match in re.findall(r'void sh_outline_f_([0-9]+)_part_[0-9]+',source)}; fragments=[unit for unit in function_units if 'functionFragmentCount' in unit]; fragment_ids={unit['firstFunctionId'] for unit in fragments}; wrappers=[sources[unit['path']] for unit in fragments if unit['functionFragmentIndex'] == 0]; o0_units=[unit for unit in function_units if unit.get('cOptimizationLevel') == 0]; assert len(part_files) >= 2 and len(ids) >= 2 and ids == fragment_ids; assert all('_sh_enter(' not in source and '_sh_leave(' not in source and 'SH_ATTRIBUTE_NOINLINE' in source and 'tryState' not in source and 'jmpBuf' not in source for source in part_files.values()); assert any('goto L' in source for source in wrappers); assert any('SHJmpBuf jmpBuf' in source and 'L_catch:' in source for source in wrappers); assert len(o0_units) == 1 and o0_units[0]['functionCount'] == 1 and o0_units[0]['functionFragmentIndex'] == 0 and o0_units[0]['functionFragmentCount'] > 1 and o0_units[0]['oversize'] and o0_units[0]['oversizeReason'] == 'no-outlineable-run'; assert all(not unit['oversize'] or unit is o0_units[0] for unit in fragments); assert all(not unit.get('oversize') or unit is o0_units[0] for unit in function_units); assert all((lambda group: group[0]['functionFragmentCount'] == len(group) and {unit['functionFragmentIndex'] for unit in group} == set(range(len(group))) and all(unit['functionFragmentCount'] == len(group) and unit['firstFunctionId'] == function_id and unit['lastFunctionId'] == function_id for unit in group))([unit for unit in fragments if unit['firstFunctionId'] == function_id]) for function_id in fragment_ids)"
+ // RUN: cd %t.dir && env python3 -c "import json; units=json.load(open('unit.c.json'))['translationUnits']; fragment_ids={unit['firstFunctionId'] for unit in units if 'functionFragmentCount' in unit}; groups={function_id:[index for index,unit in enumerate(units) if unit.get('firstFunctionId') == function_id and 'functionFragmentCount' in unit] for function_id in fragment_ids}; assert all(indexes == list(range(indexes[0], indexes[0] + len(indexes))) for indexes in groups.values())"
+ // RUN: env python3 -c "import pathlib; target=pathlib.Path(r'%t.dir/initializers.js'); count=1500; target.write_text(''.join('var closure%d = function closure%d() { return %d; };\\nvar class%d = class Class%d {};\\n' % (i, i, i, i, i) for i in range(count)) + 'print(typeof closure1499, typeof class1499);\\n')"
+ // RUN: cd %t.dir && %shermes -O -emit-c -Xemit-c-bundle -Xemit-c-shard-size=65536 -exported-unit=initializers -o initializers.c.json initializers.js
+@@ -19,8 +19,8 @@
+ // RUN: cd %t.dir && %shermes -O -emit-c -Xemit-c-bundle -Xemit-c-shard-size=1 -exported-unit=single -o single.c.json single.js
+ // RUN: cd %t.dir && env python3 -c "import json; units=json.load(open('single.c.json'))['translationUnits']; groups={function_id:[unit for unit in units if unit.get('firstFunctionId') == function_id and 'functionFragmentCount' in unit] for function_id in {unit['firstFunctionId'] for unit in units if 'functionFragmentCount' in unit}}; assert any(len(group) > 1 and all(unit['oversize'] and unit['oversizeReason'] == 'single-instruction' for unit in group) for group in groups.values())"
+ // RUN: env python3 -c "import pathlib; target=pathlib.Path(r'%t.dir/invariant.js'); linear='function mixed(value) { \\\"noinline\\\"; var object = {};\n'+''.join('object.p%d = %d;\n' % (i, i) for i in range(64)); cfg=''.join('if (value === %d) object.q%d = %d;\n' % (i, i, i) for i in range(1100)); target.write_text(linear+cfg+'return object; }\nprint(mixed(1099).q1099);\n')"
+-// RUN: cd %t.dir && (! %shermes -O -emit-c -Xemit-c-bundle -Xemit-c-shard-size=65536 -exported-unit=invariant -o invariant.c.json invariant.js 2>&1) | %FileCheck --check-prefix=INVARIANT %s
+-// RUN: cd %t.dir && test ! -e invariant.c.json
++// RUN: cd %t.dir && %shermes -O -emit-c -Xemit-c-bundle -Xemit-c-shard-size=65536 -exported-unit=invariant -o invariant.c.json invariant.js
++// RUN: cd %t.dir && env python3 -c "import json; manifest=json.load(open('invariant.c.json')); units=[unit for unit in manifest['translationUnits'] if unit['role']=='function']; o0=[unit for unit in units if unit.get('cOptimizationLevel') == 0]; assert len(o0) == 1 and o0[0]['functionFragmentIndex'] == 0 and o0[0]['functionFragmentCount'] > 1 and o0[0]['oversize'] and o0[0]['oversizeReason'] == 'no-outlineable-run'; assert all(not unit['oversize'] or unit is o0[0] for unit in units)"
+ // RUN: env python3 -c "import pathlib; pathlib.Path(r'%t.dir/initializers-main.c').write_text('#include \"hermes/VM/static_h.h\"\\n\\ntypedef struct SHConsoleContext SHConsoleContext;\\n\\nSHConsoleContext *init_console_bindings(SHRuntime *shr, int scriptArgc, const char *const *scriptArgv);\\nvoid free_console_context(SHConsoleContext *consoleContext);\\nbool run_event_loop(SHRuntime *shr, SHConsoleContext *consoleContext);\\nextern SHUnit *sh_export_initializers(void);\\n\\nint main(void) {\\n  SHRuntime *shr = _sh_init(0, NULL);\\n  SHConsoleContext *consoleContext = init_console_bindings(shr, 0, NULL);\\n  bool success = _sh_initialize_units(shr, 1, sh_export_initializers) && run_event_loop(shr, consoleContext);\\n  free_console_context(consoleContext);\\n  _sh_done(shr);\\n  return success ? 0 : 1;\\n}\\n')"
+ // RUN: cd %t.dir && for source in sh_initializers_*.c; do %c_compiler -DNDEBUG -I%static_h_config -I%S/../../include -c "$source" -o "${source%.c}.o" || exit; done
+ // RUN: cd %t.dir && %c_compiler -DNDEBUG -I%static_h_config -I%S/../../include initializers-main.c sh_initializers_*.o -L%hermesvm_lib_dir -L%shermes_console_lib_dir -Wl,-rpath,%hermesvm_lib_dir -Wl,-rpath,%shermes_console_lib_dir -lshermes_console -lhermesvm -lm -o initializers
+@@ -43,5 +43,3 @@
+ // CHECK-NEXT: 199
+ // CHECK-NEXT: true
+ // CHECK-NEXT: 1099
+-
+-// INVARIANT: Static Hermes C bundle could not outline an oversized function shard
+diff --git a/tools/shermes/compile.cpp b/tools/shermes/compile.cpp
+index 760cc1918c5ca699c7ae9e52f8749634613c126b..d23009ed6b3a4919c5ceff2b9c23e586fbd5607e 100644
+--- a/tools/shermes/compile.cpp
++++ b/tools/shermes/compile.cpp
+@@ -399,8 +399,12 @@ bool compileToCBundle(
+           candidate.functionFragmentCount != file.functionFragmentCount ||
+           candidate.functionFragmentIndex != part ||
+           (candidate.oversize &&
+-           candidate.oversizeReason !=
+-               sh::SHCBundleOversizeReason::SingleInstruction) ||
++           ((part == 0 && candidate.oversizeReason !=
++                 sh::SHCBundleOversizeReason::NoOutlineableRun &&
++             candidate.oversizeReason !=
++                 sh::SHCBundleOversizeReason::SingleInstruction) ||
++            (part != 0 && candidate.oversizeReason !=
++                 sh::SHCBundleOversizeReason::SingleInstruction))) ||
+           (!candidate.oversize &&
+            candidate.oversizeReason != sh::SHCBundleOversizeReason::None)) {
+         llvh::errs() << "Static Hermes emitted invalid function fragments\n";
