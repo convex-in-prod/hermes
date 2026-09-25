@@ -1,14 +1,14 @@
 # patch-file source-commit
-0001-Support-run-serial-tasks-inline-on-single-threaded-E.patch e8d7da1b3ad6ce7f445029f56a6e2fc2b20ce5ab
-0002-StaticH-publish-runtime-registry-and-ABI-descriptor.patch ac1e9bebad7b6a7b6c099879cb176c989e62ea3c
-0003-StaticH-emit-sharded-C-bundles.patch 63292870fedb62632bc3c8b0e54051d6cc7513d6
-0004-Flow-support-typed-class-expressions-and-computed-me.patch cf42dbc8a388d67d732d5c9adaba104e4baffb27
-0005-StaticH-fix-typed-string-and-FastArray-builtins.patch 1248fe1b0d22445c94e9e2d48b259507fdd4b932
-0006-Docs-describe-Static-Hermes-fork-branches.patch ea7594b60a5c2f79562efc735df244c4efc1186c
-0007-support-test-inline-SerialExecutor-ownership-without.patch 109f23f1fcc06c9d4c6a0ac5e538dad5d36d0393
-0008-docs-identify-static_h-as-the-maintained-source-bran.patch 2995e5dc96efcdd9f5b47f2a778b155dd22b4b97
-0009-tests-update-charCodeAt-semantic-return-annotations.patch 0db9d09a249b0b0e8f4fb13c3eaa7d4c36950dd1
-0010-shermes-fragment-structural-O0-functions.patch c3d6fb142c312a91df22505af2fd3458d8a29a3a
-0011-unicode-implement-default-case-conversion-in-Unicode.patch 689f91586878d4b1bd7d25a3654bcb6045e63969
-0012-shermes-group-outlined-helpers-into-bounded-C-transl.patch 9db5a8bcea231f7bf063964fd1ca0f7716450f8a
-0013-wasm-define-fast-floating-point-integer-conversions.patch 5354e994a64a52e883f0c4cda8743b20f10a1f08
+0001-Support-run-serial-tasks-inline-on-single-threaded-E.patch d7606596ed3ac35cbab32c9e638ec89074fafe3f
+0002-StaticH-publish-runtime-registry-and-ABI-descriptor.patch 7930ecc80f5526988169ddbd30e6a78303e372a7
+0003-StaticH-emit-sharded-C-bundles.patch e4422e9e580bd8d2b05b392efad4d1b191076838
+0004-Flow-support-typed-class-expressions-and-computed-me.patch 74908e1b50fcb3e60a1b9cfb968548e24eadfebf
+0005-StaticH-fix-typed-string-and-FastArray-builtins.patch 1f162d0617e97e94c2530180e308e0ca9947e809
+0006-Docs-describe-Static-Hermes-fork-branches.patch b4194fcdb3f12038f511c58c6d3e9a307eb43b23
+0007-support-test-inline-SerialExecutor-ownership-without.patch ef639e92ec12033256b7e08d19383b5f1b493e05
+0008-docs-identify-static_h-as-the-maintained-source-bran.patch cae404fe01588fbecd92725cfd2e9f5c47cb160a
+0009-tests-update-charCodeAt-semantic-return-annotations.patch ee58611212833f83a6d9dc64efc773570df39468
+0010-shermes-fragment-structural-O0-functions.patch 072bc67229d83121070d81afabab19c59f218ebc
+0011-unicode-implement-default-case-conversion-in-Unicode.patch 3d53997895ad671d4abd33edaccc809393c0db7b
+0012-shermes-group-outlined-helpers-into-bounded-C-transl.patch 5bed0780fb89aff780692b20d94c3c27af9cb11d
+0013-wasm-define-fast-floating-point-integer-conversions.patch 8bc2cccdcc07ee558e914bea4392d933de89bb76
