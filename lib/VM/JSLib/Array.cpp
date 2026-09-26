@@ -3825,6 +3825,7 @@ CallResult<HermesValue> arrayPrototypeMap(void *, Runtime &runtime) {
     PinnedValue<> k;
     PinnedValue<JSObject> descObj;
     PinnedValue<SymbolID> tmpPropNameStorage;
+    PinnedValue<> kValue;
     PinnedValue<> value;
   } lv;
   LocalsRAII lraii{runtime, &lv};
@@ -3868,27 +3869,43 @@ CallResult<HermesValue> arrayPrototypeMap(void *, Runtime &runtime) {
   lv.k = HermesValue::encodeTrustedNumberValue(0);
 
   // Main loop to execute callback and store the results in A.
-  // TODO: Implement a fast path for actual arrays.
   auto marker = gcScope.createMarker();
   while (lv.k->getDouble() < len) {
     gcScope.flushToMarker(marker);
 
-    ComputedPropertyDescWithSymStorage desc{lv.tmpPropNameStorage};
-    JSObject::getComputedPrimitiveDescriptor(
-        lv.O, runtime, lv.k, lv.descObj, desc);
-    CallResult<PseudoHandle<>> propRes = JSObject::getComputedPropertyValue_RJS(
-        lv.O, runtime, lv.descObj, desc.get(), lv.k);
-    if (LLVM_UNLIKELY(propRes == ExecutionStatus::EXCEPTION)) {
-      return ExecutionStatus::EXCEPTION;
+    bool present = false;
+    if (auto *arr = llvh::dyn_vmcast<JSArray>(*lv.O);
+        LLVM_LIKELY(arr &&
+                    arrayFastPathCheck(
+                        runtime, arr, nullptr, static_cast<uint32_t>(len)))) {
+      // Recheck after each callback: it may change the receiver or prototypes.
+      auto element = arr->at(runtime, static_cast<uint32_t>(lv.k->getDouble()));
+      if (!element.isEmpty()) {
+        lv.kValue = element.unboxToHV(runtime);
+        present = true;
+      }
+    } else {
+      ComputedPropertyDescWithSymStorage desc{lv.tmpPropNameStorage};
+      JSObject::getComputedPrimitiveDescriptor(
+          lv.O, runtime, lv.k, lv.descObj, desc);
+      CallResult<PseudoHandle<>> propRes =
+          JSObject::getComputedPropertyValue_RJS(
+              lv.O, runtime, lv.descObj, desc.get(), lv.k);
+      if (LLVM_UNLIKELY(propRes == ExecutionStatus::EXCEPTION)) {
+        return ExecutionStatus::EXCEPTION;
+      }
+      if (!(*propRes)->isEmpty()) {
+        lv.kValue = std::move(*propRes);
+        present = true;
+      }
     }
-    if (LLVM_LIKELY(!(*propRes)->isEmpty())) {
+    if (LLVM_LIKELY(present)) {
       // kPresent is true, execute callback and store result in A[k].
-      auto kValue = std::move(*propRes);
       auto callRes = Callable::executeCall3(
           callbackFn,
           runtime,
           args.getArgHandle(1),
-          kValue.get(),
+          lv.kValue.get(),
           lv.k.get(),
           lv.O.getHermesValue());
       if (LLVM_UNLIKELY(callRes == ExecutionStatus::EXCEPTION)) {
