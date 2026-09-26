@@ -1,0 +1,124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Sat, 26 Sep 2026 18:43:05 +0800
+Subject: [PATCH 14/14] vm: fast-path dense Array.prototype.map reads
+
+Use the existing array fast-path guard to read ordinary dense elements without generic property descriptor lookup. Recheck against the original length after each callback so array and prototype changes continue through the generic path.
+
+Cover value mutation, inherited indices, and length truncation in both Hermes and Static Hermes.
+---
+ lib/VM/JSLib/Array.cpp             | 39 +++++++++++++++++++++---------
+ test/hermes/array-map-fast-path.js | 37 ++++++++++++++++++++++++++++
+ 2 files changed, 65 insertions(+), 11 deletions(-)
+ create mode 100644 test/hermes/array-map-fast-path.js
+
+diff --git a/lib/VM/JSLib/Array.cpp b/lib/VM/JSLib/Array.cpp
+index 9bde390650e6ff56fbfa8d3540dcdb21a5a5f45f..5dc1c740e90c32fa5f8a6a0c5dac56d234722487 100644
+--- a/lib/VM/JSLib/Array.cpp
++++ b/lib/VM/JSLib/Array.cpp
+@@ -3825,6 +3825,7 @@ CallResult<HermesValue> arrayPrototypeMap(void *, Runtime &runtime) {
+     PinnedValue<> k;
+     PinnedValue<JSObject> descObj;
+     PinnedValue<SymbolID> tmpPropNameStorage;
++    PinnedValue<> kValue;
+     PinnedValue<> value;
+   } lv;
+   LocalsRAII lraii{runtime, &lv};
+@@ -3868,27 +3869,43 @@ CallResult<HermesValue> arrayPrototypeMap(void *, Runtime &runtime) {
+   lv.k = HermesValue::encodeTrustedNumberValue(0);
+ 
+   // Main loop to execute callback and store the results in A.
+-  // TODO: Implement a fast path for actual arrays.
+   auto marker = gcScope.createMarker();
+   while (lv.k->getDouble() < len) {
+     gcScope.flushToMarker(marker);
+ 
+-    ComputedPropertyDescWithSymStorage desc{lv.tmpPropNameStorage};
+-    JSObject::getComputedPrimitiveDescriptor(
+-        lv.O, runtime, lv.k, lv.descObj, desc);
+-    CallResult<PseudoHandle<>> propRes = JSObject::getComputedPropertyValue_RJS(
+-        lv.O, runtime, lv.descObj, desc.get(), lv.k);
+-    if (LLVM_UNLIKELY(propRes == ExecutionStatus::EXCEPTION)) {
+-      return ExecutionStatus::EXCEPTION;
++    bool present = false;
++    if (auto *arr = llvh::dyn_vmcast<JSArray>(*lv.O);
++        LLVM_LIKELY(arr &&
++                    arrayFastPathCheck(
++                        runtime, arr, nullptr, static_cast<uint32_t>(len)))) {
++      // Recheck after each callback: it may change the receiver or prototypes.
++      auto element = arr->at(runtime, static_cast<uint32_t>(lv.k->getDouble()));
++      if (!element.isEmpty()) {
++        lv.kValue = element.unboxToHV(runtime);
++        present = true;
++      }
++    } else {
++      ComputedPropertyDescWithSymStorage desc{lv.tmpPropNameStorage};
++      JSObject::getComputedPrimitiveDescriptor(
++          lv.O, runtime, lv.k, lv.descObj, desc);
++      CallResult<PseudoHandle<>> propRes =
++          JSObject::getComputedPropertyValue_RJS(
++              lv.O, runtime, lv.descObj, desc.get(), lv.k);
++      if (LLVM_UNLIKELY(propRes == ExecutionStatus::EXCEPTION)) {
++        return ExecutionStatus::EXCEPTION;
++      }
++      if (!(*propRes)->isEmpty()) {
++        lv.kValue = std::move(*propRes);
++        present = true;
++      }
+     }
+-    if (LLVM_LIKELY(!(*propRes)->isEmpty())) {
++    if (LLVM_LIKELY(present)) {
+       // kPresent is true, execute callback and store result in A[k].
+-      auto kValue = std::move(*propRes);
+       auto callRes = Callable::executeCall3(
+           callbackFn,
+           runtime,
+           args.getArgHandle(1),
+-          kValue.get(),
++          lv.kValue.get(),
+           lv.k.get(),
+           lv.O.getHermesValue());
+       if (LLVM_UNLIKELY(callRes == ExecutionStatus::EXCEPTION)) {
+diff --git a/test/hermes/array-map-fast-path.js b/test/hermes/array-map-fast-path.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..500ed74d7fda79098f35c151c1dcfd1147cb4c20
+--- /dev/null
++++ b/test/hermes/array-map-fast-path.js
+@@ -0,0 +1,37 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++// RUN: %hermes -target=HBC -O %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -exec %s | %FileCheck --match-full-lines %s
++
++print(JSON.stringify([1, 2, 3].map(function (value) { return value * 2; })));
++// CHECK: [2,4,6]
++
++var updated = [1, 2, 3];
++print(JSON.stringify(updated.map(function (value, index) {
++  if (index === 0) updated[1] = 7;
++  return value * 2;
++})));
++// CHECK-NEXT: [2,14,6]
++
++var inherited = [1, 2, 3];
++print(JSON.stringify(inherited.map(function (value, index) {
++  if (index === 0) {
++    delete inherited[1];
++    Array.prototype[1] = 9;
++  }
++  return value * 2;
++})));
++delete Array.prototype[1];
++// CHECK-NEXT: [2,18,6]
++
++var truncated = [1, 2, 3];
++print(JSON.stringify(truncated.map(function (value, index) {
++  if (index === 0) truncated.length = 1;
++  return value * 2;
++})));
++// CHECK-NEXT: [2,null,null]

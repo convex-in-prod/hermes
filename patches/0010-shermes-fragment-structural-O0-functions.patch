@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Mon, 14 Sep 2026 04:08:23 +0800
-Subject: [PATCH 10/13] shermes: fragment structural O0 functions
+Subject: [PATCH 10/14] shermes: fragment structural O0 functions
 
 Outline structural O0 functions even when their linear instruction runs are short, keeping control-flow wrappers small enough for C bundle consumers. Mark wrappers that contain no outlineable runs explicitly and accept that reason only for fragment zero. Update the regression test to cover the fragmented wrapper contract.
 ---

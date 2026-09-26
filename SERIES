@@ -12,3 +12,4 @@
 0011-unicode-implement-default-case-conversion-in-Unicode.patch 3d53997895ad671d4abd33edaccc809393c0db7b
 0012-shermes-group-outlined-helpers-into-bounded-C-transl.patch 5bed0780fb89aff780692b20d94c3c27af9cb11d
 0013-wasm-define-fast-floating-point-integer-conversions.patch 8bc2cccdcc07ee558e914bea4392d933de89bb76
+0014-vm-fast-path-dense-Array.prototype.map-reads.patch 295577e8cce65e98fe959aebddae5256dd40a3c7

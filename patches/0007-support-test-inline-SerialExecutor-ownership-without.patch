@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Thu, 10 Sep 2026 03:16:59 +0800
-Subject: [PATCH 07/13] support: test inline SerialExecutor ownership without
+Subject: [PATCH 07/14] support: test inline SerialExecutor ownership without
  pthreads
 
 Separate worker-dependent tests from single-threaded Emscripten coverage. Verify that move-only task captures are destroyed before add returns, nested work runs inline, and no worker runner is invoked. Describe the threaded and inline ownership contracts without contradictory lifecycle claims.

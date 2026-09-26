@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Tue, 15 Sep 2026 23:44:07 +0800
-Subject: [PATCH 11/13] unicode: implement default case conversion in
+Subject: [PATCH 11/14] unicode: implement default case conversion in
  Unicode-Lite
 
 Replace the no-op Unicode-Lite casing hook with full Unicode default lower- and uppercase mappings. Generate compact mappings and expansions from the pinned Unicode 17 data independently of regular-expression case folding. Handle supplementary code points, preserve unpaired surrogates, and apply Final_Sigma context to the original input.

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Wed, 16 Sep 2026 22:59:20 +0800
-Subject: [PATCH 13/13] wasm: define fast floating-point integer conversions
+Subject: [PATCH 13/14] wasm: define fast floating-point integer conversions
 
 Ordinary C floating-point casts have undefined behavior for out-of-range inputs, even when their Wasm instructions saturate. LLVM can remove the integer round-trip range check and accept a negative number as unsigned zero. Dynamic unsigned right shift then produces incorrect results.
 

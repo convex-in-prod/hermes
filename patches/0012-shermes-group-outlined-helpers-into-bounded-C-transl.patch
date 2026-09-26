@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Wed, 16 Sep 2026 19:13:36 +0800
-Subject: [PATCH 12/13] shermes: group outlined helpers into bounded C
+Subject: [PATCH 12/14] shermes: group outlined helpers into bounded C
  translation units
 
 Keep the no-inline functions introduced for large generated control-flow graphs, but stop requiring one native frontend invocation per helper. Group up to 64 helpers from one owning function while accounting for the shard byte target, shared state layout, extern prologue, and referenced-function declarations.
