@@ -15,6 +15,48 @@ This document is a place to put some ideas on how to make specific scenarios mor
 in the future. It is possible we'll just happen to optimize some cases here as a result of good
 type information in SH and a solid optimization pipeline.
 
+# Async startup arguments
+
+The experimental `-fasync-frame-arguments` flag avoids materializing an arguments
+object used only by internal async startup. Static Hermes recognizes the private
+`spawnAsync` call after inlining, in its original async wrapper, and requires a
+directly created generator function. Other uses of the arguments object retain
+the ordinary path.
+
+The native entry roots the generator and receiver, creates the result Promise,
+then copies arguments from the wrapper's still-live frame into a generator call
+frame. Parameter-initialization failures reject that Promise. The existing async
+driver handles suspension, rejection, resumption and completion; user-visible
+arguments and lexical captures keep their existing representation. No arbitrary
+ancestor-frame operation is exposed to JavaScript, and startup does not depend
+on replaceable `apply` properties or the optional `Reflect` global.
+
+Existing builtin indices and the old `spawnAsync` entry are preserved. The two
+new private JavaScript builtins are appended, and the bytecode version changes
+to reject incompatible bytecode. The flag is disabled by default.
+
+# Private async completion records
+
+The experimental `-fasync-generator-results` flag implies async-frame arguments.
+After inlining, it jointly changes a private async factory and its driver to
+use the lowered state-machine closure directly. The factory and inner function
+must have single explicit users, and every inner return must produce a fresh
+`{value, done}` literal with a constant boolean completion flag. Loose arguments
+objects and direct eval reject the transformation because explicit IR uses alone
+do not prove that the factory cannot escape. Public generators are unchanged.
+
+The compiler supplies an ordinary writable, null-prototype completion record.
+Literal lowering preserves its two non-index keys in order, allowing direct
+stores into slots 0 and 1. The native startup entry roots it across Promise
+creation and factory execution. The driver retains the record across suspension
+but clears its payload after consumption and abandonment. Its fields never
+escape to user code or change descriptors, and the boolean slot never contains
+a pointer. This is temporary result transport, not cached computation.
+
+The original startup ABI remains available. The additional native entry and
+private builtin form a compiler/runtime contract; the builtin is appended and
+the bytecode version rejects incompatible inputs. The flag is disabled by default.
+
 # Native object layout hints
 
 `createObjectFromEntriesWithHint` accepts a non-owning hint for runtime-owned layouts

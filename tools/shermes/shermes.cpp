@@ -218,6 +218,18 @@ cl::opt<bool> KeepTemp(
     cl::desc("Keep temporary files made along the way (for debugging)"),
     cl::cat(CompilerCategory));
 
+cl::opt<bool> AsyncFrameArguments(
+    "fasync-frame-arguments",
+    cl::desc("Avoid intermediate argument objects in internal async startup"),
+    cl::init(false),
+    cl::cat(CompilerCategory));
+
+cl::opt<bool> AsyncGeneratorResults(
+    "fasync-generator-results",
+    cl::desc("Remove private async generator wrappers and reuse completion records"),
+    cl::init(false),
+    cl::cat(CompilerCategory));
+
 cl::opt<StaticBuiltinSetting> StaticBuiltins(
     cl::desc(
         "recognizing of calls to global functions like Object.keys() statically"),
@@ -632,6 +644,9 @@ std::shared_ptr<Context> createContext() {
   optimizationOpts.inlining =
       cli::OptimizationLevel != OptLevel::O0 && cli::Inline;
   optimizationOpts.inlineMaxSize = cli::InlineMaxSize;
+  optimizationOpts.asyncFrameArguments =
+      cli::AsyncFrameArguments || cli::AsyncGeneratorResults;
+  optimizationOpts.asyncGeneratorResults = cli::AsyncGeneratorResults;
 
   optimizationOpts.reusePropCache = cli::ReusePropCache;
 

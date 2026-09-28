@@ -88,6 +88,9 @@ using ThreadRunner = std::function<void(std::function<void()>)>;
   /* Support for using microtasks. */                                  \
   F(constexpr, bool, MicrotaskQueue, true)                             \
                                                                        \
+  /* Use native storage and operations for Promise internals. */        \
+  F(constexpr, bool, EnableNativePromise, false)                       \
+                                                                       \
   /* Runtime set up for synth trace. */                                \
   F(constexpr, SynthTraceMode, SynthTraceMode, SynthTraceMode::None)   \
                                                                        \

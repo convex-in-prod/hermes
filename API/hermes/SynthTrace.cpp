@@ -144,6 +144,7 @@ SynthTrace::SynthTrace(
     json_->emitKeyValue("ES6Proxy", conf.getES6Proxy());
     json_->emitKeyValue("Intl", conf.getIntl());
     json_->emitKeyValue("MicrotasksQueue", conf.getMicrotaskQueue());
+    json_->emitKeyValue("EnableNativePromise", conf.getEnableNativePromise());
     json_->emitKeyValue("enableSampledStats", conf.getEnableSampledStats());
     json_->emitKeyValue("vmExperimentFlags", conf.getVMExperimentFlags());
     json_->closeDict();

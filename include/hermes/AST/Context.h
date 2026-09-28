@@ -65,6 +65,12 @@ struct OptimizationSettings {
   static constexpr unsigned kDefaultInlineMaxSize = 50;
   unsigned inlineMaxSize{kDefaultInlineMaxSize};
 
+  /// Start internal async generators directly from the current SH call frame.
+  bool asyncFrameArguments{false};
+
+  /// Call private async state machines directly and reuse their result record.
+  bool asyncGeneratorResults{false};
+
   /// Reuse property cache entries for same property name.
   bool reusePropCache{true};
 

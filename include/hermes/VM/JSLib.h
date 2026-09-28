@@ -34,6 +34,7 @@ class JSLibFlags {
   /// empty.
   bool enableHermesInternal = true;
   bool enableHermesInternalTestMethods = false;
+  bool enableNativePromise = false;
 };
 
 void initGlobalObject(Runtime &runtime, const JSLibFlags &jsLibFlags);

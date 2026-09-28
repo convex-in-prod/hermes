@@ -140,6 +140,7 @@ int main(int argc, char **argv) {
           .withES6Proxy(flags.ES6Proxy)
           .withIntl(flags.Intl)
           .withMicrotaskQueue(flags.MicrotaskQueue)
+          .withEnableNativePromise(flags.EnableNativePromise)
           .withTrackIO(flags.TrackBytecodeIO)
           .withEnableHermesInternal(flags.EnableHermesInternal)
           .withEnableHermesInternalTestMethods(

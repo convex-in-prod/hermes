@@ -66,6 +66,46 @@ class HermesRuntimeCustomConfigTest : public ::testing::Test,
       : HermesRuntimeTestBase(makeHermesRuntime(runtimeConfig)) {}
 };
 
+TEST(HermesRuntimeConfigTest, NativePromiseActivation) {
+  EXPECT_FALSE(::hermes::vm::RuntimeConfig::getDefaultEnableNativePromise());
+  for (bool nativePromise : {false, true}) {
+    for (bool internals : {false, true}) {
+      for (bool testMethods : {false, true}) {
+        auto runtime = makeHermesRuntime(
+            ::hermes::vm::RuntimeConfig::Builder()
+                .withEnableNativePromise(nativePromise)
+                .withEnableHermesInternal(internals)
+                .withEnableHermesInternalTestMethods(testMethods)
+                .build());
+        auto inspect = [&](const char *code) {
+          return runtime->evaluateJavaScript(
+              std::make_shared<StringBuffer>(code), "native-promise-activation");
+        };
+        EXPECT_EQ(
+            inspect("Object.getOwnPropertyNames(Promise.resolve(1)).length")
+                .asNumber(),
+            nativePromise ? 0 : 4);
+        EXPECT_TRUE(inspect(R"JS(
+          !Object.prototype.hasOwnProperty.call(
+              HermesInternal, 'createNativePromiseCore') &&
+          typeof HermesInternal.createNativePromiseCore === 'undefined' &&
+          !Object.isExtensible(HermesInternal)
+        )JS").getBool());
+        EXPECT_EQ(
+            inspect("typeof HermesInternal.drainJobs === 'function'").getBool(),
+            internals && testMethods);
+        inspect(R"JS(
+          var observed = 0;
+          Promise.resolve(41).then(function (value) { observed = value + 1; });
+        )JS");
+        EXPECT_EQ(inspect("observed").asNumber(), 0);
+        runtime->drainMicrotasks();
+        EXPECT_EQ(inspect("observed").asNumber(), 42);
+      }
+    }
+  }
+}
+
 TEST(HermesRuntimeConfigTest, FinalizerThreadRunner) {
   struct RunnerState {
     std::atomic<bool> active{false};

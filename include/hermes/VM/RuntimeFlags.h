@@ -141,6 +141,12 @@ struct VMOnlyRuntimeFlags {
       llvh::cl::init(vm::RuntimeConfig::getDefaultMicrotaskQueue()),
       llvh::cl::cat(RuntimeCategory)};
 
+  llvh::cl::opt<bool> EnableNativePromise{
+      "Xnative-promise",
+      llvh::cl::desc("Use native Promise storage and operations"),
+      llvh::cl::init(vm::RuntimeConfig::getDefaultEnableNativePromise()),
+      llvh::cl::cat(RuntimeCategory)};
+
   llvh::cl::opt<bool> StopAfterInit{
       "stop-after-module-init",
       llvh::cl::desc(

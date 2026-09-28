@@ -63,6 +63,20 @@ typedef struct SHNativeFuncInfo {
   uint8_t prohibit_invoke : 2;
 } SHNativeFuncInfo;
 
+/// Start a compiler-created async generator using the current frame's arguments.
+/// Only emitted for an async wrapper whose arguments object has no other users.
+SHERMES_EXPORT SHLegacyValue _sh_ljs_spawn_async_from_frame(
+    SHRuntime *shr,
+    SHLegacyValue generator,
+    SHLegacyValue receiver);
+
+/// The factory returns a private closure accepting the fixed value/done layout.
+SHERMES_EXPORT SHLegacyValue _sh_ljs_spawn_async_direct_from_frame(
+    SHRuntime *shr,
+    SHLegacyValue generator,
+    SHLegacyValue receiver,
+    SHLegacyValue resultRecord);
+
 /// Type of a function that allocates and returns a new SHUnit ready to be used
 /// with a runtime.
 typedef SHUnit *(*SHUnitCreator)(void);

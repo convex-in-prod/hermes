@@ -1269,6 +1269,101 @@ extern "C" SHLegacyValue _sh_ljs_create_generator_object(
   return *genObjRes;
 }
 
+static SHLegacyValue spawnAsyncFromFrame(
+    SHRuntime *shr,
+    SHLegacyValue generator,
+    SHLegacyValue receiver,
+    SHLegacyValue resultRecord) {
+  auto &runtime = getRuntime(shr);
+  auto result = [&]() -> CallResult<PseudoHandle<>> {
+    struct : public Locals {
+      PinnedValue<Callable> generator;
+      PinnedValue<> receiver;
+      PinnedValue<> promise;
+      PinnedValue<> completion;
+      PinnedValue<> resultRecord;
+    } lv;
+    LocalsRAII locals{runtime, &lv};
+    lv.generator = vmcast<Callable>(HermesValue::fromRaw(generator.raw));
+    lv.receiver = HermesValue::fromRaw(receiver.raw);
+    lv.resultRecord = HermesValue::fromRaw(resultRecord.raw);
+    GCScopeMarkerRAII marker{runtime};
+    // The NativeCall has no JS frame of its own. Keep this wrapper frame while
+    // nested calls allocate and collect; its argument slots remain GC roots.
+    auto caller = runtime.getCurrentFrame();
+    assert(
+        vmcast<NativeJSFunction>(caller.getCalleeClosureUnsafe())
+                ->getFunctionInfo()->kind == FuncKind::Async &&
+        "async startup must use its original wrapper frame");
+    auto promise = Callable::executeCall0(
+        runtime.makeHandle(runtime.getBuiltinCallable(
+            BuiltinMethod::HermesBuiltin_createPendingPromiseCore)),
+        runtime, Runtime::getUndefinedValue());
+    if (promise == ExecutionStatus::EXCEPTION)
+      return ExecutionStatus::EXCEPTION;
+    lv.promise = promise->get();
+
+    bool failed;
+    {
+      const uint32_t count = caller.getArgCount();
+      ScopedNativeCallFrame frame{
+          runtime, count, lv.generator.getHermesValue(),
+          HermesValue::encodeUndefinedValue(),
+          lv.receiver.getHermesValue()};
+      CallResult<PseudoHandle<>> generated{ExecutionStatus::EXCEPTION};
+      if (LLVM_UNLIKELY(frame.overflowed())) {
+        (void)runtime.raiseStackOverflow(Runtime::StackOverflowKind::NativeStack);
+      } else {
+        for (uint32_t i = 0; i < count; ++i)
+          frame->getArgRef(i) = caller.getArgRef(i);
+        generated = Callable::call(lv.generator, runtime);
+      }
+      failed = generated == ExecutionStatus::EXCEPTION;
+      if (failed) {
+        lv.completion = runtime.getThrownValue();
+        runtime.clearThrownValue();
+      } else {
+        lv.completion = generated->get();
+      }
+    }
+
+    if (lv.resultRecord->isNull()) {
+      return Callable::executeCall3(
+          runtime.makeHandle(runtime.getBuiltinCallable(
+              BuiltinMethod::HermesBuiltin_finishAsyncStart)),
+          runtime, Runtime::getUndefinedValue(), lv.promise.getHermesValue(),
+          lv.completion.getHermesValue(), HermesValue::encodeBoolValue(failed));
+    }
+    return Callable::executeCall4(
+        runtime.makeHandle(runtime.getBuiltinCallable(
+            BuiltinMethod::HermesBuiltin_finishAsyncDirectStart)),
+        runtime, Runtime::getUndefinedValue(), lv.promise.getHermesValue(),
+        lv.completion.getHermesValue(), HermesValue::encodeBoolValue(failed),
+        lv.resultRecord.getHermesValue());
+  }();
+  if (LLVM_UNLIKELY(result == ExecutionStatus::EXCEPTION))
+    _sh_throw_current(shr);
+  return result->get();
+}
+
+LLVM_ATTRIBUTE_NOINLINE
+extern "C" SHLegacyValue _sh_ljs_spawn_async_from_frame(
+    SHRuntime *shr,
+    SHLegacyValue generator,
+    SHLegacyValue receiver) {
+  return spawnAsyncFromFrame(
+      shr, generator, receiver, HermesValue::encodeNullValue());
+}
+
+LLVM_ATTRIBUTE_NOINLINE
+extern "C" SHLegacyValue _sh_ljs_spawn_async_direct_from_frame(
+    SHRuntime *shr,
+    SHLegacyValue generator,
+    SHLegacyValue receiver,
+    SHLegacyValue resultRecord) {
+  return spawnAsyncFromFrame(shr, generator, receiver, resultRecord);
+}
+
 LLVM_ATTRIBUTE_NOINLINE
 extern "C" SHLegacyValue _sh_ljs_create_class(
     SHRuntime *shr,

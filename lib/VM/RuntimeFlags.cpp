@@ -38,6 +38,7 @@ vm::RuntimeConfig buildRuntimeConfig(const RuntimeFlags &flags) {
       .withES6Proxy(flags.ES6Proxy)
       .withIntl(flags.Intl)
       .withMicrotaskQueue(flags.MicrotaskQueue)
+      .withEnableNativePromise(flags.EnableNativePromise)
       .withEnableSampleProfiling(
           flags.SampleProfiling != ExecuteOptions::SampleProfilingMode::None)
       .withRandomizeMemoryLayout(flags.RandomizeMemoryLayout)

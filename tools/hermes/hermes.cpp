@@ -128,6 +128,7 @@ static int executeHBCBytecodeFromCL(
           .withES6Proxy(flags.ES6Proxy)
           .withIntl(flags.Intl)
           .withMicrotaskQueue(flags.MicrotaskQueue)
+          .withEnableNativePromise(flags.EnableNativePromise)
           .withEnableSampleProfiling(
               flags.SampleProfiling !=
               ExecuteOptions::SampleProfilingMode::None)
@@ -229,6 +230,7 @@ static vm::RuntimeConfig getReplRuntimeConfig() {
       .withEnableAsyncGenerators(cl::compilerRuntimeFlags.EnableAsyncGenerators)
       .withIntl(flags.Intl)
       .withMicrotaskQueue(flags.MicrotaskQueue)
+      .withEnableNativePromise(flags.EnableNativePromise)
       .withEnableHermesInternal(flags.EnableHermesInternal)
       .withEnableHermesInternalTestMethods(
           flags.EnableHermesInternalTestMethods)

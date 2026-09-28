@@ -181,6 +181,9 @@ JS_BUILTIN(spawnAsync)
 MARK_FIRST_JS_BUILTIN(spawnAsync)
 JS_BUILTIN(makeAsyncIterator)
 JS_BUILTIN(awaitAsyncGenerator)
+JS_BUILTIN(createPendingPromiseCore)
+JS_BUILTIN(finishAsyncStart)
+JS_BUILTIN(finishAsyncDirectStart)
 
 #undef NORMAL_OBJECT
 #undef NORMAL_METHOD
