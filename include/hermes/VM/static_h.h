@@ -1877,6 +1877,14 @@ SHERMES_EXPORT int _sh_errno(void);
 SHERMES_EXPORT SHLegacyValue
 _sh_asciiz_to_string(SHRuntime *shr, const char *str, ptrdiff_t len);
 
+/// Write a JS string as UTF-8, replacing unpaired surrogates. Return the byte
+/// count, or -1 if the destination is too small.
+SHERMES_EXPORT ptrdiff_t _sh_string_write_utf8(
+    SHRuntime *shr,
+    SHLegacyValue value,
+    char *destination,
+    size_t capacity);
+
 static inline void _sh_ptr_write_char(char *ptr, int offset, char c) {
   ptr[offset] = c;
 }

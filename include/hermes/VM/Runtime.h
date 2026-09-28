@@ -93,6 +93,7 @@ struct RuntimeOffsets;
 class ScopedNativeDepthReducer;
 class ScopedNativeDepthTracker;
 class ScopedNativeCallFrame;
+class ScopedStringReuse;
 class CodeCoverageProfiler;
 struct StackTracesTree;
 struct Locals;
@@ -237,6 +238,10 @@ class RuntimeBase : public SHRuntime {
 /// exist and are completely independent from each other.
 class Runtime : public RuntimeBase, public HandleRootOwner {
  public:
+  /// Non-owning dynamic scope supplied by the embedding. Its rooted storage
+  /// belongs to the scope, never to the runtime or a retained module.
+  ScopedStringReuse *activeStringReuse{nullptr};
+
   static std::shared_ptr<Runtime> create(const RuntimeConfig &runtimeConfig);
 
   ~Runtime();
