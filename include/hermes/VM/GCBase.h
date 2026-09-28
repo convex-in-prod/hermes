@@ -41,6 +41,7 @@
 #include "llvh/ADT/BitVector.h"
 #include "llvh/ADT/DenseMap.h"
 #include "llvh/Support/ErrorHandling.h"
+#include "llvh/Support/SaveAndRestore.h"
 
 #include <cassert>
 #include <chrono>
@@ -1113,6 +1114,16 @@ class GCBase {
   /// \pre \p target must hold an Object or non-registered Symbol.
   WeakRefSlot *allocWeakSlot(SmallHermesValue target);
 
+  /// Release empty weak-reference chunks at an exclusive mutator boundary.
+  /// This neither advances collection nor moves occupied slots.
+  size_t trimUnusedWeakSlots();
+
+  /// True only inside Hades's noncompacting nursery-root callbacks. Full
+  /// collections, compaction and diagnostic visitors require complete roots.
+  bool isYoungGenerationRootScan() const {
+    return youngGenerationRootScan_;
+  }
+
   /// Allocate a slot to use in WeakMap/WeakSet when inserting a new entry.
   /// \param key Pointer to the key object.
   /// \param value The mapped value by the key \p key.
@@ -1368,16 +1379,28 @@ class GCBase {
   /// be allocated in the old gen, and references to them need not be
   /// marked during young-gen collection.
   void markRoots(RootAcceptorWithNames &acceptor, bool markLongLived) {
+    llvh::SaveAndRestore<bool> scope(
+        youngGenerationRootScan_,
+        heapKind_ == HeapKind::HadesGC && !markLongLived);
     gcCallbacks_.markRoots(acceptor, markLongLived);
   }
 
   /// Convenience method to invoke the mark weak roots function provided at
   /// initialization, using the context provided then (on this heap).
   void markWeakRoots(WeakRootAcceptor &acceptor, bool markLongLived) {
+    llvh::SaveAndRestore<bool> scope(
+        youngGenerationRootScan_,
+        heapKind_ == HeapKind::HadesGC && !markLongLived);
     gcCallbacks_.markWeakRoots(acceptor, markLongLived);
     acceptor.beginRootSection(RootAcceptor::Section::WeakRefSlots);
-    weakSlots_.forEach(
-        [&acceptor](WeakRefSlot &slot) { slot.markWeakRoots(acceptor); });
+    auto visit = [&acceptor](WeakRefSlot &slot) { slot.markWeakRoots(acceptor); };
+    // A live WeakRefSlot's referent changes only through GC. Nursery evacuation
+    // leaves old or empty references, so only subsequently added slots need a
+    // later nursery visit. Mutable WeakMap values still require the full scan.
+    if (youngGenerationRootScan_)
+      weakSlots_.forEachNew(visit);
+    else
+      weakSlots_.forEach(visit);
 
     weakMapEntrySlots_.forEach(
         [&acceptor](WeakMapEntrySlot &slot) { slot.markWeakRoots(acceptor); });
@@ -1492,6 +1515,8 @@ class GCBase {
 
   /// Whether or not a GC cycle is currently occurring.
   bool inGC_{false};
+
+  bool youngGenerationRootScan_{false};
 
   /// Whether the GC has OOMed. Currently only useful for understanding crash
   /// dumps, particularly when HERMESVM_EXCEPTION_ON_OOM is set.

@@ -700,7 +700,7 @@ void GCBase::snapshotAddGCNativeNodes(HeapSnapshot &snap) {
       HeapSnapshot::NodeType::Native,
       "hermes::ManagedChunkedList<WeakRefSlot>",
       IDTracker::reserved(IDTracker::ReservedObjectID::WeakRefSlotStorage),
-      weakSlots_.capacity() * sizeof(decltype(weakSlots_)::value_type),
+      weakSlots_.mallocSizeEstimate(),
       0);
 }
 
@@ -806,8 +806,7 @@ void GCBase::getHeapInfo(HeapInfo &info) {
 
 void GCBase::getHeapInfoWithMallocSize(HeapInfo &info) {
   // Assign to overwrite anything previously in the heap info.
-  info.mallocSizeEstimate =
-      weakSlots_.capacity() * sizeof(decltype(weakSlots_)::value_type);
+  info.mallocSizeEstimate = weakSlots_.mallocSizeEstimate();
 }
 
 #ifndef NDEBUG
@@ -994,6 +993,14 @@ WeakRefSlot *GCBase::allocWeakSlot(SmallHermesValue target) {
   return &weakSlots_.add(target);
 }
 
+size_t GCBase::trimUnusedWeakSlots() {
+  if (inGC())
+    hermes_fatal("Weak-slot trimming requires the mutator boundary");
+  const auto before = weakSlots_.capacity();
+  weakSlots_.trimEmptyChunks();
+  return before - weakSlots_.capacity();
+}
+
 WeakMapEntrySlot *GCBase::allocWeakMapEntrySlot(
     SmallHermesValue key,
     HermesValue value,
@@ -1039,8 +1046,17 @@ bool GCBase::hasObjectID(const GCCell *cell) {
 
 void GCBase::newAlloc(const GCCell *ptr, uint32_t sz) {
 #ifdef HERMES_MEMORY_INSTRUMENTATION
+#if !defined(NDEBUG) || defined(HERMES_SLOW_DEBUG)
+  // Debug allocations also validate the captured IP when tracking is disabled.
   allocationLocationTracker_.newAlloc(ptr, sz);
-  samplingAllocationTracker_.newAlloc(ptr, sz);
+#else
+  // Keep disabled instrumentation off the allocation call path. In Wasm the
+  // otherwise unused virtual IP lookup also incurs an indirect-call check.
+  if (allocationLocationTracker_.isEnabled())
+    allocationLocationTracker_.newAlloc(ptr, sz);
+#endif
+  if (samplingAllocationTracker_.isEnabled())
+    samplingAllocationTracker_.newAlloc(ptr, sz);
 #endif
 }
 
@@ -1384,10 +1400,8 @@ void GCBase::AllocationLocationTracker::disable() {
 void GCBase::AllocationLocationTracker::newAlloc(
     const GCCell *ptr,
     uint32_t sz) {
-  // Note we always get the current IP even if allocation tracking is not
-  // enabled as it allows us to assert this feature works across many tests.
-  // Note it's not very slow, it's slower than the non-virtual version
-  // in Runtime though.
+  // The allocation hook calls this while disabled only in debug builds, to
+  // exercise IP-capture assertions without charging release allocations.
   const auto *ip = gc_->gcCallbacks_.getCurrentIPSlow();
   if (!enabled_) {
     return;

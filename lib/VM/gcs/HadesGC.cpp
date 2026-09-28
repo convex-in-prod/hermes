@@ -69,6 +69,125 @@ void FreelistBuildMeta(const GCCell *cell, Metadata::Builder &mb) {
   mb.setVTable(&HadesGC::OldGen::FreelistCell::vt);
 }
 
+void HadesGC::beginPreparedHeap() {
+  if (kConcurrentGC || preparedHeapActive_ || inGC())
+    hermes_fatal("Prepared heap requires a fresh nonconcurrent mutator boundary");
+  collect("prepared allocation boundary");
+  auto lk = ensureBackgroundTaskPaused();
+  waitForCollectionToFinish("prepared allocation boundary");
+  // collect() may start a follow-up major cycle during its last evacuation.
+  // Finish that cycle's compactee without starting yet another major cycle.
+  if (compactee_.segment)
+    youngGenCollection("prepared allocation boundary", false, false);
+  if (youngGen_.used() || concurrentPhase_ != Phase::None ||
+      compactee_.segment || promoteYGToOG_)
+    hermes_fatal("Prepared heap requires completed collection");
+  for (const auto &segment : oldGen_.getSegments())
+    preparedSegments_.insert(segment.lowLim());
+  for (const auto &segment : oldGen_.getJumboSegments())
+    preparedSegments_.insert(segment.lowLim());
+  preparedNormalSegments_ = oldGen_.numSegments();
+  preparedAllocatedBytes_ = oldGen_.allocatedBytes();
+  preparedExternalBytes_ = oldGen_.externalBytes();
+  preparedExternalBytesAtPreparation_ = preparedExternalBytes_;
+  oldGen_.detachPreparedAllocation();
+  preparedHeapActive_ = true;
+}
+
+uint64_t HadesGC::dynamicOccupiedGrowth() {
+  std::lock_guard<Mutex> lk{gcMutex_};
+  if (!preparedHeapActive_ || allocatedBytes() < preparedAllocatedBytes_ ||
+      externalBytes() < preparedExternalBytes_)
+    hermes_fatal("Invalid prepared occupancy boundary");
+  return allocatedBytes() - preparedAllocatedBytes_ +
+      externalBytes() -
+      std::min(preparedExternalBytes_, preparedExternalBytesAtPreparation_);
+}
+
+void HadesGC::OldGen::detachPreparedAllocation() {
+  allocChunk_ = nullptr;
+  for (auto &segment : segmentBuckets_) {
+    for (auto &bucket : segment) {
+      bucket.next = nullptr;
+      bucket.prev = nullptr;
+      bucket.head = nullptr;
+    }
+  }
+  for (size_t i = 0; i < kNumFreelistBuckets; ++i) {
+    buckets_[i].next = nullptr;
+    buckets_[i].prev = nullptr;
+    buckets_[i].head = nullptr;
+    freelistBucketBitArray_.set(i, false);
+  }
+}
+
+HadesGC::FreePayloadResult HadesGC::exportDynamicFreePayload(
+    llvh::MutableArrayRef<FreePayloadRange> ranges,
+    uint32_t pageSize,
+    uint32_t visitLimit) {
+  if (!preparedHeapActive_ || ranges.empty() || ranges.size() > 128 ||
+      pageSize < 4096 || pageSize > 65536 || (pageSize & (pageSize - 1)) ||
+      visitLimit == 0 || visitLimit > 4096 || inGC())
+    hermes_fatal("Invalid dynamic free-payload boundary");
+  auto lk = ensureBackgroundTaskPaused();
+  // A sweep can rebuild the free list and a compactee has different ownership.
+  // Neither permits an export, even if some cells currently look disposable.
+  if (concurrentPhase_ != Phase::None || compactee_.segment || promoteYGToOG_)
+    return {FreePayloadStatus::Deferred, 0, 0};
+  return oldGen_.exportFreePayload(ranges, pageSize, visitLimit);
+}
+
+HadesGC::FreePayloadResult HadesGC::OldGen::exportFreePayload(
+    llvh::MutableArrayRef<FreePayloadRange> ranges,
+    uint32_t pageSize,
+    uint32_t visitLimit) {
+  FreePayloadResult result{FreePayloadStatus::Complete, 0, 0};
+  const uintptr_t mask = pageSize - 1;
+  const auto append = [&](FreelistCell *cell) {
+    if (result.count == ranges.size() || result.visited == visitLimit) {
+      result.status = FreePayloadStatus::Partial;
+      return false;
+    }
+    ++result.visited;
+    if (!FreelistCell::classof(cell) ||
+        gc_.preparedSegments_.count(FixedSizeHeapSegment::storageStart(cell)))
+      hermes_fatal("Invalid dynamic free-cell owner");
+    const uintptr_t address = reinterpret_cast<uintptr_t>(cell);
+    const uintptr_t end = address + cell->getAllocatedSize();
+    if (end < address || end - address < sizeof(FreelistCell))
+      hermes_fatal("Invalid dynamic free-cell extent");
+    // The size/next link lives in the header and cell-boundary metadata lives
+    // in the segment. There is no footer in the disposable payload.
+    const uintptr_t payload = address + sizeof(FreelistCell);
+    const uintptr_t padding = (pageSize - (payload & mask)) & mask;
+    if (padding > end - payload)
+      return true;
+    const uintptr_t start = payload + padding;
+    const uintptr_t stop = end & ~mask;
+    if (start < stop)
+      ranges[result.count++] = {start, stop};
+    return true;
+  };
+  // allocChunk_ is detached from the bucket lists, so include it exactly once.
+  if (allocChunk_ && !append(allocChunk_))
+    return result;
+  const auto first = getFreelistBucket(pageSize + sizeof(FreelistCell));
+  for (size_t bucket = kNumFreelistBuckets; bucket-- > first;) {
+    for (auto *segment = buckets_[bucket].next; segment; segment = segment->next) {
+      auto current = segment->head;
+      if (!current)
+        hermes_fatal("Empty free-list bucket is linked");
+      while (current) {
+        auto *cell = vmcast<FreelistCell>(current.getNonNull(gc_.getPointerBase()));
+        if (!append(cell))
+          return result;
+        current = cell->next_;
+      }
+    }
+  }
+  return result;
+}
+
 GCCell *HadesGC::OldGen::finishAlloc(GCCell *cell, uint32_t sz) {
   // Track the number of allocated bytes in a segment.
   incrementAllocatedBytes(sz);
@@ -147,12 +266,27 @@ void HadesGC::OldGen::addCellToFreelistFromSweep(
       gc_.concurrentPhase_ == Phase::Sweep &&
       "addCellToFreelistFromSweep should only be called during sweeping.");
   size_t newCellSize = freeRangeEnd - freeRangeStart;
+  const bool prepared = gc_.preparedSegments_.count(
+      FixedSizeHeapSegment::storageStart(freeRangeStart));
+  // Prepared holes never reenter allocation. Preserve already identical free
+  // headers so an ordinary full collection need not privatize their pages.
+  // An identical extent consumed just this free cell: its boundary table and
+  // poisoned payload are still valid, while coalescing must update both below.
+  auto *oldCell = reinterpret_cast<GCCell *>(freeRangeStart);
+  if (prepared && vmisa<FreelistCell>(oldCell) &&
+      oldCell->getAllocatedSize() == newCellSize)
+    return;
   // While coalescing, sweeping may generate new cells, so make sure the cell
   // head is updated.
   if (setHead)
     FixedSizeHeapSegment::setCellHead(
         reinterpret_cast<GCCell *>(freeRangeStart), newCellSize);
   auto *newCell = constructCell<FreelistCell>(freeRangeStart, newCellSize);
+  if (prepared) {
+    newCell->next_ = nullptr;
+    ASAN_POISON_FREE_CELL(newCell);
+    return;
+  }
   // Get the size bucket for the cell being added;
   const uint32_t bucket = getFreelistBucket(newCellSize);
   // Push onto the size-specific free list for this bucket and segment.
@@ -527,11 +661,18 @@ class HadesGC::EvacAcceptor final : public RootAcceptor,
   }
 
   void accept(GCCell *&ptr) override {
-    ptr = acceptRoot(ptr);
+    GCCell *forwarded = acceptRoot(ptr);
+    // An unchanged reference needs no write to its backing. Keep tracing and
+    // forwarding unconditional; acceptHeap also records incoming compaction
+    // edges even when it returns the original pointer.
+    if (forwarded != ptr)
+      ptr = forwarded;
   }
 
   void accept(GCPointerBase &ptr) {
-    ptr.setInGC(acceptHeap(ptr, &ptr));
+    CompressedPointer forwarded = acceptHeap(ptr, &ptr);
+    if (forwarded != ptr)
+      ptr.setInGC(forwarded);
   }
 
   void accept(PinnedHermesValue &hv) override {
@@ -542,7 +683,8 @@ class HadesGC::EvacAcceptor final : public RootAcceptor,
   void acceptNullable(PinnedHermesValue &hv) override {
     if (hv.isPointer()) {
       GCCell *forwardedPtr = acceptRoot(static_cast<GCCell *>(hv.getPointer()));
-      hv.setInGC(hv.updatePointer(forwardedPtr), gc);
+      if (forwardedPtr != hv.getPointer())
+        hv.setInGC(hv.updatePointer(forwardedPtr), gc);
     }
   }
 
@@ -550,7 +692,8 @@ class HadesGC::EvacAcceptor final : public RootAcceptor,
     if (shv.isPointer()) {
       GCCell *ptr = shv.getPointer(pointerBase_);
       GCCell *forwardedPtr = acceptRoot(ptr);
-      shv.setInGC(shv.updatePointer(forwardedPtr, pointerBase_), gc);
+      if (forwardedPtr != ptr)
+        shv.setInGC(shv.updatePointer(forwardedPtr, pointerBase_), gc);
     }
   }
 
@@ -558,14 +701,16 @@ class HadesGC::EvacAcceptor final : public RootAcceptor,
     if (hv.isPointer()) {
       GCCell *forwardedPtr =
           acceptHeap(static_cast<GCCell *>(hv.getPointer()), &hv);
-      hv.setInGC(hv.updatePointer(forwardedPtr), gc);
+      if (forwardedPtr != hv.getPointer())
+        hv.setInGC(hv.updatePointer(forwardedPtr), gc);
     }
   }
 
   void accept(GCSmallHermesValueBase &hv) {
     if (hv.isPointer()) {
       CompressedPointer forwardedPtr = acceptHeap(hv.getPointer(), &hv);
-      hv.setInGC(hv.updatePointer(forwardedPtr), gc);
+      if (forwardedPtr != hv.getPointer())
+        hv.setInGC(hv.updatePointer(forwardedPtr), gc);
     }
   }
 
@@ -1191,6 +1336,11 @@ bool HadesGC::OldGen::sweepNext(bool backgroundThread) {
   }
 
   // Correct the allocated byte count.
+  if (gc_.preparedSegments_.count(seg.lowLim())) {
+    if (uint64_t(segmentSweptBytes) > gc_.preparedAllocatedBytes_)
+      hermes_fatal("Prepared sweep exceeds occupied storage");
+    gc_.preparedAllocatedBytes_ -= segmentSweptBytes;
+  }
   decrementAllocatedBytes(segmentSweptBytes);
   sweepIterator_.sweptBytes += segmentSweptBytes;
   sweepIterator_.sweptExternalBytes += externalBytesBefore - externalBytes();
@@ -1334,6 +1484,7 @@ void HadesGC::getHeapInfoWithMallocSize(HeapInfo &info) {
   std::lock_guard<Mutex> lk{gcMutex_};
   // First add the usage by the runtime's roots.
   info.mallocSizeEstimate += gcCallbacks_.mallocSize();
+  info.mallocSizeEstimate += preparedSegments_.getMemorySize();
   // Scan all objects for their malloc size. This operation is what makes
   // getHeapInfoWithMallocSize O(heap size).
   forAllObjs([&info](GCCell *cell) {
@@ -1502,6 +1653,43 @@ void HadesGC::collectWithOptions(
   youngGenCollection(
       std::move(cause),
       /*forceOldGenCollection*/ options.type == GCType::Major);
+}
+
+HadesGC::YoungReclaimResult HadesGC::emptyYoungPayload() {
+  auto lk = ensureBackgroundTaskPaused();
+  if (inGC())
+    hermes_fatal("Young payload requires the mutator boundary");
+  if (!youngGen_ || concurrentPhase_ != Phase::None || compactee_.segment ||
+      promoteYGToOG_ || youngGen_.used() || !youngGenFinalizables_.empty())
+    return {YoungReclaimStatus::Deferred, nullptr, nullptr};
+  return {YoungReclaimStatus::Reclaimed, youngGen_.start(), youngGen_.hiLim()};
+}
+
+HadesGC::YoungReclaimResult HadesGC::tryReclaimYoungGeneration() {
+  auto lk = ensureBackgroundTaskPaused();
+  if (inGC())
+    hermes_fatal("Young reclamation requires the mutator boundary");
+  // Promotion changes ownership of the nursery; compaction can rewrite old
+  // objects. Neither establishes disposable young payload for the embedder.
+  if (!youngGen_ || concurrentPhase_ != Phase::None || compactee_.segment ||
+      promoteYGToOG_) {
+    return {YoungReclaimStatus::Deferred, nullptr, nullptr};
+  }
+  // Repeated boundary collections must not keep emptying YG while bypassing
+  // the old-generation start threshold. Reserve for every possible survivor
+  // before mutating the heap; a deferred caller must allow ordinary GC progress
+  // or restore/dispose, rather than retrying this operation to force progress.
+  const uint64_t maximumOldBytes = oldGen_.allocatedBytes() +
+      oldGen_.externalBytes() + youngGen_.used() + getYoungGenExternalBytes();
+  if (static_cast<double>(maximumOldBytes) >=
+      oldGen_.targetSizeBytes() * static_cast<double>(ogThreshold_))
+    return {YoungReclaimStatus::Deferred, nullptr, nullptr};
+  youngGenCollection("boundary", false, false);
+  // These checks protect a memory-discard authority, including release builds.
+  if (concurrentPhase_ != Phase::None || compactee_.segment ||
+      youngGen_.used() != 0 || !youngGenFinalizables_.empty())
+    hermes_fatal("Young reclamation did not leave an empty nursery");
+  return {YoungReclaimStatus::Reclaimed, youngGen_.start(), youngGen_.hiLim()};
 }
 
 void HadesGC::waitForCollectionToFinish(std::string cause) {
@@ -1754,7 +1942,7 @@ void HadesGC::prepareCompactee(bool forceCompaction) {
   uint64_t threshold = oldGen_.targetSizeBytes() + buffer;
   uint64_t totalBytes = oldGen_.size() + oldGen_.externalBytes();
   if ((forceCompaction || totalBytes > threshold) &&
-      oldGen_.numSegments() > 1) {
+      oldGen_.numSegments() > preparedNormalSegments_ + 1) {
     compactee_.segment =
         std::make_shared<FixedSizeHeapSegment>(oldGen_.popSegment());
     addSegmentExtentToCrashManager(
@@ -1953,7 +2141,7 @@ void HadesGC::OldGen::freeUnusedJumboSegments() {
       continue;
     }
     // Cell must be dead now.
-
+    const bool prepared = gc_.preparedSegments_.count(it->lowLim());
     auto sz = cell->getAllocatedSizeSlow();
     // Run its finalizer first if it has one.
     cell->getVT()->finalizeIfExists(cell, gc_);
@@ -1977,6 +2165,14 @@ void HadesGC::OldGen::freeUnusedJumboSegments() {
     }
 #endif
 
+    if (prepared) {
+      if (sz > gc_.preparedAllocatedBytes_)
+        hermes_fatal("Prepared jumbo exceeds occupied storage");
+      gc_.preparedAllocatedBytes_ -= sz;
+      // The native allocator can reuse this address for dynamic storage.
+      // Remove its prepared identity before destroying the segment.
+      gc_.preparedSegments_.erase(it->lowLim());
+    }
     // Remove the entire segment.
     const size_t segIdx =
         AlignedHeapSegment::getSegmentIndexFromStart(it->lowLim());
@@ -2049,6 +2245,8 @@ void HadesGC::creditExternalMemory(GCCell *cell, uint32_t sz) {
   } else {
     std::lock_guard<Mutex> lk{gcMutex_};
     oldGen_.creditExternalMemory(sz);
+    if (preparedSegments_.count(FixedSizeHeapSegment::storageStart(cell)))
+      preparedExternalBytes_ += sz;
     uint64_t totalBytes = oldGen_.allocatedBytes() + oldGen_.externalBytes();
     if (totalBytes > oldGen_.targetSizeBytes())
       youngGen_.setEffectiveEnd(youngGen_.level());
@@ -2067,6 +2265,13 @@ void HadesGC::debitExternalMemory(GCCell *cell, uint32_t sz) {
   } else {
     std::lock_guard<Mutex> lk{gcMutex_};
     oldGen_.debitExternalMemory(sz);
+    // Finalization, buffer detachment and native-container shrinkage all pass
+    // here. Update ownership before a dead jumbo segment can lose its identity.
+    if (preparedSegments_.count(FixedSizeHeapSegment::storageStart(cell))) {
+      if (sz > preparedExternalBytes_)
+        hermes_fatal("Prepared external debit exceeds owned storage");
+      preparedExternalBytes_ -= sz;
+    }
   }
 }
 
@@ -2666,7 +2871,13 @@ uint64_t HadesGC::youngGenEvacuateImpl(bool doCompaction) {
 
 void HadesGC::youngGenCollection(
     std::string cause,
-    bool forceOldGenCollection) {
+    bool forceOldGenCollection,
+    bool allowOldGenStart) {
+  assert(
+      (allowOldGenStart ||
+       (!forceOldGenCollection && concurrentPhase_ == Phase::None &&
+        !promoteYGToOG_)) &&
+      "Collection without an old-gen start requires settled marking/sweeping");
   assert(gcMutex_ && "gcMutex_ must be held during YG collection");
   assert(
       gcMutex_.depth() == 1 &&
@@ -2821,7 +3032,9 @@ void HadesGC::youngGenCollection(
   // handles the rare case where an OG collection was completed during this YG
   // collection, and the compaction will therefore only be completed in the next
   // collection.
-  if (concurrentPhase_ == Phase::None && !compactee_.segment) {
+  // Boundary reclamation cannot turn into an old-generation cycle. Ordinary
+  // allocation-pressure collections retain their existing policy and limits.
+  if (allowOldGenStart && concurrentPhase_ == Phase::None && !compactee_.segment) {
     // There is no OG collection running, check the tripwire in case this is the
     // first YG after an OG completed.
     checkTripwireAndSubmitStats();
@@ -3334,6 +3547,8 @@ void HadesGC::OldGen::addSegment(FixedSizeHeapSegment seg) {
 }
 
 FixedSizeHeapSegment HadesGC::OldGen::popSegment() {
+  if (gc_.preparedSegments_.count(segments_.back().lowLim()))
+    hermes_fatal("Cannot compact prepared storage");
   const auto &segBuckets = segmentBuckets_.back();
   for (size_t bucket = 0; bucket < kNumFreelistBuckets; ++bucket) {
     if (segBuckets[bucket].head) {
@@ -3571,19 +3786,22 @@ void HadesGC::OldGen::verifyFreelists() {
   llvh::DenseSet<const SegmentBucket *> occupiedSegBuckets;
 
   for (size_t seg = 0; seg < segments_.size(); seg++) {
-    // Records every free cell encountered while traversing the freelists. This
-    // is used to ensure that a FreelistCell is always found in a freelist.
+    const bool prepared = gc_.preparedSegments_.count(segments_[seg].lowLim());
+    // Records allocatable free cells. Prepared holes stay parseable but must
+    // never occur in the allocation chunk or any bucket.
     llvh::DenseSet<const FreelistCell *> freeCells;
 
     // The allocChunk_ will not be encountered in the freelists, so make sure we
     // record it.
     if (segments_[seg].contains(allocChunk_))
       freeCells.insert(allocChunk_);
+    assert((!prepared || freeCells.empty()) && "Prepared allocation chunk");
 
     const auto &segBuckets = segmentBuckets_[seg];
     for (size_t bucket = 0; bucket < kNumFreelistBuckets; bucket++) {
       if (!segBuckets[bucket].head)
         continue;
+      assert(!prepared && "Prepared segment has an allocation bucket");
       // Record that this segment has cells for this bucket.
       occupiedSegBuckets.insert(&segBuckets[bucket]);
       auto *cell = vmcast<FreelistCell>(
@@ -3600,7 +3818,7 @@ void HadesGC::OldGen::verifyFreelists() {
     auto *cell = (GCCell *)segments_[seg].start();
     auto *end = (GCCell *)segments_[seg].level();
     while (cell < end) {
-      if (FreelistCell *fcell = dyn_vmcast<FreelistCell>(cell))
+      if (FreelistCell *fcell = dyn_vmcast<FreelistCell>(cell); fcell && !prepared)
         assert(freeCells.erase(fcell) && "Free cell not in list");
       cell = cell->nextCell();
     }

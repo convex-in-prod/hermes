@@ -44,6 +44,198 @@ using namespace hermes::vm;
 
 extern "C" void _SH_MODEL(void) {}
 
+extern "C" void _sh_get_heap_statistics(
+    SHRuntime *shr, SHHeapStatistics *statistics) {
+  GCBase::HeapInfo info;
+  getRuntime(shr).getHeap().getHeapInfo(info);
+  *statistics = {
+      info.numCollections,
+      info.totalAllocatedBytes,
+      info.allocatedBytes,
+      static_cast<uint64_t>(info.generalStats.gcWallTime.sum() * 1e9),
+      static_cast<uint64_t>(info.generalStats.gcCPUTime.sum() * 1e9)};
+}
+
+extern "C" void _sh_try_reclaim_young_generation(
+    SHRuntime *shr, SHYoungReclaimResult *result) {
+#if HERMESVM_GCKIND == _HERMESVM_GCVALUE_HADES
+  const auto reclaimed = getRuntime(shr).getHeap().tryReclaimYoungGeneration();
+  *result = {
+      reclaimed.status == HadesGC::YoungReclaimStatus::Reclaimed
+          ? SHYoungReclaimReclaimed
+          : SHYoungReclaimDeferred,
+      reinterpret_cast<uintptr_t>(reclaimed.payloadBegin),
+      reinterpret_cast<uintptr_t>(reclaimed.payloadEnd)};
+#else
+  *result = {SHYoungReclaimUnsupported, 0, 0};
+#endif
+}
+
+extern "C" bool _sh_begin_prepared_heap(SHRuntime *shr) {
+#if HERMESVM_GCKIND == _HERMESVM_GCVALUE_HADES
+  if (kConcurrentGC)
+    return false;
+  getRuntime(shr).getHeap().beginPreparedHeap();
+  return true;
+#else
+  return false;
+#endif
+}
+
+extern "C" uint64_t _sh_prepared_heap_dynamic_bytes(SHRuntime *shr) {
+#if HERMESVM_GCKIND == _HERMESVM_GCVALUE_HADES
+  return getRuntime(shr).getHeap().dynamicOccupiedGrowth();
+#else
+  hermes_fatal("Prepared allocation is unsupported by this collector");
+#endif
+}
+
+extern "C" void _sh_empty_young_payload(
+    SHRuntime *shr, SHYoungReclaimResult *result) {
+#if HERMESVM_GCKIND == _HERMESVM_GCVALUE_HADES
+  const auto payload = getRuntime(shr).getHeap().emptyYoungPayload();
+  *result = {
+      payload.status == HadesGC::YoungReclaimStatus::Reclaimed
+          ? SHYoungReclaimReclaimed
+          : SHYoungReclaimDeferred,
+      reinterpret_cast<uintptr_t>(payload.payloadBegin),
+      reinterpret_cast<uintptr_t>(payload.payloadEnd)};
+#else
+  *result = {SHYoungReclaimUnsupported, 0, 0};
+#endif
+}
+
+extern "C" void _sh_dynamic_free_payload(
+    SHRuntime *shr,
+    SHFreePayloadResult *result,
+    uint32_t pageSize,
+    uint32_t visitLimit) {
+  result->count = result->visited = 0;
+#if HERMESVM_GCKIND == _HERMESVM_GCVALUE_HADES
+  HadesGC::FreePayloadRange ranges[128];
+  const auto exported = getRuntime(shr).getHeap().exportDynamicFreePayload(
+      ranges, pageSize, visitLimit);
+  switch (exported.status) {
+    case HadesGC::FreePayloadStatus::Complete:
+      result->status = SHFreePayloadComplete;
+      break;
+    case HadesGC::FreePayloadStatus::Partial:
+      result->status = SHFreePayloadPartial;
+      break;
+    case HadesGC::FreePayloadStatus::Deferred:
+      result->status = SHFreePayloadDeferred;
+      break;
+  }
+  result->count = exported.count;
+  result->visited = exported.visited;
+  for (uint32_t i = 0; i < exported.count; ++i)
+    result->ranges[i] = {ranges[i].start, ranges[i].end};
+#else
+  result->status = SHFreePayloadUnsupported;
+#endif
+}
+
+extern "C" uint64_t _sh_trim_unused_weak_slots(SHRuntime *shr) {
+  return getRuntime(shr).getHeap().trimUnusedWeakSlots();
+}
+
+extern "C" bool _sh_prepare_literal_layouts(
+    SHRuntime *shr, SHLegacyValue *resultOrException) {
+  Runtime &runtime = getRuntime(shr);
+  GCScope scope{runtime};
+  const auto marker = scope.createMarker();
+  for (auto *unit : runtime.units) {
+    if (!unit || !unit->ordinary_literal_shape_count ||
+        unit->runtime_ext->preparedLiteralLayouts)
+      continue;
+    if (!unit->ordinary_literal_shapes ||
+        unit->ordinary_literal_shape_count > unit->obj_shape_table_count)
+      hermes_fatal("Invalid ordinary literal shape table");
+    auto storageResult = ArrayStorage::createLongLived(
+        runtime, unit->ordinary_literal_shape_count);
+    if (LLVM_UNLIKELY(storageResult == ExecutionStatus::EXCEPTION)) {
+      *resultOrException = _sh_get_clear_thrown_value(shr);
+      return false;
+    }
+    auto storage = runtime.makeHandle<ArrayStorage>(*storageResult);
+    ArrayStorage::resizeWithinCapacity(
+        *storage, runtime, unit->ordinary_literal_shape_count);
+    // Publish the root before creating classes, which may collect. Unsupported
+    // dictionary-sized shapes leave an empty slot in the initialized storage.
+    unit->runtime_ext->preparedLiteralLayouts = *storage;
+    const auto classMarker = scope.createMarker();
+    for (uint32_t i = 0; i < unit->ordinary_literal_shape_count; ++i) {
+      scope.flushToMarker(classMarker);
+      const auto shapeIndex = unit->ordinary_literal_shapes[i];
+      if (shapeIndex >= unit->obj_shape_table_count ||
+          (i && shapeIndex <= unit->ordinary_literal_shapes[i - 1]))
+        hermes_fatal("Invalid ordinary literal shape index");
+      const auto &shape = unit->obj_shape_table[shapeIndex];
+      if (shape.num_props > HiddenClass::kDictionaryThreshold)
+        continue;
+      if (shape.key_buffer_offset > unit->obj_key_buffer_size)
+        hermes_fatal("Invalid ordinary literal key buffer");
+      auto *entry = reinterpret_cast<WeakRoot<HiddenClass> *>(
+          &unit->object_literal_class_cache[shapeIndex]);
+      auto clazz = runtime.makeMutableHandle<HiddenClass>(nullptr);
+      if (*entry) {
+        clazz = entry->getNonNull(runtime, runtime.getHeap());
+      } else {
+        const llvh::ArrayRef<uint8_t> keys{
+            unit->obj_key_buffer, unit->obj_key_buffer_size};
+        // Ordinary buffer allocations use this same root even with an explicit
+        // prototype: getHiddenClassForPrototype depends only on reserved slots.
+        clazz = addBufferPropertiesToHiddenClass(
+            runtime,
+            keys.slice(shape.key_buffer_offset),
+            shape.num_props,
+            *runtime.getHiddenClassForPrototype(
+                nullptr, JSObject::numOverlapSlots<JSObject>()),
+            [unit](StringID id) {
+              if (id >= unit->num_symbols)
+                hermes_fatal("Invalid ordinary literal symbol");
+              return SymbolID::unsafeCreate(unit->symbols[id]);
+            });
+      }
+      if (clazz->isDictionary() || clazz->isTyped() ||
+          clazz->getNumProperties() != shape.num_props)
+        hermes_fatal("Incompatible ordinary literal class");
+      entry->set(runtime, *clazz);
+      storage->set(i, HermesValue::encodeObjectValue(*clazz), runtime.getHeap());
+    }
+    scope.flushToMarker(marker);
+  }
+  // Even initializing an existing child's map can steal its parent's map.
+  // Prepare descendants before parents across all units, including on repeated
+  // calls after initialization has transferred maps out of prepared classes.
+  // Temporary handles also protect completed maps from MallocGC's debug clearing
+  // while another map allocation collects. Only the array roots persist.
+  GCScope mapScope{
+      runtime, "prepareLiteralMaps", std::numeric_limits<unsigned>::max()};
+  std::vector<Handle<HiddenClass>> layouts;
+  for (auto *unit : runtime.units) {
+    if (!unit || !unit->runtime_ext->preparedLiteralLayouts)
+      continue;
+    auto *storage = unit->runtime_ext->preparedLiteralLayouts;
+    for (uint32_t i = 0; i < storage->size(); ++i) {
+      if (storage->at(i).isObject())
+        layouts.push_back(runtime.makeHandle<HiddenClass>(storage->at(i)));
+    }
+  }
+  std::stable_sort(layouts.begin(), layouts.end(), [](auto left, auto right) {
+    return left->getNumProperties() > right->getNumProperties();
+  });
+  const auto mapMarker = mapScope.createMarker();
+  for (auto clazz : layouts) {
+    HiddenClass::forEachPropertyWhile(
+        clazz, runtime,
+        [](Runtime &, SymbolID, NamedPropertyDescriptor) { return false; });
+    mapScope.flushToMarker(mapMarker);
+  }
+  *resultOrException = HermesValue::encodeUndefinedValue();
+  return true;
+}
+
 namespace {
 /// Convert the given \p cr to a \c CallResult<HermesValue>.
 template <typename T>

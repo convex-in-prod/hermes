@@ -9,6 +9,8 @@
 
 #include "gtest/gtest.h"
 
+#include <set>
+
 namespace {
 
 using namespace hermes;
@@ -195,6 +197,68 @@ TEST(ManagedChunkListTest, ChunksAreFreed) {
   EXPECT_EQ(
       list.capacity(),
       kInitialElementCount / kOccupancyRatio / kReductionFactor);
+}
+
+TEST(ManagedChunkListTest, NewVisitsSurviveCollectionReuseAndMove) {
+  ManagedChunkedList<ManagedValue, 2> list(kOccupancyRatio, kSizingWeight);
+  const auto visitNew = [](auto &values) {
+    std::set<int> seen;
+    values.forEachNew([&](ManagedValue &value) {
+      EXPECT_TRUE(seen.insert(value.value()).second);
+    });
+    return seen;
+  };
+  list.add(1);
+  EXPECT_EQ((std::set<int>{1}), visitNew(list));
+  list.add(2);
+  std::set<int> full;
+  list.forEach([&](ManagedValue &value) { full.insert(value.value()); });
+  EXPECT_EQ((std::set<int>{1, 2}), full);
+  EXPECT_EQ((std::set<int>{2}), visitNew(list));
+  EXPECT_TRUE(visitNew(list).empty());
+
+  auto &third = list.add(3);
+  visitNew(list);
+  auto &fourth = list.add(4);
+  third.free();
+  fourth.free();
+  // The pending fourth slot belongs to a chunk deleted by this trim. Visiting
+  // after trim must use surviving storage, even if the allocator reuses it.
+  list.trimEmptyChunks();
+  EXPECT_EQ(2, list.capacity());
+  EXPECT_EQ((std::set<int>{1, 2}), visitNew(list));
+  list.add(5);
+  auto moved = std::move(list);
+  EXPECT_EQ((std::set<int>{5}), visitNew(moved));
+  EXPECT_TRUE(visitNew(moved).empty());
+  // Reusing the moved-from list must not consume a slot owned by moved.
+  EXPECT_EQ(0, list.capacity());
+  EXPECT_TRUE(visitNew(list).empty());
+  list.add(6);
+  EXPECT_EQ((std::set<int>{6}), visitNew(list));
+  full.clear();
+  moved.forEach([&](ManagedValue &value) { full.insert(value.value()); });
+  EXPECT_EQ((std::set<int>{1, 2, 5}), full);
+}
+
+TEST(ManagedChunkListTest, TrimmingReleasesIncrementalIndex) {
+  IntegerList list(kOccupancyRatio, kSizingWeight);
+  list.add(0);
+  list.forEachNew([](ManagedValue &) {});
+  const auto chunkBytes = list.mallocSizeEstimate();
+  for (size_t value = 1; value < kElementsPerChunk; ++value)
+    list.add(value).free();
+  ASSERT_GT(list.mallocSizeEstimate(), chunkBytes);
+
+  list.trimEmptyChunks();
+  EXPECT_EQ(kElementsPerChunk, list.capacity());
+  EXPECT_EQ(chunkBytes, list.mallocSizeEstimate());
+  size_t visits = 0;
+  list.forEachNew([&](ManagedValue &value) {
+    EXPECT_EQ(0, value.value());
+    ++visits;
+  });
+  EXPECT_EQ(1, visits);
 }
 
 } // namespace

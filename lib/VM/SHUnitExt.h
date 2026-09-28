@@ -8,6 +8,7 @@
 #pragma once
 
 #include "hermes/ADT/TransparentConservativeVector.h"
+#include "hermes/VM/ArrayStorage.h"
 #include "hermes/VM/PropertyCache.h"
 #include "hermes/VM/static_h.h"
 
@@ -19,6 +20,11 @@
 struct SHUnitExt {
   /// A map from template object ids to template objects.
   llvh::DenseMap<uint32_t, hermes::vm::JSObject *> templateMap{};
+
+  /// Strong root for prepared literal classes. Old GC-managed storage avoids
+  /// enumerating every stable class on each young collection. Writes must use
+  /// ArrayStorage barriers; full collection may move both storage and classes.
+  hermes::vm::ArrayStorage *preparedLiteralLayouts{nullptr};
 
   /// Vector of AddPropertyCacheEntry, where each element is lazily allocated
   /// whenever a CodeBlock needs a new entry.

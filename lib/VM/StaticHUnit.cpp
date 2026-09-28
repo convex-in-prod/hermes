@@ -266,6 +266,9 @@ void hermes::vm::sh_unit_mark_roots(
     SHUnit *unit,
     RootAcceptorWithNames &acceptor,
     bool markLongLived) {
+  if (unit->runtime_ext->preparedLiteralLayouts)
+    acceptor.acceptPtr(unit->runtime_ext->preparedLiteralLayouts);
+
   for (auto &it : unit->runtime_ext->templateMap) {
     acceptor.acceptPtr(it.second);
   }

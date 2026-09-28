@@ -6,7 +6,9 @@
  */
 
 #include "VMRuntimeTestHelpers.h"
+#include "../../lib/VM/SHUnitExt.h"
 
+#include "hermes/BCGen/SerializedLiteralGenerator.h"
 #include "hermes/VM/PropertyCache.h"
 #include "hermes/VM/StaticHUtils.h"
 #include "hermes/VM/static_h.h"
@@ -105,6 +107,76 @@ TEST(StaticHUnitTest, RejectsMismatchedStaticABI) {
 }
 
 using StaticHCacheTest = RuntimeTestFixture;
+
+TEST_F(StaticHCacheTest, PreparesParentAndChildMapsAcrossUnitsAndCollection) {
+  // Install metadata directly to avoid consuming the process-wide unit indexes
+  // exercised by InitializesAllUsableUnitSlots. Runtime still owns these units.
+  struct LiteralUnit {
+    SHUnit unit;
+    SHSymbolID symbols[3];
+    SHCompressedPointer caches[2];
+  };
+  static const uint8_t keys[]{
+      hermes::SerializedLiteralGenerator::ShortStringTag | 3,
+      0, 0, 1, 0, 2, 0};
+  static const SHShapeTableEntry initialShapes[]{{0, 1}, {0, 2}};
+  static const SHShapeTableEntry addedShapes[]{{0, 3}};
+  static const uint32_t indexes[]{0, 1};
+  const auto value = Predefined::getSymbolID(Predefined::value);
+  auto install = [&](const SHShapeTableEntry *shapes, uint32_t count) {
+    auto *data = static_cast<LiteralUnit *>(std::calloc(1, sizeof(LiteralUnit)));
+    if (!data)
+      std::abort();
+    data->symbols[0] = value.unsafeGetRaw();
+    data->symbols[1] = Predefined::getSymbolID(Predefined::length).unsafeGetRaw();
+    data->symbols[2] = Predefined::getSymbolID(Predefined::name).unsafeGetRaw();
+    auto *unit = &data->unit;
+    unit->symbols = data->symbols;
+    unit->num_symbols = 3;
+    unit->obj_key_buffer = keys;
+    unit->obj_key_buffer_size = sizeof(keys);
+    unit->obj_shape_table = shapes;
+    unit->obj_shape_table_count = count;
+    unit->ordinary_literal_shapes = indexes;
+    unit->ordinary_literal_shape_count = count;
+    unit->object_literal_class_cache = data->caches;
+    unit->runtime_ext = new SHUnitExt{};
+    for (size_t index = 1; index < std::size(runtime.units); ++index) {
+      auto &slot = runtime.units[index];
+      if (!slot) {
+        slot = unit;
+        return unit;
+      }
+    }
+    std::abort();
+  };
+  auto *first = install(initialShapes, 2);
+  SHLegacyValue result;
+  auto *shr = getSHRuntime(runtime);
+  ASSERT_TRUE(_sh_prepare_literal_layouts(shr, &result));
+  auto checkMaps = [&](SHUnit *unit) {
+    auto *storage = unit->runtime_ext->preparedLiteralLayouts;
+    ASSERT_NE(nullptr, storage);
+    for (uint32_t i = 0; i < storage->size(); ++i) {
+      auto *clazz = vmcast<HiddenClass>(storage->at(i));
+      NamedPropertyDescriptor desc;
+      auto found = HiddenClass::tryFindPropertyFast(clazz, runtime, value, desc);
+      ASSERT_TRUE(found.hasValue());
+      EXPECT_TRUE(*found);
+      EXPECT_EQ(0u, desc.slot);
+    }
+  };
+  checkMaps(first);
+  auto *second = install(addedShapes, 1);
+  ASSERT_TRUE(_sh_prepare_literal_layouts(shr, &result));
+  checkMaps(first);
+  checkMaps(second);
+  // Only the per-unit GC storage roots the classes through this collection.
+  runtime.collect("prepared layouts test");
+  ASSERT_TRUE(_sh_prepare_literal_layouts(shr, &result));
+  checkMaps(first);
+  checkMaps(second);
+}
 
 TEST_F(StaticHCacheTest, RetainsTwoShapesForNamedAndComputedReads) {
   auto first = runtime.makeHandle(JSObject::create(runtime));

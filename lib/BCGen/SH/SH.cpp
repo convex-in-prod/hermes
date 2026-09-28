@@ -190,6 +190,10 @@ class SHLiteralBuffers {
   /// Table of object literal shapes.
   std::vector<ShapeTableEntry> objShapeTable{};
 
+  /// Only live ordinary allocations authorize eager class preparation. Retained
+  /// literal tables can also contain unused slots or typed object shapes.
+  std::vector<uint32_t> ordinaryLiteralShapes{};
+
   /// A map from instruction to literal offset in the corresponding buffers.
   /// \c arrayBuffer, \c objKeyBuffer, \c objliteralValBuffer.
   LiteralBufferBuilder::LiteralOffsetMapTy literalOffsetMap{};
@@ -208,6 +212,21 @@ class SHLiteralBuffers {
     objKeyBuffer = std::move(bufs.keyBuffer);
     objShapeTable = std::move(bufs.shapeTable);
     literalOffsetMap = std::move(bufs.offsetMap);
+    llvh::BitVector ordinary(objShapeTable.size());
+    llvh::BitVector other(objShapeTable.size());
+    for (const auto &entry : literalOffsetMap) {
+      const auto shape = entry.second.shapeTableIdx;
+      if (shape == UINT32_MAX)
+        continue; // Array literals have no object shape.
+      if (llvh::isa<LIRAllocObjectFromBufferInst>(entry.first))
+        ordinary.set(shape);
+      else
+        other.set(shape);
+    }
+    for (uint32_t shape = 0; shape < objShapeTable.size(); ++shape) {
+      if (ordinary.test(shape) && !other.test(shape))
+        ordinaryLiteralShapes.push_back(shape);
+    }
   }
 
   /// For a given instruction \p inst that has an associated serialized literal,
@@ -232,6 +251,10 @@ class SHLiteralBuffers {
       os << "{ .key_buffer_offset = " << entry.keyBufferOffset
          << ", .num_props = " << entry.numProps << " },\n";
     }
+    os << "};\n";
+    os << "static const uint32_t s_ordinary_literal_shapes[] = {";
+    for (const auto shape : ordinaryLiteralShapes)
+      os << shape << ",";
     os << "};\n";
   }
 
@@ -3277,6 +3300,9 @@ void generateUnitData(
      << ".obj_shape_table_count = "
      << moduleGen.literalBuffers.objShapeTable.size() << ", "
      << ".object_literal_class_cache = unit_data->object_literal_class_cache, "
+     << ".ordinary_literal_shapes = s_ordinary_literal_shapes, "
+     << ".ordinary_literal_shape_count = "
+     << moduleGen.literalBuffers.ordinaryLiteralShapes.size() << ", "
      << ".source_locations = s_source_locations, "
      << ".source_locations_size = " << moduleGen.srcLocationTable.size()
      << ", " << ".unit_main = ";

@@ -16,6 +16,7 @@
 #include "hermes/VM/WeakRoot-inline.h"
 
 #include <chrono>
+#include <cstring>
 #include <functional>
 #include <new>
 #include <thread>
@@ -398,6 +399,173 @@ TEST(GCCallbackTest, TestCallbackInvoked) {
     }
   }
 }
+
+#if HERMESVM_GCKIND == _HERMESVM_GCVALUE_HADES && \
+    HERMESVM_SANITIZE_HANDLES == 0
+TEST(GCBasicsTestHades, PreparationCompletesFollowupCompaction) {
+  if (kConcurrentGC)
+    return;
+  using Cell = EmptyCell<FixedSizeHeapSegment::maxSize()>;
+  const auto config = GCConfig::Builder()
+                          .withInitHeapSize(2 * FixedSizeHeapSegment::storageSize())
+                          .withMaxHeapSize(16 * FixedSizeHeapSegment::storageSize())
+                          .withOccupancyTarget(1.0)
+                          .withAllocInYoung(true)
+                          .build();
+  auto runtime = DummyRuntime::create(config);
+  auto &rt = *runtime;
+  struct : Locals {
+    PinnedValue<Cell> cells[8];
+  } lv;
+  DummyLocalsRAII lraii{rt, &lv};
+  // Growing OG directly leaves its target below occupancy. collect() starts
+  // another compacting cycle after completing its explicitly forced cycle.
+  for (auto &cell : lv.cells)
+    cell = Cell::createLongLived(rt);
+  rt.getHeap().beginPreparedHeap();
+  EXPECT_EQ(0, rt.getHeap().dynamicOccupiedGrowth());
+  EXPECT_EQ(
+      HadesGC::YoungReclaimStatus::Reclaimed,
+      rt.getHeap().emptyYoungPayload().status);
+  for (auto &cell : lv.cells)
+    EXPECT_EQ(Cell::size(), cell->getAllocatedSize());
+}
+
+TEST(GCBasicsTestHades, PreparedExternalReleaseDoesNotHideDynamicGrowth) {
+  if (kConcurrentGC)
+    return;
+  auto runtime = DummyRuntime::create(TestGCConfigFixedSize(
+      8 * FixedSizeHeapSegment::storageSize()));
+  auto &rt = *runtime;
+  auto &gc = rt.getHeap();
+  struct : Locals {
+    PinnedValue<DummyObject> prepared;
+    PinnedValue<DummyObject> growingPrepared;
+    PinnedValue<DummyObject> dynamic;
+  } lv;
+  DummyLocalsRAII lraii{rt, &lv};
+  lv.prepared = DummyObject::createLongLived(gc);
+  lv.prepared->acquireExtMem(gc, 4096);
+  lv.growingPrepared = DummyObject::createLongLived(gc);
+  gc.beginPreparedHeap();
+  EXPECT_EQ(0, gc.dynamicOccupiedGrowth());
+
+  // Releasing newly acquired prepared payload must not consume the original
+  // external baseline, even when it belongs to a different prepared object.
+  lv.growingPrepared->acquireExtMem(gc, 4096);
+  EXPECT_EQ(4096, gc.dynamicOccupiedGrowth());
+  lv.growingPrepared->releaseExtMem(gc);
+  EXPECT_EQ(0, gc.dynamicOccupiedGrowth());
+  lv.growingPrepared->acquireExtMem(gc, 4096);
+  lv.growingPrepared = nullptr;
+  rt.collect();
+  EXPECT_EQ(0, gc.dynamicOccupiedGrowth());
+
+  // Detachment and shrinking native storage can debit a live prepared owner.
+  lv.prepared->releaseExtMem(gc);
+  lv.dynamic = DummyObject::createLongLived(gc);
+  const auto dynamicCellBytes = gc.dynamicOccupiedGrowth();
+  lv.dynamic->acquireExtMem(gc, 4096);
+  EXPECT_EQ(dynamicCellBytes + 4096, gc.dynamicOccupiedGrowth());
+  rt.collect();
+  EXPECT_EQ(dynamicCellBytes + 4096, gc.dynamicOccupiedGrowth());
+  lv.prepared = nullptr;
+  lv.dynamic = nullptr;
+  rt.collect();
+  EXPECT_EQ(0, gc.dynamicOccupiedGrowth());
+}
+
+TEST(GCBasicsTestHades, PreparedHolesStayOutsideAllocationAndPayload) {
+  if (kConcurrentGC)
+    return;
+  auto runtime = DummyRuntime::create(TestGCConfigFixedSize(
+      8 * FixedSizeHeapSegment::storageSize()));
+  auto &rt = *runtime;
+  auto &gc = rt.getHeap();
+  struct : Locals {
+    PinnedValue<DummyObject> prepared;
+    PinnedValue<DummyObject> dynamic;
+  } lv;
+  DummyLocalsRAII lraii{rt, &lv};
+  lv.prepared = DummyObject::createLongLived(gc);
+  gc.beginPreparedHeap();
+  const auto preparedStart = reinterpret_cast<uintptr_t>(
+      FixedSizeHeapSegment::storageStart(*lv.prepared));
+  lv.prepared = nullptr;
+  rt.collect();
+  lv.dynamic = DummyObject::createLongLived(gc);
+  EXPECT_NE(
+      preparedStart,
+      reinterpret_cast<uintptr_t>(
+          FixedSizeHeapSegment::storageStart(*lv.dynamic)));
+
+  HadesGC::FreePayloadRange ranges[128];
+  const auto result = gc.exportDynamicFreePayload(ranges, 4096, 4096);
+  ASSERT_EQ(HadesGC::FreePayloadStatus::Complete, result.status);
+  ASSERT_GT(result.count, 0);
+  const auto liveStart = reinterpret_cast<uintptr_t>(*lv.dynamic);
+  const auto liveEnd = liveStart + lv.dynamic->getAllocatedSize();
+  for (uint32_t i = 0; i < result.count; ++i) {
+    EXPECT_EQ(0, ranges[i].start % 4096);
+    EXPECT_EQ(0, ranges[i].end % 4096);
+    EXPECT_TRUE(
+        ranges[i].end <= preparedStart ||
+        ranges[i].start >= preparedStart + FixedSizeHeapSegment::storageSize());
+    EXPECT_TRUE(ranges[i].end <= liveStart || ranges[i].start >= liveEnd);
+    // Overwriting exported payload must leave free-cell headers and metadata
+    // usable by the next allocation and full sweep.
+    __asan_unpoison_memory_region(
+        reinterpret_cast<void *>(ranges[i].start),
+        ranges[i].end - ranges[i].start);
+    std::memset(
+        reinterpret_cast<void *>(ranges[i].start),
+        0,
+        ranges[i].end - ranges[i].start);
+    __asan_poison_memory_region(
+        reinterpret_cast<void *>(ranges[i].start),
+        ranges[i].end - ranges[i].start);
+  }
+  lv.dynamic = DummyObject::createLongLived(gc);
+  rt.collect();
+  EXPECT_EQ(1, lv.dynamic->x);
+}
+
+TEST(GCBasicsTestHades, YoungReclamationDefersBeforeOldGenerationPressure) {
+  using Cell = EmptyCell<(FixedSizeHeapSegment::maxSize() / 16) & ~(HeapAlign - 1)>;
+  const auto config = TestGCConfigFixedSize(
+      8 * FixedSizeHeapSegment::storageSize(),
+      GCConfig::Builder().withAllocInYoung(true));
+  auto runtime = DummyRuntime::create(config);
+  auto &rt = *runtime;
+  struct : Locals {
+    PinnedValue<Cell> survivor;
+  } lv;
+  DummyLocalsRAII lraii{rt, &lv};
+  bool deferred = false;
+  for (unsigned i = 0; i < 128; ++i) {
+    // Each previous survivor becomes unreachable in OG. Young-only collection
+    // must defer before this garbage exhausts the heap without an old cycle.
+    lv.survivor = Cell::create(rt);
+    auto result = rt.getHeap().tryReclaimYoungGeneration();
+    if (result.status == HadesGC::YoungReclaimStatus::Deferred) {
+      EXPECT_EQ(nullptr, result.payloadBegin);
+      EXPECT_EQ(nullptr, result.payloadEnd);
+      deferred = true;
+      break;
+    }
+    EXPECT_LT(result.payloadBegin, result.payloadEnd);
+    const auto survivor = reinterpret_cast<uintptr_t>(*lv.survivor);
+    EXPECT_FALSE(
+        reinterpret_cast<uintptr_t>(result.payloadBegin) <= survivor &&
+        survivor < reinterpret_cast<uintptr_t>(result.payloadEnd));
+  }
+  EXPECT_TRUE(deferred);
+  rt.collect();
+  EXPECT_EQ(
+      HadesGC::YoungReclaimStatus::Reclaimed,
+      rt.getHeap().tryReclaimYoungGeneration().status);
+}
+#endif
 
 #if HERMESVM_GCKIND != _HERMESVM_GCVALUE_MALLOC
 TEST(GCBasicsTestNCGen, TestIDPersistsAcrossMultipleCollections) {

@@ -149,6 +149,12 @@ typedef struct SHUnit {
   /// barrier is needed to safely read out the value.
   SHCompressedPointer *object_literal_class_cache;
 
+  /// Sorted shape indexes used by ordinary object-literal instructions in this
+  /// unit. Typed layouts and unused retained table slots are excluded by the
+  /// compiler; the key buffer alone does not establish allocation semantics.
+  const uint32_t *ordinary_literal_shapes;
+  uint32_t ordinary_literal_shape_count;
+
   /// The module exports cache: a map from non-negative integer module indexes
   /// to the export of the module.  An empty value indicates that the module has
   /// not yet been initialized.
@@ -179,6 +185,37 @@ typedef struct SHLocals {
   uint32_t src_location_idx;
   SHLegacyValue locals[0];
 } SHLocals;
+
+typedef enum SHYoungReclaimStatus {
+  SHYoungReclaimDeferred = 0,
+  SHYoungReclaimReclaimed = 1,
+  SHYoungReclaimUnsupported = 2,
+} SHYoungReclaimStatus;
+
+typedef struct SHYoungReclaimResult {
+  uint32_t status;
+  uintptr_t payload_begin;
+  uintptr_t payload_end;
+} SHYoungReclaimResult;
+
+typedef enum SHFreePayloadStatus {
+  SHFreePayloadComplete = 0,
+  SHFreePayloadPartial = 1,
+  SHFreePayloadDeferred = 2,
+  SHFreePayloadUnsupported = 3,
+} SHFreePayloadStatus;
+
+typedef struct SHFreePayloadRange {
+  uintptr_t start;
+  uintptr_t end;
+} SHFreePayloadRange;
+
+typedef struct SHFreePayloadResult {
+  uint32_t status;
+  uint32_t count;
+  uint32_t visited;
+  SHFreePayloadRange ranges[128];
+} SHFreePayloadResult;
 
 /// Version for Static Hermes ABI contracts that are not represented by C
 /// structure layout. Increment this when changing value encodings, calling
@@ -282,6 +319,10 @@ typedef struct SHLocals {
   V(unit_shape_table_count_offset, offsetof(SHUnit, obj_shape_table_count))  \
   V(unit_object_class_cache_offset,                                          \
     offsetof(SHUnit, object_literal_class_cache))                            \
+  V(unit_ordinary_literal_shapes_offset,                                    \
+    offsetof(SHUnit, ordinary_literal_shapes))                              \
+  V(unit_ordinary_literal_shape_count_offset,                               \
+    offsetof(SHUnit, ordinary_literal_shape_count))                         \
   V(unit_module_exports_offset, offsetof(SHUnit, moduleExports))             \
   V(unit_source_locations_offset, offsetof(SHUnit, source_locations))        \
   V(unit_source_locations_size_offset,                                       \
@@ -290,6 +331,19 @@ typedef struct SHLocals {
   V(unit_main_info_offset, offsetof(SHUnit, unit_main_info))                 \
   V(unit_name_offset, offsetof(SHUnit, unit_name))                           \
   V(unit_runtime_extension_offset, offsetof(SHUnit, runtime_ext))            \
+  V(young_reclaim_result_size, sizeof(SHYoungReclaimResult))                 \
+  V(young_reclaim_status_offset, offsetof(SHYoungReclaimResult, status))      \
+  V(young_reclaim_begin_offset,                                            \
+    offsetof(SHYoungReclaimResult, payload_begin))                          \
+  V(young_reclaim_end_offset, offsetof(SHYoungReclaimResult, payload_end))   \
+  V(free_payload_result_size, sizeof(SHFreePayloadResult))                  \
+  V(free_payload_status_offset, offsetof(SHFreePayloadResult, status))      \
+  V(free_payload_count_offset, offsetof(SHFreePayloadResult, count))        \
+  V(free_payload_visited_offset, offsetof(SHFreePayloadResult, visited))    \
+  V(free_payload_ranges_offset, offsetof(SHFreePayloadResult, ranges))      \
+  V(free_payload_range_size, sizeof(SHFreePayloadRange))                    \
+  V(free_payload_range_start_offset, offsetof(SHFreePayloadRange, start))   \
+  V(free_payload_range_end_offset, offsetof(SHFreePayloadRange, end))       \
   V(locals_size, sizeof(SHLocals))                                           \
   V(locals_prev_offset, offsetof(SHLocals, prev))                            \
   V(locals_count_offset, offsetof(SHLocals, count))                          \
@@ -360,6 +414,75 @@ _sh_init_with_error(int argc, char **argv, char **errorMessage);
 
 /// Destroy a runtime instance created by \c _sh_init();
 SHERMES_EXPORT void _sh_done(SHRuntime *shr);
+
+/// Cumulative GC counters and current heap occupancy. This reads counters,
+/// without collecting, traversing the heap, or allocating JS values.
+typedef struct SHHeapStatistics {
+  uint64_t collections;
+  uint64_t allocated_bytes;
+  uint64_t heap_bytes;
+  uint64_t gc_wall_nanos;
+  uint64_t gc_cpu_nanos;
+} SHHeapStatistics;
+SHERMES_EXPORT void _sh_get_heap_statistics(
+    SHRuntime *shr, SHHeapStatistics *statistics);
+
+/// Prepare and retain eligible ordinary literal layouts for registered units,
+/// without executing application functions. Call during request-independent
+/// preparation, with exclusive runtime access. Repeated successful calls are
+/// safe, including after additional units have initialized. Classes remain
+/// ordinary GC-managed objects; full collection and compaction still trace them.
+/// On failure, write the exception and return false. The caller must discard the
+/// partially prepared runtime. On success, write undefined and return true.
+SHERMES_EXPORT bool _sh_prepare_literal_layouts(
+    SHRuntime *shr, SHLegacyValue *resultOrException);
+
+/// Run ordinary young-generation survivor, weak-reference and finalizer
+/// processing without starting an old-generation cycle. Pending old-generation
+/// work, promotion or worst-case survivor pressure at the old-generation start
+/// threshold defers reclamation. Other collectors report unsupported.
+/// Call only with exclusive runtime access outside execution and collection.
+/// A reclaimed range contains no live objects or collector metadata, but is not
+/// necessarily page aligned. Its authority expires when guest allocation or
+/// collection resumes. The embedder must preserve that quiescence until discard
+/// finishes and retain any host resources that finalizers can still reference.
+/// Deferred calls make no collector progress; permit ordinary collection or
+/// restore/dispose instead of retrying in a loop. Work has ordinary young-GC
+/// cost, including native finalizers, with no fixed latency bound.
+/// Non-reclaimed outcomes always return an empty range.
+SHERMES_EXPORT void _sh_try_reclaim_young_generation(
+    SHRuntime *shr, SHYoungReclaimResult *result);
+
+/// Complete ordinary collection and separate prepared allocation storage.
+/// Objects in that storage retain normal liveness/finalization semantics, but
+/// their holes are excluded from allocation and their segments from compaction.
+/// Call once with exclusive runtime ownership before capturing an image.
+/// Returns false for collectors without this capability; success is required
+/// before dynamic occupancy or free-payload queries.
+SHERMES_EXPORT bool _sh_begin_prepared_heap(SHRuntime *shr);
+
+/// A constant-time collection-pressure estimate, not a physical-memory charge.
+SHERMES_EXPORT uint64_t _sh_prepared_heap_dynamic_bytes(SHRuntime *shr);
+
+/// Observe an already empty nursery without running collection. The range
+/// expires on subsequent allocation/collection, as with nursery reclamation.
+SHERMES_EXPORT void _sh_empty_young_payload(
+    SHRuntime *shr, SHYoungReclaimResult *result);
+
+/// Export collector-owned free payload at an exclusive mutator boundary.
+/// pageSize must be a power of two in [4096, 65536], visitLimit in [1, 4096].
+/// Only count ranges are initialized. Partial results grant those ranges;
+/// deferred/unsupported results grant none. Preserve allocation/collection
+/// quiescence until discard completes. Free-cell headers are always excluded.
+SHERMES_EXPORT void _sh_dynamic_free_payload(
+    SHRuntime *shr,
+    SHFreePayloadResult *result,
+    uint32_t pageSize,
+    uint32_t visitLimit);
+
+/// Release empty weak-slot chunks without collection or moving occupied slots.
+/// Requires exclusive runtime access with no collection in progress.
+SHERMES_EXPORT uint64_t _sh_trim_unused_weak_slots(SHRuntime *shr);
 
 /// Check on the native stack and throw a stack overflow error if it overflows.
 /// When compiled without HERMES_CHECK_NATIVE_STACK, does nothing.

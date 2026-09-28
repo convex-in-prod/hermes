@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstddef>
 #include <utility>
+#include <vector>
 
 namespace hermes {
 
@@ -49,8 +50,14 @@ class ManagedChunkedList {
         chunkCount_(other.chunkCount_),
         targetChunkCount_(other.targetChunkCount_),
         freeList_(other.freeList_),
-        occupancyRatio_(other.occupancyRatio_) {
+        occupancyRatio_(other.occupancyRatio_),
+        recentlyAdded_(std::move(other.recentlyAdded_)),
+        visitAllNew_(other.visitAllNew_) {
     other.chunks_ = nullptr;
+    other.chunkCount_ = 0;
+    other.freeList_ = nullptr;
+    other.recentlyAdded_.clear();
+    other.visitAllNew_ = true;
   }
 
   ManagedChunkedList(const ManagedChunkedList &) = delete;
@@ -90,6 +97,10 @@ class ManagedChunkedList {
 
     // Emplace the new value at the first location in the free list.
     Element &element = *freeList_;
+    // Record before consuming the slot so an allocation failure cannot leave
+    // an occupied element missing from the next incremental visit.
+    if (!visitAllNew_)
+      recentlyAdded_.push_back(&element);
     freeList_ = freeList_->getNextFree();
     assert(element.isFree() && "Premature element reuse");
     element.emplace(std::forward<Args>(args)...);
@@ -111,10 +122,35 @@ class ManagedChunkedList {
     }
   }
 
+  // Visit additions since the previous call, including reused slots, skipping
+  // elements that have since been freed. The first visit, and the first visit
+  // after chunk collection, includes all occupied elements. Clients must allow
+  // those repeated visits. Ordinary forEach does not consume this history.
+  // Changes to occupied elements are not recorded: clients must not install
+  // new references in previously visited slots without adding a new element.
+  template <typename Func>
+  void forEachNew(Func accept) {
+    if (visitAllNew_) {
+      forEach(accept);
+    } else {
+      for (auto *element : recentlyAdded_)
+        if (!element->isFree())
+          accept(*element);
+    }
+    recentlyAdded_.clear();
+    visitAllNew_ = false;
+  }
+
   // Determine the capacity of the list (i.e. the number of values it can hold
   // without any additional chunk allocations).
   size_t capacity() const {
     return chunkCount_ * kElementsPerChunk;
+  }
+
+  // Include the optional incremental-visit index in native ownership reports.
+  size_t mallocSizeEstimate() const {
+    return chunkCount_ * sizeof(Chunk) +
+        recentlyAdded_.capacity() * sizeof(Element *);
   }
 
   // Determine the number of values contained in the list. Only used for testing
@@ -128,16 +164,31 @@ class ManagedChunkedList {
   // Perform a garbage collection, building a free list of all free elements,
   // and potentially deleting excess empty chunks.
   void collect() {
+    // Use the preceding occupancy target so collection can delete chunks in
+    // one traversal before the new surviving-element count is known.
+    collectImpl(ceil(targetChunkCount_));
+  }
+
+  // A pressure boundary can release every empty chunk without moving live
+  // elements or discarding the occupancy history used for later allocation.
+  void trimEmptyChunks() {
+    collectImpl(0);
+    // The next visit already scans all occupied slots. Release the obsolete
+    // index too, so a temporary peak does not retain its native backing.
+    std::vector<Element *>().swap(recentlyAdded_);
+  }
+
+ private:
+  void collectImpl(size_t targetChunkCount) {
     HERMES_SLOW_ASSERT(checkWellFormed());
 
+    // Pending pointers may name chunks deleted below or slots reused by add.
+    // Invalidate them at their owner, before either operation can happen.
+    recentlyAdded_.clear();
+    visitAllNew_ = true;
     freeList_ = nullptr;
     size_t occupiedElementCount = 0;
 
-    // Delete chunks based on the target number of chunks from the previous
-    // collection. This can make deletion lag by one collection cycle, but
-    // simplifies the collection logic by allowing chunks to be deleted as they
-    // are encountered, before knowing the number of surviving values.
-    size_t targetChunkCount = ceil(targetChunkCount_);
     Chunk **chunkListEndLoc = &chunks_;
     for (Chunk *chunk = chunks_; chunk;) {
       size_t chunkOccupiedElementCount = 0;
@@ -237,6 +288,9 @@ class ManagedChunkedList {
   ExponentialMovingAverage targetChunkCount_;
   Element *freeList_ = nullptr;
   double occupancyRatio_;
+  std::vector<Element *> recentlyAdded_;
+  // Lists that never use forEachNew do not allocate or maintain an index.
+  bool visitAllNew_{true};
 };
 
 } // namespace hermes

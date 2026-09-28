@@ -17,6 +17,7 @@
 #include "hermes/VM/VMExperiments.h"
 
 #include "llvh/ADT/SparseBitVector.h"
+#include "llvh/ADT/DenseSet.h"
 #include "llvh/Support/ErrorOr.h"
 #include "llvh/Support/PointerLikeTypeTraits.h"
 #include "llvh/Support/SaveAndRestore.h"
@@ -72,6 +73,37 @@ class HadesGC final : public GCBase {
       experiments::VMExperimentFlags vmExperimentFlags);
 
   ~HadesGC() override;
+
+  /// Separate existing storage from subsequent allocation after completing
+  /// ordinary collection. Prepared objects still participate in tracing,
+  /// sweeping and finalization; their free holes are not allocation candidates.
+  /// Requires exclusive mutator access and a nonconcurrent collector. Call once
+  /// after application preparation, before capturing an initialized image.
+  void beginPreparedHeap();
+
+  /// Occupied dynamic storage, its external storage, and positive external
+  /// growth on prepared owners. This is a collection-pressure estimate, not
+  /// private physical-memory accounting.
+  uint64_t dynamicOccupiedGrowth();
+
+  struct FreePayloadRange {
+    uintptr_t start;
+    uintptr_t end;
+  };
+  enum class FreePayloadStatus { Complete, Partial, Deferred };
+  struct FreePayloadResult {
+    FreePayloadStatus status;
+    uint32_t count;
+    uint32_t visited;
+  };
+
+  /// Export whole pages inside dynamic free cells, excluding their headers.
+  /// No allocation or collector progress may occur between export and discard.
+  /// Deferred results grant no ranges and do not advance collection.
+  FreePayloadResult exportDynamicFreePayload(
+      llvh::MutableArrayRef<FreePayloadRange> ranges,
+      uint32_t pageSize,
+      uint32_t visitLimit);
 
   static bool classof(const GCBase *gc) {
     return gc->getKind() == HeapKind::HadesGC;
@@ -232,6 +264,25 @@ class HadesGC final : public GCBase {
   unsigned getNumYGGCs() const {
     return ygCumulativeStats_.numCollections;
   }
+
+  enum class YoungReclaimStatus : uint32_t { Deferred = 0, Reclaimed = 1 };
+  struct YoungReclaimResult {
+    YoungReclaimStatus status;
+    char *payloadBegin;
+    char *payloadEnd;
+  };
+
+  /// Reclaim the young generation at a mutator-owned quiescent boundary.
+  /// Survivors, weak references and native finalizers follow ordinary GC rules.
+  /// The returned payload contains no live objects until allocation resumes.
+  /// Defer for promotion, pending old-generation work or worst-case survivor
+  /// pressure that would reach the old-generation collection threshold.
+  /// This has ordinary young-GC cost, not a fixed work or latency bound.
+  YoungReclaimResult tryReclaimYoungGeneration();
+
+  /// Observe an already empty nursery without advancing collection. The same
+  /// exclusive-access and range-lifetime contract as reclamation applies.
+  YoungReclaimResult emptyYoungPayload();
 
   /// Run the finalizers for all heap objects.
   void finalizeAll() override;
@@ -716,6 +767,12 @@ class HadesGC final : public GCBase {
    public:
     explicit OldGen(HadesGC &gc);
 
+    void detachPreparedAllocation();
+    FreePayloadResult exportFreePayload(
+        llvh::MutableArrayRef<FreePayloadRange> ranges,
+        uint32_t pageSize,
+        uint32_t visitLimit);
+
     size_t numSegments() const;
 
     /// \return The deque of AlignedHeapSegments in the OG.
@@ -1140,6 +1197,20 @@ class HadesGC final : public GCBase {
   /// Protected by gcMutex_.
   OldGen oldGen_;
 
+  // Prepared normal segments form a stable prefix: only later segments may
+  // compact. Jumbo segments can die, so remove their identity before returning
+  // storage to the allocator. No prepared-to-dynamic remembered set is needed:
+  // major collection retains ordinary whole-heap reachability processing.
+  llvh::DenseSet<const void *> preparedSegments_;
+  size_t preparedNormalSegments_{0};
+  uint64_t preparedAllocatedBytes_{0};
+  // Track current external storage on prepared owners separately from its
+  // initial ceiling. Growth and later shrinkage must not consume the baseline
+  // belonging to other prepared owners, or hide dynamic owners' allocations.
+  uint64_t preparedExternalBytes_{0};
+  uint64_t preparedExternalBytesAtPreparation_{0};
+  bool preparedHeapActive_{false};
+
 #ifndef NDEBUG
   /// Map an address aligned to AlignedHeapSegment::kSegmentUnitSize to the
   /// start and end address of its owning segment.
@@ -1349,7 +1420,14 @@ class HadesGC final : public GCBase {
   ///   if one is not already active.
   /// \post The YG is completely empty, and all bytes are available for new
   ///   allocations.
-  void youngGenCollection(std::string cause, bool forceOldGenCollection);
+  /// \param allowOldGenStart If false, old marking/sweeping must be settled and
+  ///   nursery promotion disabled. A pending compactee may still be evacuated
+  ///   to finish preparation; young-only reclamation separately excludes it.
+  ///   Allocation-pressure collections retain the normal start policy.
+  void youngGenCollection(
+      std::string cause,
+      bool forceOldGenCollection,
+      bool allowOldGenStart = true);
 
   /// Implementation to actually do the YG collection. Mark roots, scan dirty
   /// cards, and evacuate reachable objects.

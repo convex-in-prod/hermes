@@ -353,21 +353,32 @@ class HermesRuntimeImpl final : public HermesRuntime,
     compileFlags_.emitAsyncBreakCheck =
         runtimeConfig.getAsyncBreakCheckInEval();
     runtime_.addCustomRootsFunction(
-        [this](vm::GC *, vm::RootAcceptor &acceptor) {
-          hermesValues_.forEach([&acceptor](HermesPointerValue &element) {
+        [this](vm::GC *gc, vm::RootAcceptor &acceptor) {
+          auto visit = [&acceptor](HermesPointerValue &element) {
             acceptor.accept(element.value());
-          });
+          };
+          // Managed values acquire a referent only at insertion. Once nursery
+          // evacuation visits one, its surviving referent is old. Compaction
+          // and full tracing still visit every retained value.
+          if (gc->isYoungGenerationRootScan())
+            hermesValues_.forEachNew(visit);
+          else
+            hermesValues_.forEach(visit);
         });
     runtime_.addCustomWeakRootsFunction(
-        [this](vm::GC *, vm::WeakRootAcceptor &acceptor) {
-          weakHermesValues_.forEach([&acceptor](WeakRefPointerValue &element) {
+        [this](vm::GC *gc, vm::WeakRootAcceptor &acceptor) {
+          auto visit = [&acceptor](WeakRefPointerValue &element) {
             // We need to use valueUnsafe() because the refernece count may
             // be decremented to 0 after we check that it is not free and hence
             // fires the assertion in value(). It is safe to accept the value
             // here because it is not freed before the iteration begings and
             // the iteration will not destroy the WeakRoot.
             acceptor.acceptWeak(element.valueUnsafe());
-          });
+          };
+          if (gc->isYoungGenerationRootScan())
+            weakHermesValues_.forEachNew(visit);
+          else
+            weakHermesValues_.forEach(visit);
         });
 #ifdef HERMES_MEMORY_INSTRUMENTATION
     runtime_.addCustomSnapshotFunction(
@@ -378,7 +389,7 @@ class HermesRuntimeImpl final : public HermesRuntime,
               "ManagedValues",
               vm::GCBase::IDTracker::reserved(
                   vm::GCBase::IDTracker::ReservedObjectID::JSIHermesValueList),
-              hermesValues_.capacity() * sizeof(HermesPointerValue),
+              hermesValues_.mallocSizeEstimate(),
               0);
           snap.beginNode();
           snap.endNode(
@@ -387,7 +398,7 @@ class HermesRuntimeImpl final : public HermesRuntime,
               vm::GCBase::IDTracker::reserved(
                   vm::GCBase::IDTracker::ReservedObjectID::
                       JSIWeakHermesValueList),
-              weakHermesValues_.capacity() * sizeof(WeakRefPointerValue),
+              weakHermesValues_.mallocSizeEstimate(),
               0);
         },
         [](vm::HeapSnapshot &snap) {
