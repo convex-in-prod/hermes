@@ -34,6 +34,7 @@ set(source_files
   JSDate.cpp
   JSError.cpp
   JSGeneratorObject.cpp
+  JSPromise.cpp
   JSObject.cpp
   JSProxy.cpp
   JSRegExp.cpp
@@ -100,6 +101,7 @@ set(source_files
   JSLib/GlobalObject.cpp
   JSLib/IteratorPrototype.cpp
   JSLib/HermesInternal.cpp
+  JSLib/NativePromise.cpp
   JSLib/HermesBuiltin.cpp
   JSLib/Intl.cpp
   JSLib/JSLibInternal.cpp JSLib/JSLibInternal.h

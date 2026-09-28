@@ -40,6 +40,7 @@ TEST_F(SynthTraceParserTest, ParseHeader) {
     "maxNumRegisters": 100,
     "ES6Proxy": false,
     "Intl": false,
+    "EnableNativePromise": true,
     "enableSampledStats": true,
     "vmExperimentFlags": 123
   },
@@ -65,6 +66,7 @@ TEST_F(SynthTraceParserTest, ParseHeader) {
   EXPECT_EQ(rtconf.getMaxNumRegisters(), 100);
   EXPECT_FALSE(rtconf.getES6Proxy());
   EXPECT_FALSE(rtconf.getIntl());
+  EXPECT_TRUE(rtconf.getEnableNativePromise());
   EXPECT_TRUE(rtconf.getEnableSampledStats());
   EXPECT_EQ(rtconf.getVMExperimentFlags(), 123);
 }
@@ -84,6 +86,7 @@ TEST_F(SynthTraceParserTest, RuntimeConfigDefaults) {
   EXPECT_EQ(rtconf.getGCConfig().getInitHeapSize(), 33554432);
   EXPECT_EQ(rtconf.getGCConfig().getMaxHeapSize(), 3221225472);
   EXPECT_FALSE(rtconf.getEnableSampledStats());
+  EXPECT_FALSE(rtconf.getEnableNativePromise());
 }
 
 TEST_F(SynthTraceParserTest, SynthVersionMismatch) {

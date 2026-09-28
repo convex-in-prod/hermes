@@ -8,6 +8,7 @@
 #ifndef HERMES_STATIC_H_H
 #define HERMES_STATIC_H_H
 
+#include "hermes/Support/MathFunctions.h"
 #include "hermes/Support/sh_tryfast_fp_cvt.h"
 #include "hermes/VM/sh_legacy_value.h"
 #include "hermes/VM/sh_mirror.h"
@@ -62,6 +63,20 @@ typedef struct SHNativeFuncInfo {
   uint8_t prohibit_invoke : 2;
 } SHNativeFuncInfo;
 
+/// Start a compiler-created async generator using the current frame's arguments.
+/// Only emitted for an async wrapper whose arguments object has no other users.
+SHERMES_EXPORT SHLegacyValue _sh_ljs_spawn_async_from_frame(
+    SHRuntime *shr,
+    SHLegacyValue generator,
+    SHLegacyValue receiver);
+
+/// The factory returns a private closure accepting the fixed value/done layout.
+SHERMES_EXPORT SHLegacyValue _sh_ljs_spawn_async_direct_from_frame(
+    SHRuntime *shr,
+    SHLegacyValue generator,
+    SHLegacyValue receiver,
+    SHLegacyValue resultRecord);
+
 /// Type of a function that allocates and returns a new SHUnit ready to be used
 /// with a runtime.
 typedef SHUnit *(*SHUnitCreator)(void);
@@ -90,6 +105,8 @@ typedef struct SHUnit {
   uint32_t num_read_prop_cache_entries;
   uint32_t num_write_prop_cache_entries;
   uint32_t num_private_name_cache_entries;
+  uint32_t num_computed_read_cache_entries;
+  uint32_t num_computed_write_cache_entries;
 
   /// Pool of ASCII strings.
   const char *ascii_pool;
@@ -121,6 +138,10 @@ typedef struct SHUnit {
   /// `num_private_name_cache_entries` elements.  Must be zeroed
   /// initially.
   SHPrivateNameCacheEntry *private_name_cache;
+  /// Zero-initialized entries, grouped by SH_COMPUTED_READ_CACHE_WAYS per site.
+  SHComputedReadCacheEntry *computed_read_cache;
+  /// Zero-initialized entries, grouped by SH_COMPUTED_WRITE_CACHE_WAYS per site.
+  SHComputedWriteCacheEntry *computed_write_cache;
 
   /// Object key buffer.
   const unsigned char *obj_key_buffer;
@@ -219,6 +240,42 @@ typedef struct SHLocals {
     offsetof(SHUnit, num_write_prop_cache_entries))                          \
   V(unit_num_private_cache_offset,                                           \
     offsetof(SHUnit, num_private_name_cache_entries))                        \
+  V(unit_num_computed_cache_offset,                                         \
+    offsetof(SHUnit, num_computed_read_cache_entries))                      \
+  V(computed_cache_entry_size, sizeof(SHComputedReadCacheEntry))            \
+  V(computed_cache_ways, SH_COMPUTED_READ_CACHE_WAYS)                       \
+  V(computed_cache_associativity, SH_COMPUTED_READ_CACHE_ASSOCIATIVITY)     \
+  V(unit_num_computed_write_cache_offset,                                  \
+    offsetof(SHUnit, num_computed_write_cache_entries))                     \
+  V(computed_write_cache_entry_size, sizeof(SHComputedWriteCacheEntry))     \
+  V(computed_write_cache_key_offset, offsetof(SHComputedWriteCacheEntry, key)) \
+  V(computed_write_cache_initialized_offset,                               \
+    offsetof(SHComputedWriteCacheEntry, initialized))                        \
+  V(computed_write_cache_ways, SH_COMPUTED_WRITE_CACHE_WAYS)                 \
+  V(computed_write_cache_associativity, SH_COMPUTED_WRITE_CACHE_ASSOCIATIVITY) \
+  V(named_cache_ways, SH_NAMED_READ_CACHE_WAYS)                             \
+  V(array_impl_size, sizeof(SHArrayImpl))                                   \
+  V(array_begin_offset, offsetof(SHArrayImpl, beginIndex))                  \
+  V(array_count_offset, offsetof(SHArrayImpl, elemCount))                    \
+  V(array_storage_offset, offsetof(SHArrayImpl, indexedStorage))            \
+  V(array_kind, SH_JSArrayKind)                                            \
+  V(cell_kind_shift, SH_CELL_KIND_SHIFT)                                    \
+  V(uint8_array_kind, SH_Uint8ArrayKind)                                    \
+  V(int8_array_kind, SH_Int8ArrayKind)                                      \
+  V(uint8_clamped_array_kind, SH_Uint8ClampedArrayKind)                     \
+  V(uint16_array_kind, SH_Uint16ArrayKind)                                  \
+  V(int16_array_kind, SH_Int16ArrayKind)                                    \
+  V(uint32_array_kind, SH_Uint32ArrayKind)                                  \
+  V(int32_array_kind, SH_Int32ArrayKind)                                    \
+  V(float32_array_kind, SH_Float32ArrayKind)                                \
+  V(float64_array_kind, SH_Float64ArrayKind)                                \
+  V(typed_array_size, sizeof(SHJSTypedArray))                               \
+  V(typed_array_buffer_offset, offsetof(SHJSTypedArray, buffer))            \
+  V(typed_array_length_offset, offsetof(SHJSTypedArray, length))            \
+  V(typed_array_offset_offset, offsetof(SHJSTypedArray, offset))            \
+  V(array_buffer_size, sizeof(SHJSArrayBuffer))                             \
+  V(array_buffer_data_offset, offsetof(SHJSArrayBuffer, data))              \
+  V(array_buffer_attached_offset, offsetof(SHJSArrayBuffer, attached))      \
   V(unit_ascii_pool_offset, offsetof(SHUnit, ascii_pool))                    \
   V(unit_u16_pool_offset, offsetof(SHUnit, u16_pool))                        \
   V(unit_strings_offset, offsetof(SHUnit, strings))                          \
@@ -226,6 +283,8 @@ typedef struct SHLocals {
   V(unit_write_cache_offset, offsetof(SHUnit, write_prop_cache))             \
   V(unit_read_cache_offset, offsetof(SHUnit, read_prop_cache))               \
   V(unit_private_cache_offset, offsetof(SHUnit, private_name_cache))         \
+  V(unit_computed_cache_offset, offsetof(SHUnit, computed_read_cache))       \
+  V(unit_computed_write_cache_offset, offsetof(SHUnit, computed_write_cache)) \
   V(unit_object_key_buffer_offset, offsetof(SHUnit, obj_key_buffer))         \
   V(unit_object_key_buffer_size_offset,                                      \
     offsetof(SHUnit, obj_key_buffer_size))                                   \
@@ -315,6 +374,18 @@ _sh_init_with_error(int argc, char **argv, char **errorMessage);
 
 /// Destroy a runtime instance created by \c _sh_init();
 SHERMES_EXPORT void _sh_done(SHRuntime *shr);
+
+/// Cumulative GC counters and current heap occupancy. This reads counters,
+/// without collecting, traversing the heap, or allocating JS values.
+typedef struct SHHeapStatistics {
+  uint64_t collections;
+  uint64_t allocated_bytes;
+  uint64_t heap_bytes;
+  uint64_t gc_wall_nanos;
+  uint64_t gc_cpu_nanos;
+} SHHeapStatistics;
+SHERMES_EXPORT void _sh_get_heap_statistics(
+    SHRuntime *shr, SHHeapStatistics *statistics);
 
 /// Check on the native stack and throw a stack overflow error if it overflows.
 /// When compiled without HERMES_CHECK_NATIVE_STACK, does nothing.
@@ -615,6 +686,50 @@ SHERMES_EXPORT SHLegacyValue _sh_ljs_callRequire(
     SHLegacyValue *requireFunc,
     uint32_t modIndex);
 
+/// Without allocation or JS effects, check for a plain data-only record whose
+/// parent is null or the intrinsic Object.prototype. Reusing missing reads also
+/// requires the embedding's restricted Object.prototype contract and nonstandard
+/// string keys. Any intervening effect invalidates the observed field values.
+SHERMES_EXPORT bool
+_sh_ljs_is_plain_record(SHRuntime *shr, SHLegacyValue source);
+
+SHERMES_EXPORT bool _sh_ljs_can_define_data_property(
+    SHRuntime *shr,
+    SHLegacyValue callee,
+    SHLegacyValue source);
+
+/// Check the original own data methods used by local string-result reuse.
+/// Does not invoke getters or JS; callers separately prove primitive inputs.
+SHERMES_EXPORT bool _sh_ljs_has_normalization_builtins(SHRuntime *shr);
+
+/// Check the intrinsic Array.prototype own join data property without invoking
+/// JS. A fresh array's join lookup must immediately follow this probe; testing
+/// only the returned callee would miss mutation by a getter returning the builtin.
+SHERMES_EXPORT bool _sh_ljs_has_array_join(SHRuntime *shr);
+
+/// Compiler-private access to the embedding's active string reuse scope.
+/// Inputs have already been guarded as strings and include every dependency.
+/// No active scope returns undefined. Lookup/store do not allocate or run JS.
+SHERMES_EXPORT SHLegacyValue
+_sh_ljs_string_reuse_lookup(SHRuntime *shr, uint32_t count, ...);
+SHERMES_EXPORT void _sh_ljs_string_reuse_store(
+    SHRuntime *shr, SHLegacyValue result, uint32_t count, ...);
+
+/// Primitive-input scans additionally guard indexed prototype observations and
+/// the methods allowed by their effect proof. Cached arrays are private copies;
+/// lookup may allocate a fresh array and throw. Unsupported results are not kept.
+SHERMES_EXPORT bool _sh_ljs_has_scan_reuse_builtins(SHRuntime *shr);
+SHERMES_EXPORT SHLegacyValue
+_sh_ljs_scan_reuse_lookup(SHRuntime *shr, SHLegacyValue input);
+SHERMES_EXPORT void _sh_ljs_scan_reuse_store(
+    SHRuntime *shr, SHLegacyValue input, SHLegacyValue result);
+
+/// Return whether the original trim builtin leaves a primitive string unchanged,
+/// or -1 when the caller must execute the original call. Does not allocate or
+/// invoke JS; the method lookup and argument evaluations must already have run.
+SHERMES_EXPORT int32_t
+_sh_ljs_try_string_trim_equal(SHLegacyValue callee, SHLegacyValue source);
+
 /// Create a new environment with the specified \p size and \p parentEnv (which
 /// may be null if this is a top level environment).
 SHERMES_EXPORT SHLegacyValue _sh_ljs_create_environment(
@@ -739,6 +854,20 @@ SHERMES_EXPORT void _sh_ljs_put_by_val_strict_rjs(
     SHLegacyValue *target,
     SHLegacyValue *key,
     SHLegacyValue *value);
+SHERMES_EXPORT void _sh_ljs_put_by_val_cached_loose_rjs(
+    SHRuntime *shr,
+    SHUnit *unit,
+    SHLegacyValue *target,
+    SHLegacyValue *key,
+    SHLegacyValue *value,
+    SHComputedWriteCacheEntry *cache);
+SHERMES_EXPORT void _sh_ljs_put_by_val_cached_strict_rjs(
+    SHRuntime *shr,
+    SHUnit *unit,
+    SHLegacyValue *target,
+    SHLegacyValue *key,
+    SHLegacyValue *value,
+    SHComputedWriteCacheEntry *cache);
 SHERMES_EXPORT void _sh_ljs_put_by_val_with_receiver_rjs(
     SHRuntime *shr,
     SHLegacyValue *target,
@@ -881,12 +1010,50 @@ static inline SHLegacyValue _sh_ljs_get_by_id_rjs_inline(
   return _sh_ljs_get_by_id_rjs(shr, source, symID, propCacheEntry);
 }
 
+/// \pre cache points to SH_NAMED_READ_CACHE_WAYS adjacent weak-rooted entries.
+SHERMES_EXPORT SHLegacyValue _sh_ljs_get_by_id_polymorphic_rjs(
+    SHRuntime *shr,
+    const SHLegacyValue *source,
+    SHSymbolID symID,
+    SHReadPropertyCacheEntry *cache);
+
+static inline SHLegacyValue _sh_ljs_get_by_id_polymorphic_rjs_inline(
+    SHRuntime *shr,
+    const SHLegacyValue *source,
+    SHSymbolID symID,
+    SHReadPropertyCacheEntry *cache) {
+  if (SH_LIKELY(_sh_ljs_is_object(*source))) {
+    SHJSObject *object = (SHJSObject *)_sh_ljs_get_pointer(*source);
+    for (unsigned i = 0; i < SH_NAMED_READ_CACHE_WAYS; ++i) {
+      if (cache[i].clazz == object->clazz)
+        return _sh_prload_inline(shr, *source, cache[i]._slot16);
+    }
+  }
+  return _sh_ljs_get_by_id_polymorphic_rjs(shr, source, symID, cache);
+}
+
 SHERMES_EXPORT SHLegacyValue _sh_ljs_get_by_id_with_receiver_rjs(
     SHRuntime *shr,
     const SHLegacyValue *source,
     const SHLegacyValue *receiver,
     SHSymbolID symID,
     SHReadPropertyCacheEntry *propCacheEntry);
+/// Compare a numeric index read from a known primitive string with one UTF-16
+/// code unit. Out-of-range keys still consult the prototype.
+SHERMES_EXPORT SHLegacyValue _sh_ljs_string_index_compare(
+    SHRuntime *shr,
+    SHLegacyValue source,
+    double key,
+    uint16_t character,
+    uint8_t invert);
+
+/// Read once and return a UTF-16 code unit, or -1 for any other property value.
+/// Used only when all consumers compare strictly against single-character strings.
+SHERMES_EXPORT SHLegacyValue _sh_ljs_get_indexed_char_code(
+    SHRuntime *shr,
+    SHLegacyValue source,
+    SHLegacyValue key);
+
 SHERMES_EXPORT SHLegacyValue _sh_ljs_get_by_val_with_receiver_rjs(
     SHRuntime *shr,
     SHLegacyValue *source,
@@ -897,6 +1064,136 @@ static inline SHLegacyValue _sh_ljs_get_by_val_rjs(
     SHLegacyValue *source,
     SHLegacyValue *key) {
   return _sh_ljs_get_by_val_with_receiver_rjs(shr, source, key, source);
+}
+
+SHERMES_EXPORT SHLegacyValue _sh_ljs_get_by_val_cached_rjs(
+    SHRuntime *shr,
+    SHLegacyValue *source,
+    SHLegacyValue *key,
+    SHComputedReadCacheEntry *cache);
+
+/// Numeric element reads can complete without a runtime call or allocation.
+/// No raw storage pointer survives a call, so GC and detachment cannot invalidate
+/// this read. Array holes must fall through to inherited-property lookup. Other
+/// keys, Float16 and BigInt arrays retain the runtime path.
+static inline bool _sh_try_get_indexed_element(
+    SHRuntime *shr,
+    SHLegacyValue source,
+    double key,
+    SHLegacyValue *result) {
+  uint32_t index;
+  if (!_sh_ljs_is_object(source) || !sh_tryfast_f64_to_u32(key, index))
+    return false;
+  SHJSTypedArray *array = (SHJSTypedArray *)_sh_ljs_get_pointer(source);
+  const unsigned kind =
+      (unsigned)(array->base.base.kindAndSize >> SH_CELL_KIND_SHIFT) & 0xff;
+  if (kind == SH_JSArrayKind) {
+    SHArrayImpl *ordinary = (SHArrayImpl *)array;
+    uint32_t offset = index - ordinary->beginIndex;
+    if (offset >= ordinary->elemCount)
+      return false;
+    SHArrayStorageSmall *storage = (SHArrayStorageSmall *)
+        _sh_cp_decode_non_null(shr, ordinary->indexedStorage);
+    SHLegacyValue value = _sh_shv_unbox_inline(shr, storage->storage[offset]);
+    if (_sh_ljs_is_empty(value))
+      return false;
+    *result = value;
+    return true;
+  }
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  if (kind < SH_Uint8ArrayKind || kind > SH_Float64ArrayKind ||
+      kind == SH_Float16ArrayKind)
+    return false;
+  SHJSArrayBuffer *buffer =
+      (SHJSArrayBuffer *)_sh_cp_decode_non_null(shr, array->buffer);
+  if (index >= array->length || !buffer->attached) {
+    *result = _sh_ljs_undefined();
+    return true;
+  }
+  const uint8_t *data = buffer->data + array->offset;
+  // memcpy permits external storage and avoids C aliasing/alignment assumptions.
+  // Typed arrays use native element byte order; this is little endian in Wasm.
+#define SH_READ_TYPED_ELEMENT(name, type)                              \
+  case SH_##name##ArrayKind: {                                         \
+    type value;                                                       \
+    memcpy(&value, data + (size_t)index * sizeof(type), sizeof(type));   \
+    *result = _sh_ljs_untrusted_double((double)value);                  \
+    return true;                                                      \
+  }
+  switch (kind) {
+    SH_READ_TYPED_ELEMENT(Uint8, uint8_t)
+    SH_READ_TYPED_ELEMENT(Int8, int8_t)
+    SH_READ_TYPED_ELEMENT(Uint8Clamped, uint8_t)
+    SH_READ_TYPED_ELEMENT(Uint16, uint16_t)
+    SH_READ_TYPED_ELEMENT(Int16, int16_t)
+    SH_READ_TYPED_ELEMENT(Uint32, uint32_t)
+    SH_READ_TYPED_ELEMENT(Int32, int32_t)
+    SH_READ_TYPED_ELEMENT(Float32, float)
+    SH_READ_TYPED_ELEMENT(Float64, double)
+  }
+#undef SH_READ_TYPED_ELEMENT
+#endif
+  return false;
+}
+
+/// Prove all reads at start + iteration * step + [0, maxOffset] are in bounds.
+/// The compiler only emits this for numeric bounds and a positive bounded step.
+/// The fast region must not contain effects that can detach the buffer.
+static inline bool _sh_can_read_byte_array_loop(
+    SHRuntime *shr,
+    SHLegacyValue source,
+    double start,
+    double limit,
+    unsigned step,
+    unsigned maxOffset) {
+  uint32_t first, end;
+  if (!_sh_ljs_is_object(source) || !sh_tryfast_f64_to_u32(start, first) ||
+      !sh_tryfast_f64_to_u32(limit, end) || first >= end || step == 0)
+    return false;
+  SHJSTypedArray *array = (SHJSTypedArray *)_sh_ljs_get_pointer(source);
+  const unsigned kind =
+      (unsigned)(array->base.base.kindAndSize >> SH_CELL_KIND_SHIFT) & 0xff;
+  if (kind != SH_Uint8ArrayKind && kind != SH_Uint8ClampedArrayKind)
+    return false;
+  SHJSArrayBuffer *buffer =
+      (SHJSArrayBuffer *)_sh_cp_decode_non_null(shr, array->buffer);
+  const uint64_t last =
+      (uint64_t)first + ((uint64_t)end - first - 1) / step * step;
+  return buffer->attached && last + maxOffset < array->length;
+}
+
+/// Only valid inside a region admitted by GuardedByteArrayLoops. Keep the
+/// receiver live and decode its current backing storage on every read; no raw
+/// pointer may survive a collector safepoint on the loop backedge.
+static inline uint8_t _sh_read_byte_array_element(
+    SHRuntime *shr,
+    SHLegacyValue source,
+    double index) {
+  SHJSTypedArray *array = (SHJSTypedArray *)_sh_ljs_get_pointer(source);
+  SHJSArrayBuffer *buffer =
+      (SHJSArrayBuffer *)_sh_cp_decode_non_null(shr, array->buffer);
+  return buffer->data[(size_t)array->offset + (uint32_t)index];
+}
+
+static inline SHLegacyValue _sh_ljs_get_by_val_rjs_inline(
+    SHRuntime *shr,
+    SHLegacyValue *source,
+    SHLegacyValue *key) {
+  SHLegacyValue result;
+  if (_sh_try_get_indexed_element(shr, *source, key->f64, &result))
+    return result;
+  return _sh_ljs_get_by_val_rjs(shr, source, key);
+}
+
+static inline SHLegacyValue _sh_ljs_get_by_val_cached_rjs_inline(
+    SHRuntime *shr,
+    SHLegacyValue *source,
+    SHLegacyValue *key,
+    SHComputedReadCacheEntry *cache) {
+  SHLegacyValue result;
+  if (_sh_try_get_indexed_element(shr, *source, key->f64, &result))
+    return result;
+  return _sh_ljs_get_by_val_cached_rjs(shr, source, key, cache);
 }
 
 SHERMES_EXPORT SHLegacyValue _sh_ljs_get_own_private_by_sym(
@@ -910,9 +1207,27 @@ SHERMES_EXPORT SHLegacyValue _sh_ljs_get_own_private_by_sym(
 SHERMES_EXPORT SHLegacyValue
 _sh_ljs_get_by_index_rjs(SHRuntime *shr, SHLegacyValue *source, uint32_t key);
 
+static inline SHLegacyValue _sh_ljs_get_by_index_rjs_inline(
+    SHRuntime *shr,
+    SHLegacyValue *source,
+    uint32_t key) {
+  SHLegacyValue result;
+  if (_sh_try_get_indexed_element(shr, *source, key, &result))
+    return result;
+  return _sh_ljs_get_by_index_rjs(shr, source, key);
+}
+
 /// Put an enumerable property by string id.
 SHERMES_EXPORT void _sh_ljs_define_own_by_id(
     SHRuntime *shr,
+    SHLegacyValue *target,
+    SHSymbolID key,
+    SHLegacyValue *value,
+    SHWritePropertyCacheEntry *cacheEntry);
+/// Define an enumerable property with a unit-owned addition cache.
+SHERMES_EXPORT void _sh_ljs_define_own_by_id_in_unit(
+    SHRuntime *shr,
+    SHUnit *unit,
     SHLegacyValue *target,
     SHSymbolID key,
     SHLegacyValue *value,
@@ -979,6 +1294,13 @@ _sh_ljs_get_string(SHRuntime *shr, SHSymbolID symID);
 
 SHERMES_EXPORT SHLegacyValue
 _sh_ljs_create_regexp(SHRuntime *shr, SHSymbolID pattern, SHSymbolID flags);
+
+SHERMES_EXPORT SHLegacyValue _sh_ljs_create_regexp_precompiled(
+    SHRuntime *shr,
+    SHSymbolID pattern,
+    SHSymbolID flags,
+    const uint8_t *bytecode,
+    uint32_t bytecode_size);
 
 /// \param value the string of the BigInt.
 /// \param size  the size of the string \c value.
@@ -1616,6 +1938,22 @@ static inline uint32_t _sh_to_uint32_double(double d) {
   return (uint32_t)_sh_to_int32_double_slow_path(d);
 }
 
+/// Math.imul after the operands have been converted to their low 32 bits.
+static inline SHLegacyValue _sh_ljs_imul_uint32(uint32_t a, uint32_t b) {
+  uint32_t product = a * b;
+  return _sh_ljs_double(product <= INT32_MAX
+      ? (double)product : (double)product - 4294967296.0);
+}
+
+/// Math.imul for operands already known to be numbers.
+static inline SHLegacyValue _sh_ljs_imul_number(
+    SHLegacyValue a,
+    SHLegacyValue b) {
+  return _sh_ljs_imul_uint32(
+      _sh_to_uint32_double(_sh_ljs_get_double(a)),
+      _sh_to_uint32_double(_sh_ljs_get_double(b)));
+}
+
 /// Store a property into direct storage.
 SHERMES_EXPORT void _sh_prstore_direct(
     SHRuntime *shr,
@@ -1876,6 +2214,14 @@ SHERMES_EXPORT int _sh_errno(void);
 /// \param len the length of the string, or -1 if the length is unknown.
 SHERMES_EXPORT SHLegacyValue
 _sh_asciiz_to_string(SHRuntime *shr, const char *str, ptrdiff_t len);
+
+/// Write a JS string as UTF-8, replacing unpaired surrogates. Return the byte
+/// count, or -1 if the destination is too small.
+SHERMES_EXPORT ptrdiff_t _sh_string_write_utf8(
+    SHRuntime *shr,
+    SHLegacyValue value,
+    char *destination,
+    size_t capacity);
 
 static inline void _sh_ptr_write_char(char *ptr, int offset, char c) {
   ptr[offset] = c;

@@ -193,6 +193,25 @@ cl::opt<StaticBuiltinSetting> StaticBuiltins(
             "Automatically detect 'use static builtin' directive from the source.")),
     cl::cat(CompilerCategory));
 
+cl::opt<bool> StaticMathBuiltins(
+    "fstatic-math-builtins",
+    cl::desc("Recognize original Math methods except random statically"),
+    cl::init(false),
+    cl::cat(CompilerCategory));
+
+cl::opt<bool> ArrayCallbacks(
+    "farray-callbacks",
+    cl::desc("Expose known array callbacks behind intrinsic and receiver guards"),
+    cl::init(false),
+    cl::cat(CompilerCategory));
+
+cl::opt<bool> StaticObjectPrototype(
+    "fstatic-object-prototype",
+    cl::desc(
+        "Assume Object.prototype is nonextensible, null-parented, and has only standard string keys"),
+    cl::init(false),
+    cl::cat(CompilerCategory));
+
 static list<std::string> CustomOptimize(
     "Xcustom-opt",
     desc("Custom optimzations"),
@@ -1217,6 +1236,9 @@ std::shared_ptr<Context> createContext(
   // parsing.
   optimizationOpts.staticBuiltins =
       cl::StaticBuiltins == cl::StaticBuiltinSetting::ForceOn;
+  optimizationOpts.staticMathBuiltins = cl::StaticMathBuiltins;
+  optimizationOpts.staticObjectPrototype = cl::StaticObjectPrototype;
+  optimizationOpts.arrayCallbacks = cl::ArrayCallbacks;
   optimizationOpts.staticRequire = cl::StaticRequire;
 
   optimizationOpts.useLegacyMem2Reg = cl::LegacyMem2Reg;

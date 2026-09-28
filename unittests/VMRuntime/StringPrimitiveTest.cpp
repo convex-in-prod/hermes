@@ -6,7 +6,9 @@
  */
 
 #include "hermes/VM/StringPrimitive.h"
+#include "hermes/VM/ScopedStringReuse.h"
 #include "hermes/VM/StringView.h"
+#include "hermes/VM/WeakRef.h"
 
 #include "llvh/Support/AlignOf.h"
 
@@ -22,6 +24,178 @@ using namespace hermes::vm;
 namespace {
 
 using StringPrimTest = RuntimeTestFixture;
+using ScopedStringReuseTest = LargeHeapRuntimeTestFixture;
+
+TEST_F(ScopedStringReuseTest, DoesNotRetainGrowingInputsOrResults) {
+  for (unsigned position = 0; position < 3; ++position) {
+    ScopedStringReuse scope(runtime);
+    llvh::Optional<WeakRef<StringPrimitive>> weak;
+    {
+      GCScopeMarkerRAII marker{runtime};
+      const std::u16string text(StringPrimitive::CONCAT_STRING_MIN_SIZE, u'\u0430');
+      auto base = StringPrimitive::createNoThrow(runtime, createUTF16Ref(text.c_str()));
+      auto suffix = StringPrimitive::createNoThrow(runtime, "x");
+      auto joined = StringPrimitive::concat(runtime, base, suffix);
+      ASSERT_NE(joined, ExecutionStatus::EXCEPTION);
+      auto prefix = runtime.makeHandle<BufferedUTF16StringPrimitive>(*joined);
+      weak.emplace(runtime, prefix);
+      auto fixed = StringPrimitive::createNoThrow(runtime, "fixed");
+      auto result = runtime.makeMutableHandle(fixed.getHermesValue());
+      if (position == 1) {
+        result = prefix.getHermesValue();
+      } else if (position == 2) {
+        auto created = JSArray::create(runtime, 1, 1);
+        ASSERT_NE(created, ExecutionStatus::EXCEPTION);
+        auto array = runtime.makeHandle(std::move(*created));
+        JSArray::unsafeSetExistingElementAt(*array, runtime, 0,
+            SmallHermesValue::encodeStringValue(*prefix, runtime));
+        result = array.getHermesValue();
+      }
+      const PinnedHermesValue input(position == 0 ? prefix.getHermesValue()
+                                                 : fixed.getHermesValue());
+      scope.store(&position, {&input, 1}, result.getHermesValue());
+
+      // A short immutable prefix shares storage with later concatenations.
+      // Admitting it by length alone can retain arbitrarily larger storage.
+      const std::u16string extension(65536, u'\u0430');
+      auto tail = StringPrimitive::createNoThrow(runtime, createUTF16Ref(extension.c_str()));
+      auto grown = StringPrimitive::concat(runtime, prefix, tail);
+      ASSERT_NE(grown, ExecutionStatus::EXCEPTION);
+      auto appended = runtime.makeHandle<BufferedUTF16StringPrimitive>(*grown);
+      EXPECT_EQ(prefix->testGetConcatBuffer(), appended->testGetConcatBuffer());
+      EXPECT_EQ(text.size() + 1, prefix->getStringLength());
+      EXPECT_GT(appended->getStringLength(), 32768u);
+    }
+    runtime.collect("reuse must not retain concatenation storage");
+    EXPECT_FALSE(weak->isValid()) << "retained position " << position;
+    weak->releaseSlot();
+  }
+}
+
+TEST_F(ScopedStringReuseTest, UTF8DoesNotRetainGrowingInputs) {
+  ScopedStringReuse scope(runtime);
+  llvh::Optional<WeakRef<StringPrimitive>> weak;
+  {
+    GCScopeMarkerRAII marker{runtime};
+    const std::u16string text(StringPrimitive::CONCAT_STRING_MIN_SIZE, u'\u0430');
+    auto base = StringPrimitive::createNoThrow(runtime, createUTF16Ref(text.c_str()));
+    auto suffix = StringPrimitive::createNoThrow(runtime, "x");
+    auto joined = StringPrimitive::concat(runtime, base, suffix);
+    ASSERT_NE(joined, ExecutionStatus::EXCEPTION);
+    auto prefix = runtime.makeHandle<BufferedUTF16StringPrimitive>(*joined);
+    weak.emplace(runtime, prefix);
+    // Mirror the API's admission boundary without manufacturing a cache store
+    // that a correctly rejecting caller would never make.
+    if (scope.allowsUTF8Reuse(*prefix)) {
+      EXPECT_EQ(nullptr, scope.lookupUTF8(*prefix));
+      std::string bytes;
+      for (size_t i = 0; i < text.size(); ++i)
+        bytes += "\xd0\xb0";
+      bytes += 'x';
+      scope.storeUTF8(*prefix, bytes);
+    }
+    const std::u16string extension(65536, u'\u0430');
+    auto tail = StringPrimitive::createNoThrow(runtime, createUTF16Ref(extension.c_str()));
+    auto grown = StringPrimitive::concat(runtime, prefix, tail);
+    ASSERT_NE(grown, ExecutionStatus::EXCEPTION);
+    auto appended = runtime.makeHandle<BufferedUTF16StringPrimitive>(*grown);
+    EXPECT_EQ(prefix->testGetConcatBuffer(), appended->testGetConcatBuffer());
+  }
+  runtime.collect("UTF-8 reuse must not retain concatenation storage");
+  EXPECT_FALSE(weak->isValid());
+  weak->releaseSlot();
+}
+
+TEST_F(ScopedStringReuseTest, ExternalCapacityCountsTowardRetention) {
+  ScopedStringReuse scope(runtime);
+  std::u16string text(StringPrimitive::CONCAT_STRING_MIN_SIZE, u'\u0430');
+  auto fixed = StringPrimitive::createNoThrow(runtime, createUTF16Ref(text.c_str()));
+  text.reserve(65536);
+  auto created = StringPrimitive::createEfficient(runtime, std::move(text));
+  ASSERT_NE(created, ExecutionStatus::EXCEPTION);
+  auto external = runtime.makeHandle<StringPrimitive>(*created);
+  ASSERT_TRUE(external->isExternal());
+  ASSERT_FALSE(isBufferedStringPrimitive(*external));
+  ASSERT_GT(external->getVT()->getMallocSize(*external), 65536u);
+  ASSERT_TRUE(external->equals(*fixed));
+  EXPECT_FALSE(scope.allowsUTF8Reuse(*external));
+  EXPECT_TRUE(scope.allowsUTF8Reuse(*fixed));
+  const PinnedHermesValue input(external.getHermesValue());
+  scope.store(this, {&input, 1}, fixed.getHermesValue());
+  EXPECT_TRUE(scope.lookup(this, {&input, 1}).isUndefined());
+  const PinnedHermesValue bounded(fixed.getHermesValue());
+  scope.store(this, {&bounded, 1}, external.getHermesValue());
+  EXPECT_TRUE(scope.lookup(this, {&bounded, 1}).isUndefined());
+  auto arrayResult = JSArray::create(runtime, 1, 1);
+  ASSERT_NE(arrayResult, ExecutionStatus::EXCEPTION);
+  auto array = runtime.makeHandle(std::move(*arrayResult));
+  JSArray::unsafeSetExistingElementAt(*array, runtime, 0,
+      SmallHermesValue::encodeStringValue(*external, runtime));
+  scope.store(this, {&bounded, 1}, array.getHermesValue());
+  EXPECT_TRUE(scope.lookup(this, {&bounded, 1}).isUndefined());
+  scope.store(this, {&bounded, 1}, fixed.getHermesValue());
+  runtime.collect("bounded reuse remains live");
+  const PinnedHermesValue moved(fixed.getHermesValue());
+  EXPECT_TRUE(scope.lookup(this, {&moved, 1}).getString()->equals(*fixed));
+}
+
+TEST_F(ScopedStringReuseTest, BufferedLookupDoesNotRetainInput) {
+  ScopedStringReuse scope(runtime);
+  std::u16string text(StringPrimitive::CONCAT_STRING_MIN_SIZE, u'\u0430');
+  text += u'x';
+  auto fixed = StringPrimitive::createNoThrow(runtime, createUTF16Ref(text.c_str()));
+  auto result = StringPrimitive::createNoThrow(runtime, "result");
+  const PinnedHermesValue key(fixed.getHermesValue());
+  scope.store(this, {&key, 1}, result.getHermesValue());
+  llvh::Optional<WeakRef<StringPrimitive>> weak;
+  {
+    GCScopeMarkerRAII marker{runtime};
+    text.pop_back();
+    auto base = StringPrimitive::createNoThrow(runtime, createUTF16Ref(text.c_str()));
+    auto suffix = StringPrimitive::createNoThrow(runtime, "x");
+    auto joined = StringPrimitive::concat(runtime, base, suffix);
+    ASSERT_NE(joined, ExecutionStatus::EXCEPTION);
+    auto prefix = runtime.makeHandle<BufferedUTF16StringPrimitive>(*joined);
+    weak.emplace(runtime, prefix);
+    const PinnedHermesValue input(prefix.getHermesValue());
+    // Equality lookup may use a safely retained key without retaining the new
+    // input, even when that input would not be admitted as a cache key.
+    auto found = scope.lookup(this, {&input, 1});
+    ASSERT_TRUE(found.isString());
+    EXPECT_TRUE(found.getString()->equals(*result));
+    const std::u16string extension(65536, u'\u0430');
+    auto tail = StringPrimitive::createNoThrow(runtime, createUTF16Ref(extension.c_str()));
+    auto grown = StringPrimitive::concat(runtime, prefix, tail);
+    ASSERT_NE(grown, ExecutionStatus::EXCEPTION);
+  }
+  runtime.collect("lookup must not retain a new input");
+  EXPECT_FALSE(weak->isValid());
+  weak->releaseSlot();
+  const PinnedHermesValue moved(fixed.getHermesValue());
+  EXPECT_TRUE(scope.lookup(this, {&moved, 1}).getString()->equals(*result));
+}
+
+TEST_F(ScopedStringReuseTest, CombinedExternalStorageIsBounded) {
+  ScopedStringReuse scope(runtime);
+  const std::u16string text(128, u'\u0430');
+  auto fixed = StringPrimitive::createNoThrow(runtime, createUTF16Ref(text.c_str()));
+  auto reserved = text;
+  reserved.reserve(20000);
+  auto created = StringPrimitive::createEfficient(runtime, std::move(reserved));
+  ASSERT_NE(created, ExecutionStatus::EXCEPTION);
+  auto external = runtime.makeHandle<StringPrimitive>(*created);
+  ASSERT_TRUE(external->isExternal());
+  const auto storage = external->getVT()->getMallocSize(*external);
+  ASSERT_GT(storage, ScopedStringReuse::maxEntryStorageBytes / 2);
+  ASSERT_LE(storage, ScopedStringReuse::maxEntryStorageBytes - 2 * text.size());
+  const PinnedHermesValue input(external.getHermesValue());
+  scope.store(this, {&input, 1}, external.getHermesValue());
+  EXPECT_TRUE(scope.lookup(this, {&input, 1}).isUndefined());
+  scope.store(this, {&input, 1}, fixed.getHermesValue());
+  auto found = scope.lookup(this, {&input, 1});
+  ASSERT_TRUE(found.isString());
+  EXPECT_TRUE(found.getString()->equals(*fixed));
+}
 
 TEST_F(StringPrimTest, CreateTest) {
   auto str1 = StringPrimitive::createNoThrow(runtime, "hello");
@@ -36,6 +210,21 @@ TEST_F(StringPrimTest, CreateTest) {
   EXPECT_TRUE(
       StringPrimitive::createStringView(runtime, str2)
           .equals(createUTF16Ref(u"foo")));
+}
+
+TEST_F(StringPrimTest, FullSliceRetainsPrimitive) {
+  for (auto input : {u"", u"a", u"unchanged", u"\u03b1\u03b2\u03b3"}) {
+    auto str = StringPrimitive::createNoThrow(runtime, createUTF16Ref(input));
+    auto full = StringPrimitive::slice(runtime, str, 0, str->getStringLength());
+    ASSERT_NE(full, ExecutionStatus::EXCEPTION);
+    EXPECT_EQ(full->getString(), str.get());
+  }
+  auto str = StringPrimitive::createNoThrow(runtime, "abcd");
+  auto part = StringPrimitive::slice(runtime, str, 1, 2);
+  ASSERT_NE(part, ExecutionStatus::EXCEPTION);
+  auto result = runtime.makeHandle(vmcast<StringPrimitive>(*part));
+  EXPECT_TRUE(StringPrimitive::createStringView(runtime, result)
+                  .equals(createUTF16Ref(u"bc")));
 }
 
 TEST_F(StringPrimTest, EqualityTest) {

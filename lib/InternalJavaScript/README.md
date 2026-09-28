@@ -8,6 +8,26 @@ The Promise Internal Bytecode is generated on the fly by running:
 $ utils/gen-promise-internal-bc.sh
 ```
 
+The optional native Promise core uses GC-traced internal state and native
+resolving functions and reactions. Enable it with
+`RuntimeConfig::Builder().withEnableNativePromise(true)` or `-Xnative-promise`.
+It is disabled by default and does not enable `HermesInternal` test methods.
+Combinators and subclass capability construction continue to use internal
+JavaScript, and reactions use the runtime's existing microtask queue.
+
+The bootstrap factory on `HermesInternal` is captured and deleted during
+internal initialization, before application code runs. Its returned operations
+must remain private to the Promise and async implementations. Activation also
+works when `EnableHermesInternal` is false.
+
+With `-fasync-generator-results`, the compiler supplies a private state machine
+and a completion record with `value` and `done` in slots 0 and 1. The native
+Promise core can drive that state machine directly, retaining its state in one
+reusable reaction instead of two JavaScript callbacks. The record layout and
+non-escape proof in `PeepholeLowering` are part of this internal contract.
+Ordinary generator execution keeps the JavaScript driver. Both paths observe
+Promise constructor access and use the same primitive cache and job queue.
+
 ## Iterator helpers
 
 The Iterator Helper polyfill is adapted from https://github.com/es-shims/iterator-helpers/ at commit fbd6ffee76f28c0aa1f99180d6971caa6a36f39c. The `Iterator.concat` polyfill was later adapted at commit `b790e7409435f3bd3f43edbf9dc1d962818d8f46`. The required dependencies are taken and flattened in `05-IteratorHelperDependencies.js` and the actual Iterator implementation are followed after the file. The dependencies may be simplified from the original source. Assertions from the polyfill, which threw `TypeError`s, are removed.

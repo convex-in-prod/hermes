@@ -199,6 +199,10 @@ uint64_t jsonStringToUint64(const ::hermes::parser::JSONValue *val) {
   if (auto *microtasks = rtConfig->get("MicrotasksQueue")) {
     conf.withMicrotaskQueue(llvh::cast<JSONBoolean>(microtasks)->getValue());
   }
+  if (auto *nativePromise = rtConfig->get("EnableNativePromise")) {
+    conf.withEnableNativePromise(
+        llvh::cast<JSONBoolean>(nativePromise)->getValue());
+  }
   if (auto *enableSampledStats = rtConfig->get("enableSampledStats")) {
     conf.withEnableSampledStats(
         llvh::cast<JSONBoolean>(enableSampledStats)->getValue());

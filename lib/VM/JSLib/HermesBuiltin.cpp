@@ -227,6 +227,97 @@ CallResult<HermesValue> hermesBuiltinThrowReferenceError(
 
 namespace {
 
+/// Copy a bounded, ordinary data-only record into a fresh empty object without
+/// creating an own-key array or performing one hidden-class transition per
+/// property. The source descriptors are still checked before adopting its layout.
+///
+/// This is deliberately narrower than the generic object-spread contract.
+/// The source must have only default enumerable data properties in contiguous
+/// named slots, and the target must be an empty, extensible ordinary object.
+/// Prototype identity is immaterial for own data properties; ordinary custom
+/// and null prototypes are therefore allowed.
+/// Every other case keeps the generic path below so getters, symbols, indexed
+/// properties and target identity remain observable.
+bool tryCopyFreshObjectDataProperties(
+    Runtime &runtime,
+    Handle<JSObject> target,
+    Handle<JSObject> source,
+    Handle<JSObject> excludedItems) {
+  if (excludedItems || target->getKind() != CellKind::JSObjectKind ||
+      source->getKind() != CellKind::JSObjectKind ||
+      target->isProxyObject() || target->isHostObject() ||
+      source->isProxyObject() || source->isHostObject() ||
+      !target->isExtensible() || target->hasPropertyStorage()) {
+    return false;
+  }
+
+  struct : public Locals {
+    PinnedValue<HiddenClass> sourceClass;
+  } lv;
+  LocalsRAII lraii(runtime, &lv);
+
+  auto *targetClass = target->getClass(runtime);
+  lv.sourceClass = source->getClass(runtime);
+  auto *sourceClass = lv.sourceClass.get();
+  // A fresh object with a medium-sized record is common at host object
+  // boundaries. Permit indirect slots, but keep the bound small enough that a
+  // rejected generic spread never turns into an unbounded allocation attempt.
+  constexpr unsigned kMaxProperties = 16;
+  if (targetClass->isDictionary() || targetClass->getNumProperties() != 0 ||
+      sourceClass->isDictionary() || sourceClass->getMayHaveAccessor() ||
+      sourceClass->getHasIndexLikeProperties() ||
+      sourceClass->getNumProperties() > kMaxProperties ||
+      source->getOwnIndexedRange(source.get(), runtime) !=
+          std::pair<uint32_t, uint32_t>{0, 0}) {
+    return false;
+  }
+
+  unsigned count = 0;
+  bool eligible = true;
+  HiddenClass::forEachPropertyNoAlloc(
+      sourceClass,
+      runtime,
+      [&count, &eligible](SymbolID id, NamedPropertyDescriptor desc) {
+        if (!eligible || count >= kMaxProperties || !id.isUniqued() ||
+            InternalProperty::isInternal(id) || desc.slot != count ||
+            desc.flags != PropertyFlags::defaultNewNamedPropertyFlags()) {
+          eligible = false;
+          return;
+        }
+        ++count;
+      });
+
+  if (!eligible || count != sourceClass->getNumProperties())
+    return false;
+
+  if (count <= JSObject::DIRECT_PROPERTY_SLOTS) {
+    // No allocation or user code can run after the checks above. The source
+    // slots are therefore stable while the target adopts the shared layout.
+    NoAllocScope noAlloc(runtime);
+    target->updateClassNoAllocPropStorageUnsafe(runtime, sourceClass);
+    for (unsigned i = 0; i < count; ++i) {
+      JSObject::setNamedSlotValueDirectUnsafe(
+          target.get(),
+          runtime,
+          i,
+          JSObject::getNamedSlotValueUnsafe(source.get(), runtime, i));
+    }
+  } else {
+    // addNewOwnPropertyInSlot allocates the target's indirect storage on the
+    // first out-of-line slot and when it grows. Reload the class from its root
+    // for every slot: collection updates the root, not the earlier raw pointer.
+    for (unsigned i = 0; i < count; ++i) {
+      JSObject::addNewOwnPropertyInSlot(
+          target.get(),
+          runtime,
+          lv.sourceClass.get(),
+          i,
+          JSObject::getNamedSlotValueUnsafe(source.get(), runtime, i));
+    }
+  }
+  return true;
+}
+
 CallResult<HermesValue> copyDataPropertiesSlowPath_RJS(
     Runtime &runtime,
     Handle<JSObject> target,
@@ -372,6 +463,9 @@ CallResult<HermesValue> hermesBuiltinCopyDataProperties(
   assert(
       (!excludedItems || !excludedItems->isProxyObject()) &&
       "excludedItems internal List is a Proxy");
+
+  if (tryCopyFreshObjectDataProperties(runtime, target, source, excludedItems))
+    return target.getHermesValue();
 
   // We cannot use the fast path if the object is a proxy, host object, or when
   // there could potentially be an accessor defined on the object. This is
@@ -1142,6 +1236,17 @@ CallResult<HermesValue> hermesBuiltinFastArraySlice(void *, Runtime &runtime) {
   return lv.result.getHermesValue();
 }
 
+/// Snapshot an actual array's nonconfigurable length without executing user
+/// code. Proxies and array-like objects must retain the generic builtin path.
+static CallResult<HermesValue> hermesBuiltinArrayIterationLength(
+    void *,
+    Runtime &runtime) {
+  auto value = runtime.getCurrentFrame().getNativeArgs().getArg(0);
+  auto *array = dyn_vmcast<JSArray>(value);
+  return HermesValue::encodeTrustedNumberValue(
+      array ? static_cast<double>(JSArray::getLength(array, runtime)) : -1);
+}
+
 void createHermesBuiltins(Runtime &runtime) {
   struct : public Locals {
     PinnedValue<NativeFunction> method;
@@ -1256,6 +1361,12 @@ void createHermesBuiltins(Runtime &runtime) {
       P::fastArraySlice,
       hermesBuiltinFastArraySlice,
       2);
+
+  defineInternMethod(
+      B::HermesBuiltin_arrayIterationLength,
+      P::arrayIterationLength,
+      hermesBuiltinArrayIterationLength,
+      1);
 
   // Define the 'requireFast' function, which takes a number argument.
   defineInternMethod(

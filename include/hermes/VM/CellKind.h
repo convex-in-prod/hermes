@@ -8,6 +8,8 @@
 #ifndef HERMES_VM_CELLKIND_H
 #define HERMES_VM_CELLKIND_H
 
+#include "hermes/VM/sh_mirror.h"
+
 #include <cstddef>
 #include <type_traits>
 
@@ -21,6 +23,10 @@ enum class CellKind {
   rangeName##Kind_first = first##Kind, rangeName##Kind_last = last##Kind,
 #include "hermes/VM/CellKinds.def"
 };
+
+#define CELL_KIND(name) \
+  static_assert(static_cast<unsigned>(CellKind::name##Kind) == SH_##name##Kind);
+#include "hermes/VM/CellKinds.def"
 
 // Verify the following order of consecutive ranges:
 // [CallableUnknownMakesThis, CallableMakesThis, CallableExpectsThis]

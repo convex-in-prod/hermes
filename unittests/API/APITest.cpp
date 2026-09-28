@@ -62,6 +62,46 @@ class HermesRuntimeCustomConfigTest : public ::testing::Test,
       : HermesRuntimeTestBase(makeHermesRuntime(runtimeConfig)) {}
 };
 
+TEST(HermesRuntimeConfigTest, NativePromiseActivation) {
+  EXPECT_FALSE(::hermes::vm::RuntimeConfig::getDefaultEnableNativePromise());
+  for (bool nativePromise : {false, true}) {
+    for (bool internals : {false, true}) {
+      for (bool testMethods : {false, true}) {
+        auto runtime = makeHermesRuntime(
+            ::hermes::vm::RuntimeConfig::Builder()
+                .withEnableNativePromise(nativePromise)
+                .withEnableHermesInternal(internals)
+                .withEnableHermesInternalTestMethods(testMethods)
+                .build());
+        auto inspect = [&](const char *code) {
+          return runtime->evaluateJavaScript(
+              std::make_shared<StringBuffer>(code), "native-promise-activation");
+        };
+        EXPECT_EQ(
+            inspect("Object.getOwnPropertyNames(Promise.resolve(1)).length")
+                .asNumber(),
+            nativePromise ? 0 : 4);
+        EXPECT_TRUE(inspect(R"JS(
+          !Object.prototype.hasOwnProperty.call(
+              HermesInternal, 'createNativePromiseCore') &&
+          typeof HermesInternal.createNativePromiseCore === 'undefined' &&
+          !Object.isExtensible(HermesInternal)
+        )JS").getBool());
+        EXPECT_EQ(
+            inspect("typeof HermesInternal.drainJobs === 'function'").getBool(),
+            internals && testMethods);
+        inspect(R"JS(
+          var observed = 0;
+          Promise.resolve(41).then(function (value) { observed = value + 1; });
+        )JS");
+        EXPECT_EQ(inspect("observed").asNumber(), 0);
+        runtime->drainMicrotasks();
+        EXPECT_EQ(inspect("observed").asNumber(), 42);
+      }
+    }
+  }
+}
+
 TEST(HermesRuntimeConfigTest, FinalizerThreadRunner) {
   struct RunnerState {
     std::atomic<bool> active{false};
@@ -1537,6 +1577,100 @@ TEST_P(HermesRuntimeTest, NativeExceptionDoesNotUseGlobalError) {
       "std::logic_error C++ exception in Host Function",
       test.call(*rt).getString(*rt).utf8(*rt));
 }
+
+TEST(HermesStringReuseTest, UTF8ConversionLifetimeAndIndependentResults) {
+  auto rt = makeHermesRuntime();
+  std::u16string units(80, u'x');
+  units.append({0xd800, 0, 0xdc00, 0xd83d, 0xde42, 0x0430});
+  const std::string expected = std::string(80, 'x') +
+      std::string("\xef\xbf\xbd\0\xef\xbf\xbd\xf0\x9f\x99\x82\xd0\xb0", 13);
+  auto input = String::createFromUtf16(*rt, units.data(), units.size());
+  EXPECT_EQ(input.utf8(*rt), expected);
+  {
+    auto outer = rt->createStringReuseScope();
+    auto first = input.utf8(*rt);
+    EXPECT_EQ(first, expected);
+    first[0] = 'z';
+    rt->instrumentation().collectGarbage("UTF-8 conversion cache");
+    EXPECT_EQ(input.utf8(*rt), expected);
+    {
+      auto inner = rt->createStringReuseScope();
+      EXPECT_EQ(input.utf8(*rt), expected);
+      rt->instrumentation().collectGarbage("nested UTF-8 conversion cache");
+    }
+    EXPECT_EQ(input.utf8(*rt), expected);
+  }
+  EXPECT_EQ(input.utf8(*rt), expected);
+  {
+    auto fresh = rt->createStringReuseScope();
+    EXPECT_EQ(input.utf8(*rt), expected);
+  }
+  try {
+    auto failing = rt->createStringReuseScope();
+    EXPECT_EQ(input.utf8(*rt), expected);
+    throw std::runtime_error("scope cleanup");
+  } catch (const std::runtime_error &) {
+  }
+  EXPECT_EQ(input.utf8(*rt), expected);
+}
+
+TEST(HermesStringReuseTest, UTF8ConversionBoundsAndChurn) {
+  auto rt = makeHermesRuntime();
+  std::vector<String> strings;
+  std::vector<std::string> expected;
+  for (unsigned i = 0; i < 40; ++i) {
+    const auto text = std::string(80 + i, 'x') + "\xd0\xb0";
+    strings.push_back(String::createFromUtf8(*rt, text));
+    expected.push_back(text);
+  }
+  auto scope = rt->createStringReuseScope();
+  for (unsigned repeat = 0; repeat < 3; ++repeat) {
+    for (unsigned i = 0; i < strings.size(); ++i) {
+      EXPECT_EQ(strings[i].utf8(*rt), expected[i]);
+      if (i % 3 == 0)
+        rt->instrumentation().collectGarbage("UTF-8 cache churn");
+    }
+  }
+  for (size_t length : {size_t{0}, size_t{63}, size_t{64}, size_t{8192},
+                        size_t{8193}, size_t{40000}}) {
+    std::u16string units(length, 0x0430);
+    std::string bytes;
+    for (size_t i = 0; i < length; ++i)
+      bytes += "\xd0\xb0";
+    auto input = String::createFromUtf16(*rt, units.data(), units.size());
+    auto fresh = rt->createStringReuseScope();
+    EXPECT_EQ(input.utf8(*rt), bytes);
+    EXPECT_EQ(input.utf8(*rt), bytes);
+  }
+}
+
+#if HERMES_ENABLE_CORE_EXTENSIONS
+TEST(HermesStringReuseTest, TextEncoderObservesCoercionAndReturnsFreshBytes) {
+  auto rt = makeHermesRuntime();
+  auto run = rt->evaluateJavaScript(std::make_shared<StringBuffer>(R"JS(
+    (() => {
+      const encoder = new TextEncoder();
+      const text = 'x'.repeat(80) + '\u0430';
+      let calls = 0;
+      const input = {toString() { if (++calls === 3) throw new Error('coercion'); return text; }};
+      let previous;
+      return function () {
+        const result = encoder.encode(input);
+        if (result.length !== 82 || result[0] !== 120 || result === previous ||
+            (previous && result.buffer === previous.buffer)) throw new Error('shared bytes');
+        previous = result;
+        result[0] = 0;
+        return calls;
+      };
+    })()
+  )JS"), "text-encoder-reuse").asObject(*rt).asFunction(*rt);
+  auto scope = rt->createStringReuseScope();
+  EXPECT_EQ(run.call(*rt).getNumber(), 1);
+  rt->instrumentation().collectGarbage("TextEncoder fresh bytes");
+  EXPECT_EQ(run.call(*rt).getNumber(), 2);
+  EXPECT_THROW(run.call(*rt), JSError);
+}
+#endif
 
 TEST_P(HermesRuntimeTest, UTF16ConversionTest) {
   String ascii = String::createFromUtf8(*rt, "z");
@@ -3694,3 +3828,304 @@ INSTANTIATE_TEST_CASE_P(
     HermesRuntimeTest,
     ::testing::ValuesIn(runtimeGenerators()));
 } // namespace
+
+TEST(HermesNativeValuesTest, ObjectShapesAndOwnProperties) {
+  auto rt = makeHermesRuntime();
+  std::vector<std::pair<std::string, Value>> fields;
+  fields.emplace_back("name", String::createFromUtf8(*rt, "first"));
+  fields.emplace_back("__proto__", 42);
+  fields.emplace_back("nested", Object(*rt));
+  auto first = rt->createObjectWithProperties(fields);
+  rt->global().setProperty(*rt, "first", first);
+  rt->evaluateJavaScript(std::make_shared<StringBuffer>(
+      "delete first.name; first.extra = 9;"), "test");
+  rt->instrumentation().collectGarbage("shape reuse");
+  auto second = rt->createObjectWithProperties(fields);
+  rt->global().setProperty(*rt, "second", second);
+  auto result = rt->evaluateJavaScript(std::make_shared<StringBuffer>(
+      "Object.getPrototypeOf(second) === Object.prototype && "
+      "Object.keys(second).join(',') === 'name,__proto__,nested' && "
+      "second.name === 'first' && second.__proto__ === 42 && "
+      "Object.getOwnPropertyDescriptor(second, '__proto__').writable"), "test");
+  EXPECT_TRUE(result.getBool());
+  std::vector<std::pair<std::string, Value>> indexed;
+  indexed.emplace_back("2", 20);
+  indexed.emplace_back("1", 10);
+  indexed.emplace_back("2", 21);
+  indexed.emplace_back("01", 30);
+  auto object = rt->createObjectWithProperties(indexed);
+  rt->global().setProperty(*rt, "indexed", object);
+  EXPECT_TRUE(rt->evaluateJavaScript(std::make_shared<StringBuffer>(
+      "Object.keys(indexed).join(',') === '1,2,01' && indexed[2] === 21"),
+      "test").getBool());
+  std::vector<Value> elements;
+  elements.emplace_back(*rt, second);
+  elements.emplace_back(3);
+  auto dense = rt->createArrayWithValues(elements);
+  EXPECT_EQ(dense.size(*rt), 2);
+  EXPECT_TRUE(Value::strictEquals(*rt, dense.getValueAtIndex(*rt, 0), Value(*rt, second)));
+  EXPECT_EQ(dense.getValueAtIndex(*rt, 1).getNumber(), 3);
+  // Cache eviction must release only templates, never returned documents.
+  for (int i = 0; i < 80; ++i) {
+    std::vector<std::pair<std::string, Value>> varying;
+    varying.emplace_back("field" + std::to_string(i), i);
+    varying.emplace_back("unique" + std::to_string(i), i);
+    rt->createObjectWithProperties(varying);
+  }
+  EXPECT_EQ(second.getProperty(*rt, "name").asString(*rt).utf8(*rt), "first");
+}
+
+TEST(HermesNativeValuesTest, StreamingConstructionAcrossCollectionAndEviction) {
+  auto rt = makeHermesRuntime();
+  const std::vector<std::string> keys{"first", "nested", "__proto__"};
+  size_t decoded = 0;
+  auto object = rt->createObjectFromEntries(
+      keys.size(), [&](size_t i) { return std::string_view(keys[i]); },
+      [&](size_t i) -> Value {
+        EXPECT_EQ(i, decoded++);
+        if (i == 0)
+          return String::createFromUtf8(*rt, "retained");
+        // Evict the enclosing layout while the partially filled object is
+        // rooted, and collect before writing each nested array element.
+        for (size_t j = 0; j < 80; ++j) {
+          std::string key = "nested" + std::to_string(j);
+          rt->createObjectFromEntries(
+              1, [&](size_t) { return std::string_view(key); },
+              [&](size_t) { return Value(static_cast<double>(j)); });
+        }
+        return rt->createArrayFromValues(3, [&](size_t j) -> Value {
+          rt->instrumentation().collectGarbage("streamed values");
+          return String::createFromUtf8(*rt, std::to_string(j));
+        });
+      });
+  rt->global().setProperty(*rt, "streamed", object);
+  EXPECT_TRUE(rt->evaluateJavaScript(std::make_shared<StringBuffer>(
+      "streamed.first === 'retained' && streamed.nested.join(',') === '0,1,2' && "
+      "streamed.__proto__.join(',') === '0,1,2' && "
+      "Object.getPrototypeOf(streamed) === Object.prototype && "
+      "Object.keys(streamed).join(',') === 'first,nested,__proto__'"),
+      "test").getBool());
+  const auto info = rt->instrumentation().getHeapInfo(false);
+  EXPECT_GT(info.at("hermes_objectLayoutEvictions"), 0);
+
+  // Dictionary objects must remain independent even after their shape changes.
+  std::vector<std::string> wideKeys;
+  for (size_t i = 0; i < 80; ++i)
+    wideKeys.push_back("field" + std::to_string(i));
+  auto makeWide = [&] {
+    return rt->createObjectFromEntries(
+        wideKeys.size(), [&](size_t i) { return std::string_view(wideKeys[i]); },
+        [&](size_t i) { return Value(static_cast<double>(i)); });
+  };
+  rt->global().setProperty(*rt, "wideFirst", makeWide());
+  rt->global().setProperty(*rt, "wideSecond", makeWide());
+  EXPECT_TRUE(rt->evaluateJavaScript(std::make_shared<StringBuffer>(
+      "delete wideFirst.field30; wideFirst.extra = 1; "
+      "wideSecond.field30 === 30 && !('extra' in wideSecond) && "
+      "Object.keys(wideSecond).length === 80"), "test").getBool());
+}
+
+TEST(HermesNativeValuesTest, ObjectLayoutHintsValidateKeysAndRuntime) {
+  HermesRuntime::ObjectLayoutHint hint;
+  auto rt = makeHermesRuntime();
+  size_t reads = 0;
+  size_t values = 0;
+  std::vector<std::string> keys{"first", "second"};
+  auto make = [&] {
+    values = 0;
+    return rt->createObjectFromEntriesWithHint(
+        keys.size(),
+        [&](size_t i) { ++reads; return std::string_view(keys[i]); },
+        [&](size_t i) {
+          EXPECT_EQ(i, values++);
+          rt->instrumentation().collectGarbage("hinted construction");
+          return Value(static_cast<double>(i));
+        }, hint);
+  };
+  make();
+  reads = 0;
+  auto object = make();
+  EXPECT_EQ(reads, keys.size());
+  EXPECT_EQ(object.getProperty(*rt, "second").getNumber(), 1);
+  EXPECT_EQ(rt->instrumentation().getHeapInfo(false).at("hermes_objectLayoutHintHits"), 1);
+
+  // Same count with different keys must not reuse the old slots. Index-like
+  // and duplicate keys still use ordinary definition and overwrite behavior.
+  keys = {"second", "first"};
+  object = make();
+  EXPECT_EQ(object.getProperty(*rt, "first").getNumber(), 1);
+  keys = {"2", "2"};
+  object = make();
+  EXPECT_EQ(object.getProperty(*rt, "2").getNumber(), 1);
+  EXPECT_EQ(object.getPropertyNames(*rt).size(*rt), 1);
+  keys = {"same", "same"};
+  object = make();
+  EXPECT_EQ(object.getProperty(*rt, "same").getNumber(), 1);
+  EXPECT_EQ(object.getPropertyNames(*rt).size(*rt), 1);
+
+  keys = {"first", "second"};
+  object = make();
+  EXPECT_THROW(rt->createObjectFromEntriesWithHint(
+      2, [&](size_t i) { return std::string_view(keys[i]); },
+      [&](size_t i) -> Value {
+        rt->instrumentation().collectGarbage("throwing hinted decoder");
+        if (i == 1)
+          throw JSINativeException("Decoder failed");
+        return String::createFromUtf8(*rt, "rooted before failure");
+      }, hint), JSINativeException);
+  EXPECT_EQ(make().getProperty(*rt, "second").getNumber(), 1);
+  auto other = makeHermesRuntime();
+  EXPECT_THROW(other->createObjectFromEntriesWithHint(
+      2, [&](size_t i) { return std::string_view(keys[i]); },
+      [&](size_t) { ADD_FAILURE() << "Foreign hint decoded a value"; return Value(0); },
+      hint), JSINativeException);
+}
+
+TEST(HermesNativeValuesTest, LayoutLookupSurvivesReentrantKeys) {
+  auto rt = makeHermesRuntime();
+  const std::vector<std::string> keys{"first", "second"};
+  rt->createObjectFromEntries(
+      keys.size(), [&](size_t i) { return std::string_view(keys[i]); },
+      [](size_t) { return Value(0); });
+  size_t reads = 0;
+  auto object = rt->createObjectFromEntries(
+      keys.size(),
+      [&](size_t i) {
+        // Two reads compute the hash; the third compares the cached layout.
+        if (++reads == 3) {
+          for (size_t j = 0; j < 80; ++j) {
+            const auto key = "eviction" + std::to_string(j);
+            rt->createObjectFromEntries(
+                1, [&](size_t) { return std::string_view(key); },
+                [](size_t) { return Value(1); });
+          }
+          rt->instrumentation().collectGarbage("reentrant layout keys");
+        }
+        return std::string_view(keys[i]);
+      },
+      [](size_t i) { return Value(static_cast<double>(i)); });
+  EXPECT_EQ(object.getProperty(*rt, "first").getNumber(), 0);
+  EXPECT_EQ(object.getProperty(*rt, "second").getNumber(), 1);
+}
+
+TEST(HermesNativeValuesTest, ObjectLayoutHintsExpireWithoutKeepingRoots) {
+  HermesRuntime::ObjectLayoutHint hint;
+  {
+    auto rt = makeHermesRuntime();
+    auto make = [&](std::string_view key) {
+      return rt->createObjectFromEntriesWithHint(
+          1, [&](size_t) { return key; },
+          [&](size_t) { return Value(7); }, hint);
+    };
+    auto retained = make("retained");
+    for (size_t i = 0; i < 80; ++i) {
+      const auto key = "new" + std::to_string(i);
+      rt->createObjectFromEntries(
+          1, [&](size_t) { return std::string_view(key); },
+          [&](size_t) { return Value(8); });
+    }
+    rt->instrumentation().collectGarbage("evicted hinted layout");
+    auto replacement = make("retained");
+    EXPECT_EQ(replacement.getProperty(*rt, "retained").getNumber(), 7);
+    EXPECT_EQ(retained.getProperty(*rt, "retained").getNumber(), 7);
+    EXPECT_EQ(rt->instrumentation().getHeapInfo(false).at("hermes_objectLayoutHintHits"), 0);
+  }
+  // The opaque weak hint remains safe to destroy or replace after its runtime.
+  auto next = makeHermesRuntime();
+  auto object = next->createObjectFromEntriesWithHint(
+      1, [](size_t) { return std::string_view("after"); },
+      [](size_t) { return Value(9); }, hint);
+  EXPECT_EQ(object.getProperty(*next, "after").getNumber(), 9);
+}
+
+TEST(HermesNativeValuesTest, HintLookupSurvivesReentrantEviction) {
+  auto rt = makeHermesRuntime();
+  HermesRuntime::ObjectLayoutHint hint;
+  const std::vector<std::string> keys{"first", "second"};
+  rt->createObjectFromEntriesWithHint(
+      keys.size(), [&](size_t i) { return std::string_view(keys[i]); },
+      [](size_t) { return Value(0); }, hint);
+  size_t reads = 0;
+  auto object = rt->createObjectFromEntriesWithHint(
+      keys.size(),
+      [&](size_t i) {
+        if (++reads == 1) {
+          for (size_t j = 0; j < 80; ++j) {
+            const auto key = "eviction" + std::to_string(j);
+            rt->createObjectFromEntries(
+                1, [&](size_t) { return std::string_view(key); },
+                [](size_t) { return Value(1); });
+          }
+          rt->instrumentation().collectGarbage("reentrant hinted keys");
+        }
+        return std::string_view(keys[i]);
+      },
+      [](size_t i) { return Value(static_cast<double>(i)); }, hint);
+  EXPECT_EQ(reads, keys.size());
+  EXPECT_EQ(object.getProperty(*rt, "first").getNumber(), 0);
+  EXPECT_EQ(object.getProperty(*rt, "second").getNumber(), 1);
+  auto before = rt->getObjectLayoutStatistics();
+  rt->createObjectFromEntriesWithHint(
+      keys.size(), [&](size_t i) { return std::string_view(keys[i]); },
+      [](size_t) { return Value(2); }, hint);
+  EXPECT_EQ(rt->getObjectLayoutStatistics().misses, before.misses + 1);
+}
+
+TEST(HermesNativeValuesTest, LayoutHitsRefreshEvictionOrder) {
+  auto rt = makeHermesRuntime();
+  std::array<HermesRuntime::ObjectLayoutHint, 65> hints;
+  auto make = [&](size_t i) {
+    auto key = "key" + std::to_string(i);
+    return rt->createObjectFromEntriesWithHint(
+        1, [&](size_t) { return std::string_view(key); },
+        [](size_t) { return Value(7); }, hints[i]);
+  };
+  for (size_t i = 0; i < 64; ++i)
+    make(i);
+  auto before = rt->getObjectLayoutStatistics();
+  // Move the oldest and a middle entry, then reuse the newest entry.
+  make(0);
+  make(32);
+  make(32);
+  make(64);
+  make(0);
+  make(32);
+  auto after = rt->getObjectLayoutStatistics();
+  EXPECT_EQ(after.hits, before.hits + 5);
+  EXPECT_EQ(after.misses, before.misses + 1);
+  EXPECT_EQ(after.evictions, before.evictions + 1);
+  make(1);
+  EXPECT_EQ(rt->getObjectLayoutStatistics().misses, after.misses + 1);
+  EXPECT_EQ(rt->getObjectLayoutStatistics().evictions, after.evictions + 1);
+}
+
+TEST(HermesNativeValuesTest, DescriptorSnapshots) {
+  auto rt = makeHermesRuntime();
+  auto eval = [&](const char *source) {
+    return rt->evaluateJavaScript(std::make_shared<StringBuffer>(source), "test");
+  };
+  auto object = eval(
+      "globalThis.key = Symbol('key'); globalThis.calls = 0;"
+      "globalThis.subject = { n: NaN, z: 0, [key]: 3, "
+      "get x() { ++calls; return 1; } }; subject").asObject(*rt);
+  auto keys = eval("Reflect.ownKeys(subject)").asObject(*rt).asArray(*rt);
+  auto matches = rt->createOwnPropertyValidator(object, keys, false);
+  rt->instrumentation().collectGarbage("snapshot roots");
+  EXPECT_TRUE(matches());
+  EXPECT_EQ(eval("calls").getNumber(), 0);
+  eval("subject.z = -0");
+  EXPECT_FALSE(matches());
+  eval("subject.z = 0; subject[key] = 4");
+  EXPECT_FALSE(matches());
+  eval("subject[key] = 3; Object.defineProperty(subject, 'x', {get() {return 1}})");
+  EXPECT_FALSE(matches());
+  auto current = rt->createOwnPropertyValidator(object, keys, false);
+  auto subset = rt->createOwnPropertyValidator(object, keys, true);
+  eval("subject.newField = 5");
+  EXPECT_FALSE(current());
+  EXPECT_TRUE(subset());
+  eval("delete subject.n");
+  EXPECT_FALSE(subset());
+  auto proxy = eval("new Proxy({}, {})").asObject(*rt);
+  EXPECT_THROW(rt->createOwnPropertyValidator(proxy, keys, false), JSINativeException);
+}

@@ -132,10 +132,25 @@ static cl::opt<bool> EmitCBundle(
     cl::init(false),
     cl::desc("Emit generated C as a manifest and multiple translation units"));
 
+static cl::opt<bool> SplitCExceptionDispatch(
+    "Xsplit-c-exceptions",
+    cl::init(false),
+    cl::desc("Separate exception dispatch from C bundle instruction bodies"));
+
 static cl::opt<unsigned> EmitCShardSize(
     "Xemit-c-shard-size",
     cl::init(2 * 1024 * 1024),
     cl::desc("Target function-body bytes per generated C translation unit"));
+
+static cl::opt<bool> EmitCBundleLayout(
+    "Xemit-c-layout",
+    cl::init(false),
+    cl::desc("Emit reusable function, cache and string assignments beside the C bundle"));
+
+static cl::opt<std::string> CBundleLayoutInput(
+    "Xc-layout-input",
+    cl::init(""),
+    cl::desc("Authenticated metadata layout from a previous C bundle"));
 
 cl::opt<DebugLevel> DebugInfoLevel(
     cl::desc("Choose debug info level:"),
@@ -216,6 +231,85 @@ cl::opt<bool> KeepTemp(
     "keep-temp",
     cl::init(false),
     cl::desc("Keep temporary files made along the way (for debugging)"),
+    cl::cat(CompilerCategory));
+
+cl::opt<bool> StaticMathBuiltins(
+    "fstatic-math-builtins",
+    cl::desc("Recognize original Math methods except random statically"),
+    cl::init(false),
+    cl::cat(CompilerCategory));
+
+cl::opt<bool> GuardedRecordLoads(
+    "fguarded-record-loads",
+    cl::desc("Reuse record fields within guarded regions without intervening effects"),
+    cl::init(false),
+    cl::cat(CompilerCategory));
+
+cl::opt<bool> GuardedDataPropertyDefinitions(
+    "fguarded-data-property-definitions",
+    cl::desc("Fuse guarded ordinary data-property construction sequences"),
+    cl::init(false),
+    cl::cat(CompilerCategory));
+
+cl::opt<bool> GuardedByteArrayLoops(
+    "fguarded-byte-array-loops",
+    cl::desc("Specialize effect-free numeric loops over guarded byte arrays"),
+    cl::init(false),
+    cl::cat(CompilerCategory));
+
+cl::opt<bool> InlineRecordReturns(
+    "finline-record-returns",
+    cl::desc("Inline bounded record producers to eliminate unpacked return objects"),
+    cl::init(false),
+    cl::cat(CompilerCategory));
+
+cl::opt<bool> AsyncFrameArguments(
+    "fasync-frame-arguments",
+    cl::desc("Avoid intermediate argument objects in internal async startup"),
+    cl::init(false),
+    cl::cat(CompilerCategory));
+
+cl::opt<bool> AsyncGeneratorResults(
+    "fasync-generator-results",
+    cl::desc("Remove private async generator wrappers and reuse completion records"),
+    cl::init(false),
+    cl::cat(CompilerCategory));
+
+cl::opt<bool> NativeIntegerRegisters(
+    "fnative-integer-registers",
+    cl::desc("Store proved integer temporaries in native integer registers"),
+    cl::init(false),
+    cl::cat(CompilerCategory));
+
+cl::opt<bool> GuardedMethodCalls(
+    "fguarded-method-calls",
+    cl::desc("Expose method bodies behind exact closure identity guards"),
+    cl::init(false),
+    cl::cat(CompilerCategory));
+
+cl::opt<bool> ScopedNormalizationReuse(
+    "fscoped-normalization-reuse",
+    cl::desc("Reuse proved string helper results within an embedding-owned invocation scope"),
+    cl::init(false),
+    cl::cat(CompilerCategory));
+
+cl::opt<bool> StringTrimComparisons(
+    "fstring-trim-comparisons",
+    cl::desc("Compare primitive strings with their trimmed form without materializing it"),
+    cl::init(false),
+    cl::cat(CompilerCategory));
+
+cl::opt<bool> ArrayCallbacks(
+    "farray-callbacks",
+    cl::desc("Expose known array callbacks behind intrinsic and receiver guards"),
+    cl::init(false),
+    cl::cat(CompilerCategory));
+
+cl::opt<bool> StaticObjectPrototype(
+    "fstatic-object-prototype",
+    cl::desc(
+        "Assume Object.prototype is nonextensible, null-parented, and has only standard string keys"),
+    cl::init(false),
     cl::cat(CompilerCategory));
 
 cl::opt<StaticBuiltinSetting> StaticBuiltins(
@@ -632,6 +726,11 @@ std::shared_ptr<Context> createContext() {
   optimizationOpts.inlining =
       cli::OptimizationLevel != OptLevel::O0 && cli::Inline;
   optimizationOpts.inlineMaxSize = cli::InlineMaxSize;
+  optimizationOpts.staticHermesInlining = true;
+  optimizationOpts.inlineRecordReturns = cli::InlineRecordReturns;
+  optimizationOpts.asyncFrameArguments =
+      cli::AsyncFrameArguments || cli::AsyncGeneratorResults;
+  optimizationOpts.asyncGeneratorResults = cli::AsyncGeneratorResults;
 
   optimizationOpts.reusePropCache = cli::ReusePropCache;
 
@@ -643,6 +742,17 @@ std::shared_ptr<Context> createContext() {
   // parsing.
   optimizationOpts.staticBuiltins =
       cli::StaticBuiltins == StaticBuiltinSetting::ForceOn;
+  optimizationOpts.staticMathBuiltins = cli::StaticMathBuiltins;
+  optimizationOpts.staticObjectPrototype = cli::StaticObjectPrototype;
+  optimizationOpts.arrayCallbacks = cli::ArrayCallbacks;
+  optimizationOpts.guardedRecordLoads = cli::GuardedRecordLoads;
+  optimizationOpts.guardedDataPropertyDefinitions =
+      cli::GuardedDataPropertyDefinitions;
+  optimizationOpts.guardedByteArrayLoops = cli::GuardedByteArrayLoops;
+  optimizationOpts.guardedMethodCalls = cli::GuardedMethodCalls;
+  optimizationOpts.scopedNormalizationReuse = cli::ScopedNormalizationReuse;
+  optimizationOpts.stringTrimComparisons = cli::StringTrimComparisons;
+  optimizationOpts.nativeIntegerRegisters = cli::NativeIntegerRegisters;
 
   optimizationOpts.metroRequireOpt = cli::MetroRequireOpt;
 
@@ -933,6 +1043,19 @@ bool compileFromCommandLineOptions() {
     llvh::errs() << "Error: -Xemit-c-shard-size must be positive.\n";
     return false;
   }
+  if (cli::SplitCExceptionDispatch && !cli::EmitCBundle) {
+    llvh::errs() << "Error: -Xsplit-c-exceptions requires -Xemit-c-bundle.\n";
+    return false;
+  }
+  if ((cli::EmitCBundleLayout || !cli::CBundleLayoutInput.empty()) &&
+      !cli::EmitCBundle) {
+    llvh::errs() << "Error: retained C layout requires -Xemit-c-bundle.\n";
+    return false;
+  }
+  if (!cli::CBundleLayoutInput.empty() && !cli::EmitCBundleLayout) {
+    llvh::errs() << "Error: -Xc-layout-input requires -Xemit-c-layout.\n";
+    return false;
+  }
   if (!cli::ExportedUnit.empty()) {
     if (cli::OutputLevel == OutputLevelKind::Run ||
         cli::OutputLevel == OutputLevelKind::Executable) {
@@ -1082,7 +1205,10 @@ bool compileFromCommandLineOptions() {
 
   genOptions.smallC = cli::SmallC;
   genOptions.emitCBundle = cli::EmitCBundle;
+  genOptions.splitCExceptionDispatch = cli::SplitCExceptionDispatch;
   genOptions.cBundleShardSize = cli::EmitCShardSize;
+  genOptions.emitCBundleLayout = cli::EmitCBundleLayout;
+  genOptions.cBundleLayoutInput = cli::CBundleLayoutInput;
 
   genOptions.emitSourceLocations =
       cli::DumpSourceLocation != LocationDumpMode::None;

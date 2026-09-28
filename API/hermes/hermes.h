@@ -13,6 +13,9 @@
 #include <memory>
 #include <ostream>
 #include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 #include <hermes/Public/HermesExport.h>
 #include <hermes/Public/RuntimeConfig.h>
@@ -205,6 +208,96 @@ class HermesRuntime : public jsi::Runtime,
   ~HermesRuntime() override = default;
 
   using jsi::Runtime::castInterface;
+
+  /// Snapshot own enumerable string properties in Object.entries order without
+  /// allocating an entries array and pair arrays in the JavaScript heap.
+  /// Getters and proxy traps run in the same order as Object.entries.
+  virtual std::vector<std::pair<jsi::String, jsi::Value>>
+  getOwnEnumerableEntries(const jsi::Object &object) = 0;
+
+  struct ObjectLayoutStatistics {
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t evictions;
+    uint64_t fallbacks;
+  };
+
+  /// Read cumulative construction counters without allocating or collecting.
+  virtual ObjectLayoutStatistics getObjectLayoutStatistics() const = 0;
+
+  /// Construct ordinary own data properties, bypassing inherited setters.
+  /// Repeated small non-indexed shapes reuse runtime-local keys and slots.
+  virtual jsi::Object createObjectWithProperties(
+      const std::vector<std::pair<std::string, jsi::Value>> &properties) = 0;
+
+  /// Decode into final rooted storage. Keys must remain valid for the call and
+  /// may be read repeatedly; values are read once each, in index order. Neither
+  /// callback may change the keys. No callback receives the unfinished object.
+  virtual jsi::Object createObjectFromEntries(
+      size_t count,
+      const std::function<std::string_view(size_t)> &keyAt,
+      const std::function<jsi::Value(size_t)> &valueAt) = 0;
+
+  /// Construct dense own array elements without property setters.
+  virtual jsi::Array createArrayWithValues(
+      const std::vector<jsi::Value> &values) = 0;
+
+  /// Read each element once, in order, into final rooted array storage.
+  virtual jsi::Array createArrayFromValues(
+      size_t count,
+      const std::function<jsi::Value(size_t)> &valueAt) = 0;
+
+  /// Capture descriptors without invoking accessors. The returned check must
+  /// not outlive this runtime. Extra keys are allowed only when requested.
+  /// Rejects proxies and host objects; intended for intrinsic state checks.
+  virtual std::function<bool()> createOwnPropertyValidator(
+      const jsi::Object &object,
+      const jsi::Array &keys,
+      bool allowAdditionalProperties) = 0;
+
+  /// A non-owning hint for repeated construction with similar keys. It retains
+  /// no objects and may outlive its runtime; eviction makes it empty. Only the
+  /// originating runtime can consume a live hint. Keys are checked before reuse.
+  class ObjectLayoutHint {
+   public:
+    ObjectLayoutHint() = default;
+
+   private:
+    friend class HermesRuntime;
+    struct Storage;
+    std::weak_ptr<Storage> storage_;
+  };
+
+  /// Bound string-result reuse to one embedding invocation. Scopes must be
+  /// destroyed in reverse creation order, before their runtime. No values are
+  /// retained after destruction. This does not authorize arbitrary JS memoization;
+  /// only compiler-proved, guarded string computations can use the scope.
+  class StringReuseScope {
+   public:
+    struct Statistics {
+      uint64_t hits;
+      uint64_t misses;
+      uint64_t stores;
+    };
+    virtual ~StringReuseScope() = default;
+    virtual Statistics statistics() const = 0;
+  };
+  virtual std::unique_ptr<StringReuseScope> createStringReuseScope() = 0;
+
+  /// As createObjectFromEntries, reusing a validated layout when the hint's keys
+  /// match. Mismatches and retired hints use the ordinary bounded layout cache.
+  virtual jsi::Object createObjectFromEntriesWithHint(
+      size_t count,
+      const std::function<std::string_view(size_t)> &keyAt,
+      const std::function<jsi::Value(size_t)> &valueAt,
+      ObjectLayoutHint &hint) = 0;
+
+ protected:
+  using ObjectLayoutStorage = ObjectLayoutHint::Storage;
+  static std::weak_ptr<ObjectLayoutStorage> &objectLayoutHintStorage(
+      ObjectLayoutHint &hint) {
+    return hint.storage_;
+  }
 };
 
 /// Returns a pointer to an object that can be cast into IHermesRootAPI, which

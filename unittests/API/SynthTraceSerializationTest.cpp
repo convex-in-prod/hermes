@@ -316,6 +316,9 @@ TEST_F(SynthTraceSerializationTest, TraceHeader) {
   EXPECT_EQ(conf.getES6Proxy(), rtConfig.getProperty(*rt, "ES6Proxy").asBool());
   EXPECT_EQ(conf.getIntl(), rtConfig.getProperty(*rt, "Intl").asBool());
   EXPECT_EQ(
+      conf.getEnableNativePromise(),
+      rtConfig.getProperty(*rt, "EnableNativePromise").asBool());
+  EXPECT_EQ(
       conf.getEnableSampledStats(),
       rtConfig.getProperty(*rt, "enableSampledStats").asBool());
   EXPECT_EQ(

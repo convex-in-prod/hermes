@@ -47,6 +47,7 @@ class KindAndSize {
   // so that it can be accessed without any masking or shifting.
   static constexpr size_t kNumSizeBits =
       std::min<size_t>(kNumBits - kNumKindBits, 32);
+  static_assert(kNumSizeBits == SH_CELL_KIND_SHIFT);
   static_assert(
       kNumCellKinds < 256,
       "More cell kinds than available kind bits.");

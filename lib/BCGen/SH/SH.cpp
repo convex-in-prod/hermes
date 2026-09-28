@@ -7,6 +7,7 @@
 
 #include "hermes/BCGen/SH/SH.h"
 
+#include "CBundleLayout.h"
 #include "LineDirectiveEmitter.h"
 #include "LoweringPasses.h"
 #include "SHRegAlloc.h"
@@ -25,15 +26,20 @@
 #include "hermes/IR/IR.h"
 #include "hermes/IR/IRVerifier.h"
 #include "hermes/IR/Instrs.h"
+#include "hermes/Optimizer/Scalar/Utils.h"
 #include "hermes/Support/BigIntSupport.h"
 #include "hermes/Support/DenseMapInfoSpecializations.h"
 #include "hermes/Support/HashString.h"
 #include "hermes/Support/UTF8.h"
+#include "hermes/VMLayouts/PropertyCache.h"
 #include "hermes/VMLayouts/StackFrameLayout.h"
 #include "llvh/ADT/MapVector.h"
 
 #include "llvh/ADT/BitVector.h"
 #include "llvh/ADT/SetVector.h"
+#include "llvh/ADT/StringSet.h"
+#include "llvh/Support/JSON.h"
+#include "llvh/Support/MemoryBuffer.h"
 
 #include <iterator>
 
@@ -53,9 +59,100 @@ const char *boolStr(bool b) {
   return b ? "true" : "false";
 }
 
+constexpr size_t kRetainedStringSlots = 256 * 1024;
+constexpr size_t kRetainedStringBytes = 8 * 1024 * 1024;
+constexpr size_t kRetainedLayoutBytes = 32 * 1024 * 1024;
+constexpr const char *kProhibitConstructMessage = "Function is not a constructor";
+constexpr const char *kProhibitCallMessage =
+    "Class constructor invoked without new";
+
+bool readRetainedLayout(
+    Module *M,
+    const BytecodeGenerationOptions &options,
+    std::vector<std::string> &strings,
+    sh::CBundleFunctionLayout &functionLayout) {
+  if (options.cBundleLayoutInput.empty())
+    return true;
+  auto reject = [&]() {
+    M->getContext().getSourceErrorManager().error(
+        SMLoc{}, "Invalid retained Static Hermes C layout");
+    return false;
+  };
+  auto buffer = llvh::MemoryBuffer::getFile(options.cBundleLayoutInput);
+  if (!buffer || (*buffer)->getBufferSize() > kRetainedLayoutBytes)
+    return reject();
+  auto parsed = llvh::json::parse((*buffer)->getBuffer());
+  if (!parsed) {
+    llvh::consumeError(parsed.takeError());
+    return reject();
+  }
+  const auto *object = parsed->getAsObject();
+  if (!object || object->size() != (object->get("literals") ? 7 : 6) ||
+      object->getString("kind") !=
+          llvh::StringRef("static-hermes-c-layout-v1") ||
+      object->getString("unitName") != options.unitName)
+    return reject();
+  if (const auto *literals = object->get("literals")) {
+    if (!functionLayout.readLiterals(*literals))
+      return reject();
+  }
+  const auto *functions = object->getArray("functions");
+  if (!functions || !functionLayout.read(*functions))
+    return reject();
+  const auto *scopes = object->getArray("scopes");
+  if (!scopes || !functionLayout.readScopes(*scopes))
+    return reject();
+  const auto *shards = object->getArray("shards");
+  if (!shards || !functionLayout.readShards(*shards))
+    return reject();
+  const auto *slots = object->getArray("strings");
+  if (!slots || slots->size() > kRetainedStringSlots)
+    return reject();
+  llvh::StringSet<> seen;
+  size_t bytes = 0;
+  for (const auto &slot : *slots) {
+    auto encoded = slot.getAsString();
+    if (!encoded || encoded->size() % 2 != 0 ||
+        encoded->size() / 2 > kRetainedStringBytes - bytes)
+      return reject();
+    std::string decoded;
+    decoded.reserve(encoded->size() / 2);
+    unsigned byte = 0;
+    for (size_t index = 0; index < encoded->size(); ++index) {
+      char c = (*encoded)[index];
+      if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+        return reject();
+      byte = byte * 16 + (c <= '9' ? c - '0' : c - 'a' + 10);
+      if (index % 2 == 1) {
+        decoded.push_back(static_cast<char>(byte));
+        byte = 0;
+      }
+    }
+    const size_t size = decoded.size();
+    // The decoder assumes enough readable bytes for a complete code point.
+    // Padding makes truncated externally supplied strings safe to reject.
+    decoded.append(UTF8CodepointMaxBytes, '\0');
+    const char *cursor = decoded.data();
+    const char *end = cursor + size;
+    bool valid = true;
+    while (cursor < end && valid)
+      decodeUTF8<true>(cursor, [&](const llvh::Twine &) { valid = false; });
+    decoded.resize(size);
+    if (!valid)
+      return reject();
+    if (!seen.insert(decoded).second)
+      return reject();
+    bytes += decoded.size();
+    strings.push_back(std::move(decoded));
+  }
+  return true;
+}
+
 /// Helper to unique and store the contents of strings.
 class SHStringTable {
   StringSetVector strings_;
+  std::vector<bool> used_;
+  bool hasRetainedStrings_;
 
   /// Append a printable representation of the character \p c, that when
   /// enclosed in single quotes in a C file, will produce the same character.
@@ -84,6 +181,16 @@ class SHStringTable {
   }
 
  public:
+  explicit SHStringTable(llvh::ArrayRef<std::string> retained = {})
+      : hasRetainedStrings_(!retained.empty()) {
+    for (const auto &str : retained) {
+      const auto index = strings_.insert(str);
+      assert(index == used_.size() && "retained strings must be unique");
+      (void)index;
+      used_.push_back(false);
+    }
+  }
+
   /// \return the current number of strings in the table.
   uint32_t size() const {
     return strings_.size();
@@ -92,7 +199,91 @@ class SHStringTable {
   /// Add the string \p str to the table if it is not already in it.
   /// \return the index associated with str.
   uint32_t add(llvh::StringRef str) {
-    return strings_.insert(str);
+    const auto index = strings_.insert(str);
+    if (hasRetainedStrings_) {
+      if (index == used_.size())
+        used_.push_back(true);
+      else
+        used_[index] = true;
+    }
+    return index;
+  }
+
+  bool needsCompaction() const {
+    if (!hasRetainedStrings_)
+      return false;
+    size_t liveSlots = 0, liveBytes = 0, retiredBytes = 0;
+    size_t index = 0;
+    for (const auto &str : strings_) {
+      if (used_[index++]) {
+        ++liveSlots;
+        liveBytes += str.size();
+      } else {
+        retiredBytes += str.size();
+      }
+    }
+    return strings_.size() - liveSlots > std::max<size_t>(1024, liveSlots / 4) ||
+        retiredBytes > std::max<size_t>(64 * 1024, liveBytes / 4);
+  }
+
+  void generateLayout(
+      llvh::raw_ostream &os,
+      llvh::StringRef unitName,
+      const sh::CBundleFunctionLayout &functionLayout) const {
+    llvh::json::Array slots;
+    size_t bytes = 0;
+    const char *hex = "0123456789abcdef";
+    const bool reset = needsCompaction();
+    for (const auto &str : strings_) {
+      // A reset applies to the next compilation. This emission already used
+      // the retained indices and must not replace its table underneath them.
+      if (reset)
+        break;
+      // Retain a bounded prefix even for unusually large live tables. Numeric
+      // slots outside that prefix are regenerated from the next source input.
+      if (slots.size() == kRetainedStringSlots ||
+          str.size() > kRetainedStringBytes - bytes)
+        break;
+      std::string encoded;
+      encoded.reserve(str.size() * 2);
+      for (unsigned char c : str) {
+        encoded += hex[c >> 4];
+        encoded += hex[c & 15];
+      }
+      bytes += str.size();
+      slots.push_back(std::move(encoded));
+    }
+    // Hex preserves the exact internal string bytes, including lone surrogates
+    // which cannot round-trip through an ordinary UTF-8 JSON string.
+    auto functions = functionLayout.generate();
+    auto scopes = functions.empty() ? llvh::json::Array{}
+                                   : functionLayout.generateScopes();
+    auto shards = functions.empty() ? llvh::json::Array{}
+                                   : functionLayout.generateShards();
+    llvh::json::Value layout(llvh::json::Object{
+        {"kind", "static-hermes-c-layout-v1"},
+        {"literals", functionLayout.generateLiterals()},
+        {"functions", std::move(functions)},
+        {"scopes", std::move(scopes)},
+        {"shards", std::move(shards)},
+        {"strings", std::move(slots)},
+        {"unitName", unitName},
+    });
+    std::string encoded;
+    llvh::raw_string_ostream encodedOS(encoded);
+    encodedOS << layout << '\n';
+    encodedOS.flush();
+    if (encoded.size() > kRetainedLayoutBytes) {
+      // Independently bounded tables can exceed the combined input budget.
+      // Drop function hints for the next build; the bounded string prefix fits.
+      (*layout.getAsObject())["functions"] = llvh::json::Array{};
+      (*layout.getAsObject())["scopes"] = llvh::json::Array{};
+      (*layout.getAsObject())["shards"] = llvh::json::Array{};
+      (*layout.getAsObject())["literals"] = nullptr;
+      os << layout << '\n';
+    } else {
+      os << encoded;
+    }
   }
 
   /// Turn the table of strings into the SH C data structures that are necessary
@@ -196,13 +387,16 @@ class SHLiteralBuffers {
   explicit SHLiteralBuffers(
       Module *M,
       SHStringTable &table,
-      bool optimizationEnabled) {
+      bool optimizationEnabled,
+      sh::CBundleFunctionLayout *layout) {
     LiteralBufferBuilder::Result bufs = LiteralBufferBuilder::generate(
         M,
         [](const Function *) { return true; },
         [&table](llvh::StringRef str) { return table.add(str); },
         [&table](llvh::StringRef str) { return table.add(str); },
-        optimizationEnabled);
+        optimizationEnabled,
+        nullptr,
+        layout ? &layout->literalBuffers() : nullptr);
     literalValueBuffer = std::move(bufs.literalValBuffer);
     objKeyBuffer = std::move(bufs.keyBuffer);
     objShapeTable = std::move(bufs.shapeTable);
@@ -362,16 +556,19 @@ class SHNativeJSFunctionTable {
   SHStringTable &stringTable_;
   /// Prefix used to give cross-translation-unit symbols unique linkage.
   std::string bundlePrefix_;
+  sh::CBundleFunctionLayout *layout_;
 
  public:
   explicit SHNativeJSFunctionTable(
       Module *M,
       SHStringTable &stringTable,
-      llvh::StringRef bundleUnitName = {})
+      llvh::StringRef bundleUnitName = {},
+      sh::CBundleFunctionLayout *layout = nullptr)
       : stringTable_(stringTable),
         bundlePrefix_(bundleUnitName.empty()
                           ? std::string{}
-                          : ("sh_" + bundleUnitName + "_").str()) {
+                          : ("sh_" + bundleUnitName + "_").str()),
+        layout_(layout) {
     // Ensure that the top level function has an id of 0.
     auto topLevelFunc = M->getTopLevelFunction();
     funcMap_[topLevelFunc] = 0;
@@ -385,9 +582,15 @@ class SHNativeJSFunctionTable {
     }
   }
 
+  /// Dense declaration-bitset ordinal, independent of runtime slots and
+  /// retained shard emission order.
   /// \return the unique index for the given \p F.
   uint32_t getIndex(Function *F) const {
     return funcMap_.find(F)->second;
+  }
+
+  uint32_t getRuntimeIndex(Function *F) const {
+    return layout_ ? layout_->getSlot(F) : getIndex(F);
   }
 
   /// \return size of the function table.
@@ -408,7 +611,10 @@ class SHNativeJSFunctionTable {
   void generateFunctionLabel(Function *F, llvh::raw_ostream &OS) const {
     if (!bundlePrefix_.empty())
       OS << bundlePrefix_ << 'f';
-    OS << '_' << getIndex(F) << '_';
+    OS << '_' << getRuntimeIndex(F);
+    if (layout_)
+      return;
+    OS << '_';
 
     auto name = F->getInternalNameStr();
     for (auto c : name) {
@@ -440,7 +646,7 @@ class SHNativeJSFunctionTable {
       Function *F,
       llvh::raw_ostream &OS) const {
     assert(isBundle() && "outlined state requires bundle labels");
-    OS << bundlePrefix_ << "f_" << getIndex(F) << "_state";
+    OS << bundlePrefix_ << "f_" << getRuntimeIndex(F) << "_state";
   }
 
   void generateOutlinedPartLabel(
@@ -448,7 +654,7 @@ class SHNativeJSFunctionTable {
       uint32_t part,
       llvh::raw_ostream &OS) const {
     assert(isBundle() && "outlined part requires bundle labels");
-    OS << bundlePrefix_ << "f_" << getIndex(F) << "_part_"
+    OS << bundlePrefix_ << "f_" << getRuntimeIndex(F) << "_part_"
        << llvh::format("%05u", part);
   }
 
@@ -456,21 +662,62 @@ class SHNativeJSFunctionTable {
     return !bundlePrefix_.empty();
   }
 
+  /// Keep address-taken function slots and shared error literals ahead of
+  /// changing pools. The metadata object must precede the function objects at
+  /// link time. A deleted function keeps a distinct, unreachable table entry
+  /// until the retained layout is compacted. The function is retained but never
+  /// called: a pointer array would add a relocation for every slot at startup.
+  /// One used data reference keeps the helper through linker GC without making
+  /// it an exported Emscripten entry point.
+  void generateLinkerAnchors(llvh::raw_ostream &OS) const {
+    assert(isBundle() && layout_ && "linker anchors require retained slots");
+    const auto functions = layout_->functionsBySlot();
+    OS << "#if defined(__wasm__)\n";
+    for (uint32_t slot = 0; slot < functions.size(); ++slot) {
+      OS << "SH_BUNDLE_HIDDEN SHLegacyValue " << bundlePrefix_
+         << (functions[slot] ? "f_" : "linker_removed_") << slot
+         << "(SHRuntime *shr)";
+      if (functions[slot])
+        OS << ";\n";
+      else
+        OS << " { __builtin_trap(); }\n";
+    }
+    OS << "static void s_linker_functions(\n"
+          "    NativeJSFunctionPtr volatile *out) {\n";
+    for (uint32_t slot = 0; slot < functions.size(); ++slot)
+      OS << "  out[" << slot << "] = " << bundlePrefix_
+         << (functions[slot] ? "f_" : "linker_removed_") << slot << ";\n";
+    OS << "}\n"
+       << "__attribute__((used)) static void (*const s_linker_function_root)(\n"
+          "    NativeJSFunctionPtr volatile *) = s_linker_functions;\n"
+       << "__attribute__((used)) static const char *const "
+          "s_linker_messages[] = {\n"
+       << "  \"" << kProhibitCallMessage << "\",\n"
+       << "  \"" << kProhibitConstructMessage << "\",\n"
+       << "  \"sh_compiled\",\n"
+       << "};\n#endif\n\n";
+  }
+
   /// Turn the table of function information into the corresponding SH C data
   /// structures.
   void generate(llvh::raw_ostream &OS) const {
     // Sort the keys by function index.
-    std::vector<const Function *> sortedKeys{funcMap_.size()};
-    for (auto &entry : funcMap_)
-      sortedKeys[entry.second] = entry.first;
+    auto sortedKeys = layout_ ? layout_->functionsBySlot() : functionsByIndex();
 
     if (isBundle())
       OS << "\nSH_BUNDLE_HIDDEN SHNativeFuncInfo ";
     else
       OS << "\nstatic SHNativeFuncInfo ";
     generateFunctionInfoTableLabel(OS);
-    OS << "[] = {\n";
+    OS << "[]";
+    if (layout_)
+      OS << " SH_BUNDLE_LINKAGE_DATA(\"function_info\")";
+    OS << " = {\n";
     for (const Function *F : sortedKeys) {
+      if (!F) {
+        OS << "  {0},\n";
+        continue;
+      }
       uint32_t nameIdx = stringTable_.add(F->getOriginalOrInferredName().str());
       uint32_t argCount = F->getExpectedParamCountIncludingThis() - 1;
       auto kindVal = F->getKind();
@@ -485,6 +732,9 @@ class SHNativeJSFunctionTable {
 };
 
 struct ModuleGen {
+  sh::CBundleFunctionLayout *functionLayout;
+  uint32_t nextComputedReadCacheIdx{0};
+  uint32_t nextComputedWriteCacheIdx{0};
   /// Table containing uniqued strings for the current module.
   SHStringTable stringTable{};
 
@@ -501,10 +751,14 @@ struct ModuleGen {
   explicit ModuleGen(
       Module *M,
       bool optimizationEnabled,
-      llvh::StringRef bundleUnitName = {})
-      : literalBuffers{M, stringTable, optimizationEnabled},
+      llvh::StringRef bundleUnitName = {},
+      llvh::ArrayRef<std::string> retainedStrings = {},
+      sh::CBundleFunctionLayout *layout = nullptr)
+      : functionLayout{layout},
+        stringTable{retainedStrings},
+        literalBuffers{M, stringTable, optimizationEnabled, layout},
         srcLocationTable{stringTable},
-        nativeFunctionTable{M, stringTable, bundleUnitName} {}
+        nativeFunctionTable{M, stringTable, bundleUnitName, layout} {}
 };
 
 /// \return true if the SHLegacyValue representations of values \p a and \p b
@@ -569,12 +823,26 @@ class InstrGen {
         tryIDs_(tryIDs),
         enclosingTrys_(enclosingTrys),
         registerStorage_(registerStorage) {
+    if (options.splitCExceptionDispatch &&
+        registerStorage == RegisterStorage::StatePointer) {
+      tryStateName_ = "exceptionState->tryState";
+      jmpBufAddress_ = "&exceptionState->jmpBuf";
+    }
     (void)options_;
+    selectIntegerRegisters();
+  }
+
+  uint8_t integerRegisterRange(unsigned index) const {
+    return integerRegisters_.empty() ? 0 : integerRegisters_[index];
   }
 
   /// Converts Instruction \p I into valid C code and outputs it through the
   /// ostream.
   void generate(Instruction &I) {
+    if (nativeIntegerRange(&I)) {
+      generateIntegerInstruction(I);
+      return;
+    }
     switch (I.getKind()) {
 #define DEF_VALUE(CLASS, PARENT) \
   case ValueKind::CLASS##Kind:   \
@@ -629,6 +897,210 @@ class InstrGen {
 
   /// Where LocalPtr and LocalNonPtr registers are stored in generated C.
   RegisterStorage registerStorage_;
+
+  llvh::StringRef tryStateName_ = "tryState";
+  llvh::StringRef jmpBufAddress_ = "&jmpBuf";
+
+  /// A register can be reused by unrelated SSA values. Every definition and
+  /// consumer must support the representation, including lowered phi moves.
+  llvh::SmallVector<uint8_t, 16> integerRegisters_;
+
+  /// A generic operation may coerce operands but still produce a proved integer.
+  /// Use its existing emitter and unbox the result into the integer destination.
+  Instruction *boxedIntegerResult_{nullptr};
+
+  uint8_t nativeIntegerRange(Value *value) const {
+    if (integerRegisters_.empty())
+      return 0;
+    auto reg = ra_.getOptionalRegister(value);
+    return reg && reg->getClass() == sh::RegClass::LocalInteger
+        ? integerRegisters_[reg->getIndex()]
+        : 0;
+  }
+
+  void selectIntegerRegisters() {
+    if (!F_.getContext().getOptimizationSettings().nativeIntegerRegisters ||
+        registerStorage_ != RegisterStorage::LocalsAndNonPtrVariables ||
+        !tryIDs_.empty())
+      return;
+    constexpr uint8_t all = IntegerRangeInt32 | IntegerRangeUint32 |
+        IntegerRangeInt32OrUint32;
+    integerRegisters_.assign(
+        ra_.getMaxRegisterUsage(sh::RegClass::LocalInteger), all);
+    llvh::BitVector seen(integerRegisters_.size());
+    for (auto &block : F_) {
+      for (auto &inst : block) {
+        auto reg = ra_.getOptionalRegister(&inst);
+        if (!reg || reg->getClass() != sh::RegClass::LocalInteger)
+          continue;
+        const auto index = reg->getIndex();
+        seen.set(index);
+        auto &range = integerRegisters_[index];
+        if (!range)
+          continue;
+        range &= getKnownIntegerRange(&inst);
+        bool supported = false;
+        switch (inst.getKind()) {
+          case ValueKind::AsInt32InstKind:
+          case ValueKind::AsUint32InstKind:
+          case ValueKind::MovInstKind:
+          case ValueKind::LIRSpillMovInstKind:
+          case ValueKind::LIRLoadConstInstKind:
+          case ValueKind::UnionNarrowTrustedInstKind:
+          case ValueKind::PhiInstKind:
+            supported = true;
+            break;
+          case ValueKind::BinaryAndInstKind:
+          case ValueKind::BinaryOrInstKind:
+          case ValueKind::BinaryXorInstKind:
+          case ValueKind::BinaryLeftShiftInstKind:
+          case ValueKind::BinaryRightShiftInstKind:
+          case ValueKind::BinaryUnsignedRightShiftInstKind:
+            supported = true;
+            break;
+          case ValueKind::CallBuiltinInstKind:
+            supported = llvh::cast<CallBuiltinInst>(&inst)->getBuiltinIndex() ==
+                BuiltinMethod::Math_imul;
+            break;
+          default:
+            break;
+        }
+        for (auto *user : inst.getUsers()) {
+          if (llvh::isa<BinaryOperatorInst>(user) ||
+              llvh::isa<FUnaryMathInst>(user) ||
+              llvh::isa<FBinaryMathInst>(user) ||
+              llvh::isa<FCompareInst>(user)) {
+            continue;
+          }
+          switch (user->getKind()) {
+            case ValueKind::MovInstKind:
+            case ValueKind::LIRSpillMovInstKind:
+            case ValueKind::ImplicitMovInstKind:
+            case ValueKind::UnionNarrowTrustedInstKind:
+            case ValueKind::PhiInstKind:
+            case ValueKind::AsInt32InstKind:
+            case ValueKind::AsUint32InstKind:
+            case ValueKind::ReturnInstKind:
+            case ValueKind::StoreFrameInstKind:
+            case ValueKind::TypeOfIsInstKind:
+            case ValueKind::CallBuiltinInstKind:
+            case ValueKind::AllocArrayInstKind:
+              break;
+            default:
+              supported = false;
+              break;
+          }
+        }
+        if (!supported)
+          range = 0;
+      }
+    }
+    for (unsigned i = 0; i < integerRegisters_.size(); ++i)
+      if (!seen.test(i))
+        integerRegisters_[i] = 0;
+  }
+
+  void generateIntegerInstruction(Instruction &inst) {
+    if (llvh::isa<PhiInst>(inst))
+      return;
+    const auto destination = ra_.getRegister(&inst);
+    if (auto *binary = llvh::dyn_cast<BinaryOperatorInst>(&inst)) {
+      if (!binary->getLeftHandSide()->getType().isNumberType() ||
+          !binary->getRightHandSide()->getType().isNumberType()) {
+        os_ << "  { SHLegacyValue boxed;\n";
+        boxedIntegerResult_ = &inst;
+        generateBinaryOperatorInst(*binary);
+        boxedIntegerResult_ = nullptr;
+        os_ << "    ";
+        generateRegister(destination);
+        // The operation's result is narrower than a reused destination that
+        // carries both signed and unsigned values at different program points.
+        os_ << (inst.getKind() == ValueKind::BinaryUnsignedRightShiftInstKind
+                    ? " = (uint32_t)"
+                    : " = (int32_t)")
+            << "_sh_ljs_get_double(boxed); }\n";
+        return;
+      }
+    }
+    if (llvh::isa<MovInst>(inst) || llvh::isa<LIRSpillMovInst>(inst) ||
+        llvh::isa<LIRLoadConstInst>(inst) ||
+        llvh::isa<UnionNarrowTrustedInst>(inst)) {
+      os_ << "  ";
+      generateRegister(destination);
+      os_ << " = ";
+      auto *input = inst.getOperand(0);
+      if (nativeIntegerRange(input)) {
+        generateRegister(ra_.getRegister(input));
+      } else {
+        const auto inputRange = getKnownIntegerRange(input);
+        os_ << (inputRange & IntegerRangeInt32 ? "(int32_t)"
+                : inputRange & IntegerRangeUint32 ? "(uint32_t)"
+                                                 : "(int64_t)")
+            << "_sh_ljs_get_double(";
+        generateValue(*input);
+        os_ << ")";
+      }
+      os_ << ";\n";
+      return;
+    }
+    if (llvh::isa<AsInt32Inst>(inst) || llvh::isa<AsUint32Inst>(inst)) {
+      const bool signedResult = llvh::isa<AsInt32Inst>(inst);
+      os_ << "  ";
+      generateRegister(destination);
+      os_ << " = ";
+      auto *input = inst.getOperand(0);
+      if (input->getType().isNumberType()) {
+        generateNumberToInt32(input, signedResult);
+      } else {
+        os_ << (signedResult ? "_sh_ljs_to_int32_rjs_inline(shr, "
+                             : "_sh_ljs_to_uint32_rjs_inline(shr, ");
+        generateRegisterPtr(*input);
+        os_ << ")";
+      }
+      os_ << ";\n";
+      return;
+    }
+    if (auto *call = llvh::dyn_cast<CallBuiltinInst>(&inst)) {
+      if (call->getNumArguments() != 3 ||
+          !call->getArgument(1)->getType().isNumberType() ||
+          !call->getArgument(2)->getType().isNumberType()) {
+        os_ << "  ";
+        generateRegister(destination);
+        os_ << " = (int32_t)_sh_ljs_get_double(_sh_ljs_call_builtin(shr, frame, "
+            << call->getNumArguments() - 1 << ", "
+            << static_cast<uint32_t>(call->getBuiltinIndex()) << "));\n";
+        return;
+      }
+    }
+    // Compute wrapping bits unsigned; converting their high half via int64_t
+    // avoids relying on an out-of-range unsigned-to-signed C conversion.
+    os_ << "  { uint32_t bits = ";
+    bool unsignedResult = false;
+    if (auto *call = llvh::dyn_cast<CallBuiltinInst>(&inst)) {
+      generateNumberToInt32(call->getArgument(1), false);
+      os_ << " * ";
+      generateNumberToInt32(call->getArgument(2), false);
+    } else {
+      auto *binary = llvh::cast<BinaryOperatorInst>(&inst);
+      const bool signedShift =
+          inst.getKind() == ValueKind::BinaryRightShiftInstKind;
+      unsignedResult =
+          inst.getKind() == ValueKind::BinaryUnsignedRightShiftInstKind;
+      generateNumberToInt32(binary->getLeftHandSide(), signedShift);
+      os_ << " " << (unsignedResult ? ">>" : binary->getOperatorStr()) << " (";
+      generateNumberToInt32(binary->getRightHandSide(), false);
+      if (signedShift || unsignedResult ||
+          inst.getKind() == ValueKind::BinaryLeftShiftInstKind)
+        os_ << " & 31";
+      os_ << ")";
+    }
+    os_ << "; ";
+    generateRegister(destination);
+    os_ << (unsignedResult
+                ? " = bits; }\n"
+                : " = (int64_t)bits - ((bits & 0x80000000u) ? "
+                  "4294967296LL : 0); }\n");
+  }
 
   void unimplemented(Instruction &inst) {
     std::string err{"Unimplemented "};
@@ -696,9 +1168,10 @@ class InstrGen {
   }
   llvh::raw_ostream &genStringConstReadIC(
       LiteralString *LS,
-      Value *optValue = nullptr) {
+      Value *optValue = nullptr,
+      uint32_t entries = 1) {
     genStringConstICCommon(LS, optValue);
-    return genReadIC(LS);
+    return genReadIC(LS, entries);
   }
 
   /// Generate a cache index. This must be used when passing parameters to API
@@ -708,16 +1181,30 @@ class InstrGen {
   /// different instructions accessing the same property probably are for
   /// objects of the same hidden class, and should get the same offset.
   llvh::raw_ostream &genWriteIC(LiteralString *LS) {
+    if (moduleGen_.functionLayout)
+      return os_ << "shUnit->write_prop_cache + "
+                 << moduleGen_.functionLayout->allocateCache(
+                        &F_, sh::CBundleFunctionLayout::Write, 1);
     if (options_.emitCBundle)
       return os_ << "shUnit->write_prop_cache + " << nextWriteCacheIdx_++;
     return os_ << "get_write_prop_cache(shUnit) + " << nextWriteCacheIdx_++;
   }
-  llvh::raw_ostream &genReadIC(LiteralString *LS) {
+  llvh::raw_ostream &genReadIC(LiteralString *LS, uint32_t entries = 1) {
+    if (moduleGen_.functionLayout)
+      return os_ << "shUnit->read_prop_cache + "
+                 << moduleGen_.functionLayout->allocateCache(
+                        &F_, sh::CBundleFunctionLayout::Read, entries);
+    const auto index = nextReadCacheIdx_;
+    nextReadCacheIdx_ += entries;
     if (options_.emitCBundle)
-      return os_ << "shUnit->read_prop_cache + " << nextReadCacheIdx_++;
-    return os_ << "get_read_prop_cache(shUnit) + " << nextReadCacheIdx_++;
+      return os_ << "shUnit->read_prop_cache + " << index;
+    return os_ << "get_read_prop_cache(shUnit) + " << index;
   }
   llvh::raw_ostream &genPrivateNameIC(Value *privateName) {
+    if (moduleGen_.functionLayout)
+      return os_ << "shUnit->private_name_cache + "
+                 << moduleGen_.functionLayout->allocateCache(
+                        &F_, sh::CBundleFunctionLayout::PrivateName, 1);
     if (options_.emitCBundle)
       return os_ << "shUnit->private_name_cache + "
                  << nextPrivateNameCacheIdx_++;
@@ -744,6 +1231,10 @@ class InstrGen {
         os_ << "np" << reg.getIndex();
         break;
 
+      case sh::RegClass::LocalInteger:
+        os_ << "ni" << reg.getIndex();
+        break;
+
       case sh::RegClass::RegStack:
         os_ << "frame[" << (hbc::StackFrameLayout::FirstLocal + reg.getIndex())
             << ']';
@@ -757,6 +1248,16 @@ class InstrGen {
   /// Helper to generate a value that must always have an allocated register,
   /// for instance because we need to assign to it or take its address.
   void generateRegister(Value &val) {
+    if (&val == boxedIntegerResult_) {
+      os_ << "boxed";
+      return;
+    }
+    if (nativeIntegerRange(&val)) {
+      os_ << "_sh_ljs_double((double)";
+      generateRegister(ra_.getRegister(&val));
+      os_ << ")";
+      return;
+    }
     generateRegister(ra_.getRegister(&val));
   }
 
@@ -766,6 +1267,12 @@ class InstrGen {
   /// The pointer can be used to pass to API functions that will use it
   /// as a PinnedHermesValue.
   void generateRegisterPtr(Value &val) {
+    if (nativeIntegerRange(&val)) {
+      os_ << "&(SHLegacyValue){.f64 = (double)";
+      generateRegister(ra_.getRegister(&val));
+      os_ << "}";
+      return;
+    }
     os_ << "&";
     generateRegister(val);
   }
@@ -865,9 +1372,9 @@ class InstrGen {
     generateRegister(inst);
     os_ << " = ";
     if (inst.getSingleOperand()->getType().isNumberType()) {
-      os_ << "_sh_ljs_double((double)_sh_to_int32_double(_sh_ljs_get_double(";
-      generateRegister(*inst.getSingleOperand());
-      os_ << ")));\n";
+      os_ << "_sh_ljs_double((double)";
+      generateNumberToInt32(inst.getSingleOperand(), true);
+      os_ << ");\n";
     } else {
       os_
           << (options_.smallC
@@ -882,9 +1389,9 @@ class InstrGen {
     generateRegister(inst);
     os_ << " = ";
     if (inst.getSingleOperand()->getType().isNumberType()) {
-      os_ << "_sh_ljs_double((double)_sh_to_uint32_double(_sh_ljs_get_double(";
-      generateRegister(*inst.getSingleOperand());
-      os_ << ")));\n";
+      os_ << "_sh_ljs_double((double)";
+      generateNumberToInt32(inst.getSingleOperand(), false);
+      os_ << ");\n";
     } else {
       os_
           << (options_.smallC
@@ -1006,7 +1513,12 @@ class InstrGen {
     generateValue(inst);
     os_ << " = _sh_ljs_load_from_env(";
     generateValue(*inst.getScope());
-    os_ << ", " << inst.getLoadVariable()->getIndexInVariableList() << ");\n";
+    os_ << ", "
+        << (moduleGen_.functionLayout
+                ? moduleGen_.functionLayout->getVariableSlot(
+                      inst.getLoadVariable())
+                : inst.getLoadVariable()->getIndexInVariableList())
+        << ");\n";
   }
   void generateLIRLoadConstInst(LIRLoadConstInst &inst) {
     os_.indent(2);
@@ -1083,6 +1595,34 @@ class InstrGen {
     // Nothing to do here.
     os_ << "  // PhiInst\n";
   }
+
+  void generateNumberToInt32(Value *value, bool signedResult) {
+    if (nativeIntegerRange(value)) {
+      os_ << (signedResult ? "(int32_t)" : "(uint32_t)");
+      generateRegister(ra_.getRegister(value));
+      return;
+    }
+    const uint8_t range = getKnownIntegerRange(value);
+    if (range) {
+      // Cast the double into a type which represents every proved input before
+      // narrowing. In particular, a negative double cannot be cast directly to
+      // uint32_t, even when the final Wasm instruction happens to saturate.
+      os_ << (signedResult ? "(int32_t)" : "(uint32_t)");
+      os_ << (range & IntegerRangeInt32 ? "(int32_t)"
+              : range & IntegerRangeUint32 ? "(uint32_t)"
+                                           : "(int64_t)");
+      os_ << "_sh_ljs_get_double(";
+      generateValue(*value);
+      os_ << ")";
+    } else {
+      os_ << (signedResult ? "_sh_to_int32_double("
+                          : "_sh_to_uint32_double(");
+      os_ << "_sh_ljs_get_double(";
+      generateValue(*value);
+      os_ << "))";
+    }
+  }
+
   void generateBinaryOperatorInst(BinaryOperatorInst &inst) {
     os_.indent(2);
     generateRegister(inst);
@@ -1108,6 +1648,52 @@ class InstrGen {
 
     bool bothDouble = inst.getLeftHandSide()->getType().isNumberType() &&
         inst.getRightHandSide()->getType().isNumberType();
+
+    // Proven numbers cannot invoke user coercions or BigInt operations. Keep
+    // ToInt32/ToUint32 semantics, including non-finite and out-of-range numbers,
+    // without retaining the generic operation's type checks and runtime call.
+    const char *numberBitOp = nullptr;
+    bool signedRightShift = false;
+    bool unsignedResult = false;
+    bool shift = false;
+    if (bothDouble) {
+      switch (inst.getKind()) {
+        case ValueKind::BinaryOrInstKind:
+          numberBitOp = "|";
+          break;
+        case ValueKind::BinaryAndInstKind:
+          numberBitOp = "&";
+          break;
+        case ValueKind::BinaryXorInstKind:
+          numberBitOp = "^";
+          break;
+        case ValueKind::BinaryLeftShiftInstKind:
+          numberBitOp = "<<";
+          shift = true;
+          break;
+        case ValueKind::BinaryRightShiftInstKind:
+          numberBitOp = ">>";
+          shift = signedRightShift = true;
+          break;
+        case ValueKind::BinaryUnsignedRightShiftInstKind:
+          numberBitOp = ">>";
+          shift = unsignedResult = true;
+          break;
+        default:
+          break;
+      }
+    }
+    if (numberBitOp) {
+      os_ << "_sh_ljs_double((double)";
+      if (!unsignedResult)
+        os_ << "(int32_t)";
+      os_ << "(";
+      generateNumberToInt32(inst.getLeftHandSide(), signedRightShift);
+      os_ << " " << numberBitOp << " (";
+      generateNumberToInt32(inst.getRightHandSide(), false);
+      os_ << (shift ? " & 31" : "") << ")));\n";
+      return;
+    }
 
     // NOTE: this used to check whether we know that both operands are numbers
     // in the int32 range. We no longer track that information, so for now this
@@ -1322,10 +1908,10 @@ class InstrGen {
       os_ << ".raw";
     } else {
       assert(funcUntypedOp);
-      os_ << funcUntypedOp << "(shr, &";
-      generateRegister(*inst.getLeftHandSide());
-      os_ << ", &";
-      generateRegister(*inst.getRightHandSide());
+      os_ << funcUntypedOp << "(shr, ";
+      generateRegisterPtr(*inst.getLeftHandSide());
+      os_ << ", ";
+      generateRegisterPtr(*inst.getRightHandSide());
       os_ << ")";
     }
     if (boolConv)
@@ -1394,16 +1980,21 @@ class InstrGen {
     }
 
     if (strictMode)
-      os_ << "_sh_ljs_put_by_val_strict_rjs";
+      os_ << "_sh_ljs_put_by_val_cached_strict_rjs";
     else
-      os_ << "_sh_ljs_put_by_val_loose_rjs";
-    os_ << "(shr,&";
+      os_ << "_sh_ljs_put_by_val_cached_loose_rjs";
+    os_ << "(shr, shUnit, &";
     generateRegister(*inst.getObject());
     os_ << ", &";
     generateRegister(*inst.getProperty());
     os_ << ", &";
     generateRegister(*inst.getStoredValue());
-    os_ << ");\n";
+    os_ << ", shUnit->computed_write_cache + "
+        << (moduleGen_.functionLayout
+                ? moduleGen_.functionLayout->allocateCache(
+                      &F_, sh::CBundleFunctionLayout::ComputedWrite, 1)
+                : moduleGen_.nextComputedWriteCacheIdx++)
+        << " * SH_COMPUTED_WRITE_CACHE_WAYS);\n";
   }
   void generateStorePropertyLooseInst(StorePropertyLooseInst &inst) {
     generateStorePropertyInstImpl(inst, false);
@@ -1465,7 +2056,7 @@ class InstrGen {
       assert(
           inst.getIsEnumerable() &&
           "Non-enumerable properties with literal keys should be handled by LoadConstants");
-      os_ << "_sh_ljs_define_own_by_id(shr,&";
+      os_ << "_sh_ljs_define_own_by_id_in_unit(shr,shUnit,&";
       generateRegister(*inst.getObject());
       os_ << ", ";
       genStringConstWriteIC(LS, inst.getStoredValue()) << ");\n";
@@ -1565,29 +2156,49 @@ class InstrGen {
     generateValue(inst);
     os_ << " = ";
     if (auto *LS = llvh::dyn_cast<LiteralString>(inst.getProperty())) {
-      os_ << (options_.smallC ? "_sh_ljs_get_by_id_rjs"
-                              : "_sh_ljs_get_by_id_rjs_inline")
+      os_ << (options_.smallC ? "_sh_ljs_get_by_id_polymorphic_rjs"
+                             : "_sh_ljs_get_by_id_polymorphic_rjs_inline")
           << "(shr,&";
       generateRegister(*inst.getObject());
       os_ << ",";
-      genStringConstReadIC(LS) << ");\n";
+      genStringConstReadIC(LS, nullptr, SH_NAMED_READ_CACHE_WAYS) << ");\n";
       return;
     }
     // If the prop is an index-like constant, generate the special bytecode.
     if (auto *litNum = llvh::dyn_cast<LiteralNumber>(inst.getProperty())) {
       if (auto idxOpt = doubleToArrayIndex(litNum->getValue())) {
-        os_ << "_sh_ljs_get_by_index_rjs(shr,&";
+        os_ << (options_.smallC ? "_sh_ljs_get_by_index_rjs"
+                               : "_sh_ljs_get_by_index_rjs_inline")
+            << "(shr,&";
         generateRegister(*inst.getObject());
         os_ << ", ";
         os_ << *idxOpt << ");\n";
         return;
       }
     }
-    os_ << "_sh_ljs_get_by_val_rjs(shr,&";
+    if (inst.getProperty()->getType().isNumberType()) {
+      // Numeric-only sites cannot use a named-property cache.
+      os_ << (options_.smallC ? "_sh_ljs_get_by_val_rjs"
+                             : "_sh_ljs_get_by_val_rjs_inline")
+          << "(shr,&";
+      generateRegister(*inst.getObject());
+      os_ << ", &";
+      generateRegister(*inst.getProperty());
+      os_ << ");\n";
+      return;
+    }
+    os_ << (options_.smallC ? "_sh_ljs_get_by_val_cached_rjs"
+                           : "_sh_ljs_get_by_val_cached_rjs_inline")
+        << "(shr,&";
     generateRegister(*inst.getObject());
     os_ << ", &";
     generateRegister(*inst.getProperty());
-    os_ << ");\n";
+    os_ << ", shUnit->computed_read_cache + "
+        << (moduleGen_.functionLayout
+                ? moduleGen_.functionLayout->allocateCache(
+                      &F_, sh::CBundleFunctionLayout::ComputedRead, 1)
+                : moduleGen_.nextComputedReadCacheIdx++)
+        << " * SH_COMPUTED_READ_CACHE_WAYS);\n";
   }
   void generateLoadPropertyWithReceiverInst(
       LoadPropertyWithReceiverInst &inst) {
@@ -1763,7 +2374,11 @@ class InstrGen {
     generateValue(*inst.getScope());
     os_ << ",";
     generateValue(*inst.getValue());
-    os_ << ", " << inst.getVariable()->getIndexInVariableList() << ");\n";
+    os_ << ", "
+        << (moduleGen_.functionLayout
+                ? moduleGen_.functionLayout->getVariableSlot(inst.getVariable())
+                : inst.getVariable()->getIndexInVariableList())
+        << ");\n";
   }
   void generateAllocStackInst(AllocStackInst &inst) {
     // This is a no-op.
@@ -1872,7 +2487,7 @@ class InstrGen {
     // Restore the tryState to the state of the Try enclosing this block.
     TryStartInst *enclosing = enclosingTrys_.at(inst.getParent());
     uint32_t stateToRestore = enclosing ? tryIDs_.at(enclosing) : 0;
-    os_ << "  tryState = " << stateToRestore << ";\n";
+    os_ << "  " << tryStateName_ << " = " << stateToRestore << ";\n";
     os_.indent(2);
     generateRegister(inst);
     os_ << " = _sh_get_clear_thrown_value(shr);\n";
@@ -1881,41 +2496,36 @@ class InstrGen {
     hermes_fatal("DebuggerInst should have been deleted.");
   }
   void generateCreateRegExpInst(CreateRegExpInst &inst) {
-    os_.indent(2);
-
     uint32_t patternStrID =
         moduleGen_.stringTable.add(inst.getPattern()->getValue().str());
     uint32_t flagsStrID =
         moduleGen_.stringTable.add(inst.getFlags()->getValue().str());
+    auto &regexp = F_.getContext().getCompiledRegExp(
+        inst.getPattern()->getValue().getUnderlyingPointer(),
+        inst.getFlags()->getValue().getUnderlyingPointer());
 
-    // Compile the regexp. We expect this to succeed because the AST went
-    // through the SemanticValidator. This is a bit of a hack: what we would
-    // really like to do is have the Parser emit a CompiledRegExp that can be
-    // threaded through the AST and then through the IR to this instruction
-    // selection, but that is too awkward, so we compile again here.
-    // uint32_t reBytecodeID = UINT32_MAX;
-    // if (auto regexp = CompiledRegExp::tryCompile(
-    //         inst.getPattern()->getValue().str(),
-    //         inst.getFlags()->getValue().str())) {
-    //   reBytecodeID = moduleGen_.regexpTable.addRegExp(std::move(*regexp));
-    // }
-
-    // TODO(T132343328): Compile the regexp bytecode ahead of time.
+    // Keep literal data with the instruction so ordinary C output, bundles and
+    // outlined fragments share the same path. IRGen separately initializes named
+    // capture groups. Runtime evaluation must still allocate a fresh RegExp.
+    os_ << "  {\n    static const uint8_t regexp_bytecode[] = {";
+    for (uint8_t byte : regexp.getBytecode())
+      os_ << (unsigned)byte << ',';
+    os_ << "};\n    ";
     generateValue(inst);
     os_ << " = ";
-    os_ << "_sh_ljs_create_regexp(shr, ";
+    os_ << "_sh_ljs_create_regexp_precompiled(shr, ";
     os_ << (options_.emitCBundle ? "shUnit->symbols[" : "get_symbols(shUnit)[")
         << patternStrID << ']';
     os_ << ", ";
     os_ << (options_.emitCBundle ? "shUnit->symbols[" : "get_symbols(shUnit)[")
         << flagsStrID << ']';
-    os_ << ");\n";
+    os_ << ", regexp_bytecode, sizeof(regexp_bytecode));\n  }\n";
   }
   void generateTryEndInst(TryEndInst &inst) {
     // Restore the tryState to the state of the Try enclosing the catch.
     TryStartInst *enclosing = enclosingTrys_.at(inst.getBranchDest());
     uint32_t stateToRestore = enclosing ? tryIDs_.at(enclosing) : 0;
-    os_ << "  tryState = " << stateToRestore << ";\n";
+    os_ << "  " << tryStateName_ << " = " << stateToRestore << ";\n";
     os_ << "  goto ";
     generateBasicBlockLabel(inst.getBranchDest(), os_, bbMap_);
     os_ << ";\n";
@@ -1977,7 +2587,7 @@ class InstrGen {
     os_ << '&';
     moduleGen_.nativeFunctionTable.generateFunctionInfoTableLabel(os_);
     os_ << '['
-        << moduleGen_.nativeFunctionTable.getIndex(inst.getFunctionCode())
+        << moduleGen_.nativeFunctionTable.getRuntimeIndex(inst.getFunctionCode())
         << "]" << ", shUnit);\n";
   }
   void generateCreateGeneratorInst(CreateGeneratorInst &inst) {
@@ -1995,7 +2605,7 @@ class InstrGen {
     os_ << '&';
     moduleGen_.nativeFunctionTable.generateFunctionInfoTableLabel(os_);
     os_ << '['
-        << moduleGen_.nativeFunctionTable.getIndex(inst.getFunctionCode())
+        << moduleGen_.nativeFunctionTable.getRuntimeIndex(inst.getFunctionCode())
         << "]" << ", shUnit);\n";
   }
   void generateCreateClassInst(CreateClassInst &inst) {
@@ -2014,7 +2624,7 @@ class InstrGen {
     os_ << '&';
     moduleGen_.nativeFunctionTable.generateFunctionInfoTableLabel(os_);
     os_ << '['
-        << moduleGen_.nativeFunctionTable.getIndex(inst.getFunctionCode())
+        << moduleGen_.nativeFunctionTable.getRuntimeIndex(inst.getFunctionCode())
         << "]";
     os_ << ", (SHUnit *)shUnit, ";
     generateRegisterPtr(*inst.getHomeObjectOutput());
@@ -2033,7 +2643,7 @@ class InstrGen {
   }
   void generateReturnInst(ReturnInst &inst) {
     if (!tryIDs_.empty()) {
-      os_ << "  _sh_end_try(shr, &jmpBuf);\n";
+      os_ << "  _sh_end_try(shr, " << jmpBufAddress_ << ");\n";
     }
     os_ << "  _sh_leave(shr, &";
     if (registerStorage_ == RegisterStorage::LocalsAndNonPtrVariables)
@@ -2119,7 +2729,7 @@ class InstrGen {
   }
   void generateTryStartInst(TryStartInst &inst) {
     uint32_t stateToEnter = tryIDs_.at(&inst);
-    os_.indent(2) << "tryState = " << stateToEnter << ";\n";
+    os_.indent(2) << tryStateName_ << " = " << stateToEnter << ";\n";
     os_ << "  goto ";
     generateBasicBlockLabel(inst.getTryBody(), os_, bbMap_);
     os_ << ";\n";
@@ -2174,13 +2784,19 @@ class InstrGen {
     // new.target is set up in LowerCalls.
   }
   void generateCallInst(CallInst &inst) {
-    if (inst.getAttributes(inst.getModule()).isNativeJSFunction) {
+    auto *targetFunc = llvh::dyn_cast<Function>(inst.getTarget());
+    // An analyzed same-unit closure uses the same native entry convention as a
+    // typed function. Retain the actual closure in the outgoing frame: its
+    // environment can differ between invocations of the same function code.
+    // A target with non-callable alternatives still needs the runtime check.
+    if (inst.getAttributes(inst.getModule()).isNativeJSFunction ||
+        (targetFunc && inst.getCalleeIsAlwaysClosure()->getValue())) {
       // Fast paths for calling NativeJSFunction.
       setupCallInline(inst);
       os_.indent(2);
       generateRegister(inst);
       os_ << " = ";
-      if (auto *targetFunc = llvh::dyn_cast<Function>(inst.getTarget())) {
+      if (targetFunc) {
         // Fast path, avoid all indirection and just call the function.
         moduleGen_.nativeFunctionTable.generateFunctionLabel(targetFunc, os_);
         os_ << "(shr);\n";
@@ -2217,16 +2833,83 @@ class InstrGen {
         << (uint32_t)inst.getBuiltinIndex() << ");\n";
   }
   void generateCallBuiltinInst(CallBuiltinInst &inst) {
-    if (inst.getBuiltinIndex() == BuiltinMethod::Math_sqrt) {
-      if (inst.getNumArguments() == 2 &&
-          inst.getArgument(1)->getType().isNumberType()) {
+    if (inst.getBuiltinIndex() == BuiltinMethod::Math_imul &&
+        inst.getNumArguments() == 3 &&
+        inst.getArgument(1)->getType().isNumberType() &&
+        inst.getArgument(2)->getType().isNumberType()) {
+      os_.indent(2);
+      generateRegister(inst);
+      // Unsigned multiplication provides the specified modulo-2^32 result
+      // without C signed overflow. Convert the high half without an
+      // implementation-defined unsigned-to-signed cast.
+      if (getKnownIntegerRange(inst.getArgument(1)) ||
+          getKnownIntegerRange(inst.getArgument(2))) {
+        os_ << " = _sh_ljs_imul_uint32(";
+        generateNumberToInt32(inst.getArgument(1), false);
+        os_ << ", ";
+        generateNumberToInt32(inst.getArgument(2), false);
+      } else {
+        os_ << " = _sh_ljs_imul_number(";
+        generateValue(*inst.getArgument(1));
+        os_ << ", ";
+        generateValue(*inst.getArgument(2));
+      }
+      os_ << ");\n";
+      return;
+    }
+    // CallBuiltinInst already carries an intrinsic-identity proof. Restrict
+    // direct emission to numbers so coercions and their order stay in the VM.
+    if (inst.getNumArguments() == 2 &&
+        inst.getArgument(1)->getType().isNumberType()) {
+      const char *operation = nullptr;
+      switch (inst.getBuiltinIndex()) {
+        case BuiltinMethod::Math_abs:
+          operation = "fabs";
+          break;
+        case BuiltinMethod::Math_ceil:
+          operation = "ceil";
+          break;
+        case BuiltinMethod::Math_floor:
+          operation = "floor";
+          break;
+        case BuiltinMethod::Math_trunc:
+          operation = "trunc";
+          break;
+        case BuiltinMethod::Math_round:
+          operation = "hermesMathRound";
+          break;
+        case BuiltinMethod::Math_sqrt:
+          operation = "sqrt";
+          break;
+        default:
+          break;
+      }
+      if (operation) {
         os_.indent(2);
         generateRegister(inst);
-        os_ << " = _sh_ljs_double(sqrt(_sh_ljs_get_double(";
+        os_ << " = _sh_ljs_double(" << operation << "(_sh_ljs_get_double(";
         generateValue(*inst.getArgument(1));
         os_ << ")));\n";
         return;
       }
+    }
+    if ((inst.getBuiltinIndex() == BuiltinMethod::Math_min ||
+         inst.getBuiltinIndex() == BuiltinMethod::Math_max) &&
+        inst.getNumArguments() == 3 &&
+        inst.getArgument(1)->getType().isNumberType() &&
+        inst.getArgument(2)->getType().isNumberType()) {
+      os_.indent(2);
+      generateRegister(inst);
+      os_ << " = _sh_ljs_double("
+          << (inst.getBuiltinIndex() == BuiltinMethod::Math_min
+                  ? "hermesMathMin"
+                  : "hermesMathMax")
+          << "(_sh_ljs_get_double(";
+      generateValue(*inst.getArgument(1));
+      os_ << "), _sh_ljs_get_double(";
+      generateValue(*inst.getArgument(2));
+      os_ << ")));\n";
+      return;
     }
     os_.indent(2);
     generateRegister(inst);
@@ -2255,7 +2938,11 @@ class InstrGen {
       os_ << "NULL";
     else
       generateRegisterPtr(*inst.getParentScope());
-    os_ << ", " << inst.getVariableScope()->getVariables().size() << ");\n";
+    os_ << ", "
+        << (moduleGen_.functionLayout
+                ? moduleGen_.functionLayout->scopeSize(inst.getVariableScope())
+                : inst.getVariableScope()->getVariables().size())
+        << ");\n";
   }
   void generateHBCCreateFunctionEnvironmentInst(
       HBCCreateFunctionEnvironmentInst &inst) {
@@ -2703,6 +3390,10 @@ class InstrGen {
   }
   /// Convert a JS value to its corresponding native argument type.
   void convertToNativeArg(NativeCType ctype, Value *arg) {
+    if (ctype == NativeCType::c_hermes_value) {
+      generateValue(*arg);
+      return;
+    }
     MachineType mt = nativeContext_.md.mapCType(ctype);
     const MachineDesc::MTD &mtd = nativeContext_.md.getMTD(mt);
     int parens = 1;
@@ -2819,7 +3510,8 @@ void generateFunction(
 
   llvh::SmallVector<BasicBlock *, 16> order(PO.rbegin(), PO.rend());
 
-  sh::SHRegisterAllocator RA(&F);
+  sh::SHRegisterAllocator RA(
+      &F, F.getContext().getOptimizationSettings().nativeIntegerRegisters);
   RA.allocate(order);
 
   if (options.format == DumpRA) {
@@ -2869,9 +3561,12 @@ void generateFunction(
   }
 
   auto &srcMgr = F.getContext().getSourceErrorManager();
-  OS << "// ";
-  srcMgr.dumpCoords(OS, F.getSourceRange().Start);
-  OS << '\n';
+  if (!options.emitCBundleLayout || options.emitSourceLocations ||
+      options.emitLineDirectives) {
+    OS << "// ";
+    srcMgr.dumpCoords(OS, F.getSourceRange().Start);
+    OS << '\n';
+  }
 
   llvh::DenseMap<BasicBlock *, TryStartInst *> enclosingTrys;
   if (!tryIDs.empty())
@@ -2968,6 +3663,20 @@ void generateFunction(
        ++i) {
     OS << "  SHLegacyValue np" << i << " = _sh_ljs_undefined();\n";
   }
+  for (size_t i = 0, e = RA.getMaxRegisterUsage(sh::RegClass::LocalInteger);
+       i < e;
+       ++i) {
+    const auto range = instrGen.integerRegisterRange(i);
+    if (range) {
+      OS << "  "
+         << (range & IntegerRangeInt32 ? "int32_t"
+                 : range & IntegerRangeUint32 ? "uint32_t"
+                                              : "int64_t")
+         << " ni" << i << " = 0;\n";
+    } else {
+      OS << "  SHLegacyValue ni" << i << " = _sh_ljs_undefined();\n";
+    }
+  }
 
   switch (F.getProhibitInvoke()) {
     case Function::ProhibitInvoke::ProhibitNone:
@@ -2975,14 +3684,14 @@ void generateFunction(
     case Function::ProhibitInvoke::ProhibitConstruct:
       OS << "  if (!_sh_ljs_is_undefined(frame["
          << hbc::StackFrameLayout::NewTarget << "]))\n"
-         << "    _sh_throw_type_error_ascii(shr, \"Function is not a "
-            "constructor\");\n";
+         << "    _sh_throw_type_error_ascii(shr, \""
+         << kProhibitConstructMessage << "\");\n";
       break;
     case Function::ProhibitInvoke::ProhibitCall:
       OS << "  if (_sh_ljs_is_undefined(frame["
          << hbc::StackFrameLayout::NewTarget << "]))\n"
-         << "    _sh_throw_type_error_ascii(shr, \"Class constructor invoked "
-            "without new\");\n";
+         << "    _sh_throw_type_error_ascii(shr, \""
+         << kProhibitCallMessage << "\");\n";
       break;
   }
 
@@ -3185,16 +3894,23 @@ void generateUnitData(
     uint32_t nextReadCacheIdx,
     uint32_t nextPrivateNameCacheIdx,
     const BytecodeGenerationOptions &options) {
+  if (options.emitCBundleLayout)
+    moduleGen.nativeFunctionTable.generateLinkerAnchors(OS);
   if (options.emitCBundle) {
     OS << "SH_BUNDLE_HIDDEN uint32_t ";
     moduleGen.nativeFunctionTable.generateUnitIndexLabel(OS);
+    if (options.emitCBundleLayout)
+      OS << " SH_BUNDLE_LINKAGE_DATA(\"unit_index\") = 0";
     OS << ";\n";
   }
 
+  if (options.emitCBundleLayout)
+    moduleGen.nativeFunctionTable.generate(OS);
   moduleGen.literalBuffers.generate(OS);
   moduleGen.srcLocationTable.generate(
       OS, M->getContext().getSourceErrorManager());
-  moduleGen.nativeFunctionTable.generate(OS);
+  if (!options.emitCBundleLayout)
+    moduleGen.nativeFunctionTable.generate(OS);
   // String table must be generated last because the other tables may add
   // strings while they are emitted.
   moduleGen.stringTable.generate(OS);
@@ -3213,6 +3929,10 @@ void generateUnitData(
      << nextReadCacheIdx << "];\n"
      << "  SHPrivateNameCacheEntry private_name_cache_data["
      << nextPrivateNameCacheIdx << "];\n"
+     << "  SHComputedReadCacheEntry computed_read_cache_data["
+     << moduleGen.nextComputedReadCacheIdx << " * SH_COMPUTED_READ_CACHE_WAYS];\n"
+     << "  SHComputedWriteCacheEntry computed_write_cache_data["
+     << moduleGen.nextComputedWriteCacheIdx << " * SH_COMPUTED_WRITE_CACHE_WAYS];\n"
      << "  SHCompressedPointer object_literal_class_cache["
      << moduleGen.literalBuffers.objShapeTable.size() << "];\n};\n"
      << "SHUnit *CREATE_THIS_UNIT(void) {\n"
@@ -3224,11 +3944,18 @@ void generateUnitData(
   OS << ",.num_symbols =" << moduleGen.stringTable.size()
      << ", .num_write_prop_cache_entries = " << nextWriteCacheIdx
      << ", .num_read_prop_cache_entries = " << nextReadCacheIdx
+     << ", .num_private_name_cache_entries = " << nextPrivateNameCacheIdx
+     << ", .num_computed_read_cache_entries = "
+     << moduleGen.nextComputedReadCacheIdx << " * SH_COMPUTED_READ_CACHE_WAYS"
+     << ", .num_computed_write_cache_entries = "
+     << moduleGen.nextComputedWriteCacheIdx << " * SH_COMPUTED_WRITE_CACHE_WAYS"
      << ", .ascii_pool = s_ascii_pool, .u16_pool = s_u16_pool,"
      << ".strings = s_strings, .symbols = unit_data->symbol_data,"
      << ".write_prop_cache = unit_data->write_prop_cache_data,"
      << ".read_prop_cache = unit_data->read_prop_cache_data, "
      << ".private_name_cache = unit_data->private_name_cache_data, "
+     << ".computed_read_cache = unit_data->computed_read_cache_data, "
+     << ".computed_write_cache = unit_data->computed_write_cache_data, "
      << ".obj_key_buffer = s_obj_key_buffer, .obj_key_buffer_size = "
      << moduleGen.literalBuffers.objKeyBuffer.size() << ", "
      << ".literal_val_buffer = s_literal_val_buffer, .literal_val_buffer_size = "
@@ -3535,6 +4262,24 @@ void generateOutlinedPartDeclaration(
   OS << " *state, SHLegacyValue *frame, SHUnit *shUnit)";
 }
 
+void generateExceptionFunctionDeclaration(
+    llvh::raw_ostream &OS,
+    Function *function,
+    const SHNativeJSFunctionTable &functionTable,
+    bool body) {
+  OS << "static SH_ATTRIBUTE_NOINLINE SHLegacyValue ";
+  functionTable.generateFunctionLabel(function, OS);
+  OS << (body ? "_exception_body" : "_exception_dispatch");
+  OS << "(SHRuntime *shr, struct ";
+  functionTable.generateOutlinedStateLabel(function, OS);
+  OS << " *state, SHLegacyValue *frame, SHUnit *shUnit, struct ";
+  functionTable.generateOutlinedStateLabel(function, OS);
+  OS << "_exceptions *exceptionState";
+  if (body)
+    OS << ", uint32_t resume";
+  OS << ')';
+}
+
 void emitOutlinedInstructions(
     sh::LineDirectiveEmitter &OS,
     llvh::ArrayRef<BufferedOutlinedInstruction> instructions,
@@ -3586,9 +4331,9 @@ void generateBundleFunctionDeclaration(
 }
 
 /// Generate an independently compilable wrapper and zero or more C helpers.
-/// The wrapper retains every basic-block label and terminator. Helpers contain
-/// only same-block non-terminator instruction runs and operate on the wrapper's
-/// register state without entering a JavaScript frame.
+/// Instruction-run helpers share the caller's register state without entering
+/// a JavaScript frame. Split exception dispatch additionally keeps setjmp in a
+/// small dispatcher, outside the instruction body and its register owner.
 std::vector<BufferedBundleFunction> generateOutlinedBundleFunction(
     Function &F,
     ModuleGen &moduleGen,
@@ -3685,13 +4430,11 @@ std::vector<BufferedBundleFunction> generateOutlinedBundleFunction(
   // Keep a helper body below a fraction of its containing translation-unit
   // target. The remaining space holds declarations for function references,
   // the shared-state definition, and the C file prologue. A single generated
-  // instruction can still exceed the target. Keep the O0 singleton intact:
-  // dividing it would create non-O0 helper fragments.
+  // instruction can still exceed the target. Helpers from an O0 control-flow
+  // wrapper are optimized normally, so they need the same smaller body limit.
   const uint64_t partTargetBytes =
-      cOptimizationLevel == sh::SHCBundleCOptimizationLevel::O0
-      ? options.cBundleShardSize
-      : std::max<uint64_t>(
-            1, options.cBundleShardSize / kOutlinedPartTargetDivisor);
+      std::max<uint64_t>(
+          1, options.cBundleShardSize / kOutlinedPartTargetDivisor);
   std::string stateDefinition;
   llvh::raw_string_ostream stateOS(stateDefinition);
   generateOutlinedStateDefinition(
@@ -3715,6 +4458,8 @@ std::vector<BufferedBundleFunction> generateOutlinedBundleFunction(
   const bool structuralO0 =
       cOptimizationLevel == sh::SHCBundleCOptimizationLevel::O0;
   const bool needsOutlining = structuralO0 || outlineableBytes >= instructionTarget;
+  const bool splitExceptionDispatch =
+      options.splitCExceptionDispatch && !tryIDs.empty();
   std::vector<OutlinedPart> parts;
   if (needsOutlining) {
     for (uint32_t blockIndex = 0; blockIndex < blocks.size(); ++blockIndex) {
@@ -3771,6 +4516,17 @@ std::vector<BufferedBundleFunction> generateOutlinedBundleFunction(
     sh::LineDirectiveEmitter OS(wrapperSourceOS);
     generateOutlinedStateDefinition(
         OS, &F, moduleGen.nativeFunctionTable, localsSize, nonPtrSize);
+    if (splitExceptionDispatch) {
+      OS << "struct ";
+      moduleGen.nativeFunctionTable.generateOutlinedStateLabel(&F, OS);
+      OS << "_exceptions {\n  SHJmpBuf jmpBuf;\n"
+            "  volatile uint32_t tryState;\n};\n";
+      for (bool body : {false, true}) {
+        generateExceptionFunctionDeclaration(
+            OS, &F, moduleGen.nativeFunctionTable, body);
+        OS << ";\n";
+      }
+    }
     if (outline) {
       for (uint32_t part = 0; part < parts.size(); ++part) {
         generateOutlinedPartDeclaration(
@@ -3780,9 +4536,13 @@ std::vector<BufferedBundleFunction> generateOutlinedBundleFunction(
       OS << '\n';
     }
 
-    OS << "// ";
-    srcMgr.dumpCoords(OS, F.getSourceRange().Start);
-    OS << "\nSH_BUNDLE_HIDDEN SHLegacyValue ";
+    if (!options.emitCBundleLayout || options.emitSourceLocations ||
+        options.emitLineDirectives) {
+      OS << "// ";
+      srcMgr.dumpCoords(OS, F.getSourceRange().Start);
+      OS << '\n';
+    }
+    OS << "SH_BUNDLE_HIDDEN SHLegacyValue ";
     moduleGen.nativeFunctionTable.generateFunctionLabel(&F, OS);
     OS << "(SHRuntime *shr) {\n";
     OS.setDirectiveInfo(F.getSourceRange().Start, srcMgr);
@@ -3835,17 +4595,51 @@ std::vector<BufferedBundleFunction> generateOutlinedBundleFunction(
       case Function::ProhibitInvoke::ProhibitConstruct:
         OS << "  if (!_sh_ljs_is_undefined(frame["
            << hbc::StackFrameLayout::NewTarget << "]))\n"
-           << "    _sh_throw_type_error_ascii(shr, \"Function is not a "
-              "constructor\");\n";
+           << "    _sh_throw_type_error_ascii(shr, \""
+           << kProhibitConstructMessage << "\");\n";
         break;
       case Function::ProhibitInvoke::ProhibitCall:
         OS << "  if (_sh_ljs_is_undefined(frame["
            << hbc::StackFrameLayout::NewTarget << "]))\n"
-           << "    _sh_throw_type_error_ascii(shr, \"Class constructor "
-              "invoked without new\");\n";
+           << "    _sh_throw_type_error_ascii(shr, \""
+           << kProhibitCallMessage << "\");\n";
         break;
     }
-    if (!tryIDs.empty()) {
+    if (splitExceptionDispatch) {
+      // Registers and exception state belong to the caller of setjmp. A throw
+      // unwinds the instruction body, but never invalidates their storage or
+      // leaves modified non-volatile automatic objects in the setjmp function.
+      OS << "  struct ";
+      moduleGen.nativeFunctionTable.generateOutlinedStateLabel(&F, OS);
+      OS << "_exceptions exceptionStorage;\n"
+            "  exceptionStorage.tryState = 0;\n"
+            "  return ";
+      moduleGen.nativeFunctionTable.generateFunctionLabel(&F, OS);
+      OS << "_exception_dispatch(shr, state, frame, shUnit, &exceptionStorage);\n"
+            "}\n\n";
+      generateExceptionFunctionDeclaration(
+          OS, &F, moduleGen.nativeFunctionTable, false);
+      OS << R"( {
+  if (__builtin_expect(_sh_try(shr, &exceptionState->jmpBuf), 0) != 0) {
+    if (exceptionState->tryState == 0) {
+      _sh_end_try(shr, &exceptionState->jmpBuf);
+      _sh_throw_current(shr);
+    }
+    )";
+      OS << "_sh_catch_no_pop(shr, (SHLocals*)state, frame, "
+         << (RA.getMaxArgumentRegisters() +
+             hbc::StackFrameLayout::FirstLocal)
+         << ");\n    return ";
+      moduleGen.nativeFunctionTable.generateFunctionLabel(&F, OS);
+      OS << "_exception_body(shr, state, frame, shUnit, exceptionState, "
+            "exceptionState->tryState);\n  }\n  return ";
+      moduleGen.nativeFunctionTable.generateFunctionLabel(&F, OS);
+      OS << "_exception_body(shr, state, frame, shUnit, exceptionState, 0);\n"
+            "}\n\n";
+      generateExceptionFunctionDeclaration(
+          OS, &F, moduleGen.nativeFunctionTable, true);
+      OS << " {\n";
+    } else if (!tryIDs.empty()) {
       OS << R"(
   SHJmpBuf jmpBuf;
   volatile uint32_t tryState = 0;
@@ -3855,6 +4649,18 @@ std::vector<BufferedBundleFunction> generateOutlinedBundleFunction(
     if (emitNativeTraces) {
       OS << "  frame[" << hbc::StackFrameLayout::SHLocals << "]"
          << " = _sh_ljs_native_pointer(&state->head);\n";
+    }
+
+    if (splitExceptionDispatch) {
+      OS << "  switch (resume) {\n    case 0: goto ";
+      generateBasicBlockLabel(order.front(), OS, bbMap);
+      OS << ";\n";
+      for (const auto &[tryStart, id] : tryIDs) {
+        OS << "    case " << id << ": goto ";
+        generateBasicBlockLabel(tryStart->getCatchTarget(), OS, bbMap);
+        OS << ";\n";
+      }
+      OS << "    default: abort();\n  }\n";
     }
 
     uint32_t nextPart = 0;
@@ -3895,7 +4701,7 @@ std::vector<BufferedBundleFunction> generateOutlinedBundleFunction(
       }
     }
     assert(nextPart == parts.size() && "not all outlined parts were called");
-    if (!tryIDs.empty()) {
+    if (!tryIDs.empty() && !splitExceptionDispatch) {
       OS << R"(
 L_catch:
   if (tryState == 0) {
@@ -3925,8 +4731,8 @@ L_catch:
   }
   wrapperSourceOS.flush();
 
-  // The wrapper keeps block labels and terminators while helpers replace
-  // outlineable instruction runs. A remaining singleton cannot be divided.
+  // The main translation unit keeps block labels and terminators while helpers
+  // replace instruction runs. A remaining singleton cannot be divided.
   size_t wrapperInstructionCount = 0;
   uint32_t nextWrapperPart = 0;
   for (uint32_t blockIndex = 0; blockIndex < blocks.size(); ++blockIndex) {
@@ -4089,6 +4895,14 @@ void generateBundleHeader(
      << "#else\n"
      << "#define SH_BUNDLE_HIDDEN __attribute__((visibility(\"hidden\")))\n"
      << "#endif\n\n"
+     // Wasm has writable linear memory even for linker sections named rodata.
+     // These few frequently referenced bases must precede variable-size pools.
+     << "#if defined(__wasm__)\n"
+     << "#define SH_BUNDLE_LINKAGE_DATA(name) "
+        "__attribute__((section(\".rodata.sh_\" name)))\n"
+     << "#else\n"
+     << "#define SH_BUNDLE_LINKAGE_DATA(name)\n"
+     << "#endif\n\n"
      << "extern SH_BUNDLE_HIDDEN uint32_t ";
   moduleGen.nativeFunctionTable.generateUnitIndexLabel(OS);
   OS << ";\nextern SH_BUNDLE_HIDDEN SHNativeFuncInfo ";
@@ -4116,12 +4930,19 @@ bool generateBundleFunctionShard(
     const std::vector<BufferedBundleFunction> &functions,
     uint64_t bodyBytes,
     uint32_t shardIndex,
+    uint32_t groupIndex,
+    uint32_t groupPart,
+    uint32_t firstFunctionId,
     uint64_t targetBytes,
     sh::SHCBundleFile &file) {
   std::string path;
   llvh::raw_string_ostream pathOS(path);
-  pathOS << "sh_" << unitName << "_functions_"
-         << llvh::format("%05u", shardIndex) << ".c";
+  pathOS << "sh_" << unitName << "_functions_";
+  if (moduleGen.functionLayout)
+    pathOS << llvh::format("%05u_%05u", groupIndex, groupPart);
+  else
+    pathOS << llvh::format("%05u", shardIndex);
+  pathOS << ".c";
   pathOS.flush();
 
   llvh::BitVector declarations(moduleGen.nativeFunctionTable.size());
@@ -4176,10 +4997,21 @@ bool generateBundleFunctionShard(
         OS << "#include \"" << headerPath << "\"\n\n";
         generateExternCIncludes(M, OS, *usedExterns);
         generateExternC(M, OS, *usedExterns);
+        std::vector<Function *> declaredFunctions;
         for (int index = declarations.find_first(); index >= 0;
-             index = declarations.find_next(index)) {
+             index = declarations.find_next(index))
+          declaredFunctions.push_back(functionsByIndex[index]);
+        if (moduleGen.functionLayout) {
+          std::sort(
+              declaredFunctions.begin(), declaredFunctions.end(),
+              [&](Function *left, Function *right) {
+                return moduleGen.nativeFunctionTable.getRuntimeIndex(left) <
+                    moduleGen.nativeFunctionTable.getRuntimeIndex(right);
+              });
+        }
+        for (auto *function : declaredFunctions) {
           generateBundleFunctionDeclaration(
-              OS, functionsByIndex[index], moduleGen.nativeFunctionTable);
+              OS, function, moduleGen.nativeFunctionTable);
         }
         OS << '\n';
         for (const auto &function : functions)
@@ -4191,8 +5023,8 @@ bool generateBundleFunctionShard(
   file = {
       path,
       sh::SHCBundleFileRole::Function,
-      moduleGen.nativeFunctionTable.getIndex(functions.front().function),
-      moduleGen.nativeFunctionTable.getIndex(functions.back().function),
+      firstFunctionId,
+      firstFunctionId + static_cast<uint32_t>(functions.size()) - 1,
       static_cast<uint32_t>(functions.size()),
       targetBytes,
       oversize,
@@ -4216,6 +5048,10 @@ bool generateModuleBundle(
   assert(
       (options.format == DumpBytecode || options.format == EmitBundle) &&
       "bundle generation requires C output");
+  std::vector<std::string> retainedStrings;
+  sh::CBundleFunctionLayout functionLayout;
+  if (!readRetainedLayout(M, options, retainedStrings, functionLayout))
+    return false;
   if (!lowerModuleIR(M, options.optimizationEnabled))
     return false;
 
@@ -4232,10 +5068,18 @@ bool generateModuleBundle(
   uint32_t nextReadCacheIdx = 0;
   uint32_t nextPrivateNameCacheIdx = 0;
   ModuleGen moduleGen{
-      M, options.optimizationEnabled, options.unitName};
+      M,
+      options.optimizationEnabled,
+      options.unitName,
+      retainedStrings,
+      options.emitCBundleLayout ? &functionLayout : nullptr};
   const auto functionsByIndex =
       moduleGen.nativeFunctionTable.functionsByIndex();
   M->assignIndexToVariables();
+  if (options.emitCBundleLayout) {
+    functionLayout.assign(functionsByIndex);
+    functionLayout.assignScopes(M);
+  }
 
   const std::string headerPath =
       bundleFilePath(options.unitName, "_internal.h");
@@ -4249,107 +5093,152 @@ bool generateModuleBundle(
   std::vector<BufferedBundleFunction> bufferedFunctions;
   uint64_t bufferedBytes = 0;
   uint32_t shardIndex = 0;
-  auto flushShard = [&]() {
-    if (bufferedFunctions.empty())
+  uint32_t firstFunctionId = 0;
+  std::vector<sh::CBundleFunctionLayout::ShardGroup> groups;
+  if (options.emitCBundleLayout)
+    groups = functionLayout.groupFunctions(functionsByIndex);
+  else
+    groups.push_back({0, false, functionsByIndex});
+  for (const auto &group : groups) {
+    uint32_t groupIndex = group.index;
+    uint32_t groupPart = 0;
+    auto flushShard = [&]() {
+      if (bufferedFunctions.empty())
+        return true;
+      if (shardIndex >= kMaxBundleFunctionShards - options.emitCBundleLayout) {
+        hermes_fatal("Static Hermes C bundle has too many function shards");
+      }
+      sh::SHCBundleFile file;
+      if (!generateBundleFunctionShard(
+              M,
+              writeFile,
+              headerPath,
+              options.unitName,
+              moduleGen,
+              functionsByIndex,
+              bufferedFunctions,
+              bufferedBytes,
+              shardIndex++,
+              groupIndex,
+              groupPart++,
+              firstFunctionId,
+              options.cBundleShardSize,
+              file)) {
+        return false;
+      }
+      if (options.emitCBundleLayout) {
+        std::vector<Function *> members;
+        for (const auto &function : bufferedFunctions)
+          members.push_back(function.function);
+        functionLayout.recordShard(groupIndex, members);
+      }
+      // Manifest ordinals describe output coverage. Declaration bitsets keep
+      // their original module indices, and generated labels use runtime slots.
+      // An outlined function occupies one ordinal across all of its fragments.
+      if (file.functionFragmentCount == 0 ||
+          file.functionFragmentIndex + 1 == file.functionFragmentCount) {
+        firstFunctionId += file.functionCount;
+        if (!group.retained) {
+          ++groupIndex;
+          groupPart = 0;
+        }
+      }
+      functionFiles.push_back(std::move(file));
+      bufferedFunctions.clear();
+      bufferedBytes = 0;
       return true;
-    if (shardIndex >= kMaxBundleFunctionShards) {
-      hermes_fatal("Static Hermes C bundle has too many function shards");
-    }
-    sh::SHCBundleFile file;
-    if (!generateBundleFunctionShard(
-            M,
-            writeFile,
-            headerPath,
-            options.unitName,
-            moduleGen,
-            functionsByIndex,
-            bufferedFunctions,
-            bufferedBytes,
-            shardIndex++,
-            options.cBundleShardSize,
-            file)) {
-      return false;
-    }
-    functionFiles.push_back(std::move(file));
-    bufferedFunctions.clear();
-    bufferedBytes = 0;
-    return true;
-  };
+    };
 
-  // Keep function generation sequential. String, source-location, and cache
-  // indexes are allocated while bodies are emitted and are shared by all
-  // shards in this logical unit.
-  for (Function *function : functionsByIndex) {
-    const auto cOptimizationLevel =
-        cOptimizationLevelForFunction(function);
-    std::vector<BufferedBundleFunction> generatedFunctions;
-    if (canOutlineFunction(function)) {
-      generatedFunctions = generateOutlinedBundleFunction(
-          *function,
-          moduleGen,
-          nextWriteCacheIdx,
-          nextReadCacheIdx,
-          nextPrivateNameCacheIdx,
-          cOptimizationLevel,
-          options);
-    } else {
-      std::string source;
-      llvh::raw_string_ostream sourceOS(source);
-      {
-        sh::LineDirectiveEmitter emitter(sourceOS);
-        generateFunction(
+    // Keep function generation sequential. String, source-location, and cache
+    // indexes are allocated while bodies are emitted and are shared by all
+    // shards in this logical unit.
+    for (Function *function : group.functions) {
+      const auto cOptimizationLevel =
+          cOptimizationLevelForFunction(function);
+      std::vector<BufferedBundleFunction> generatedFunctions;
+      if (canOutlineFunction(function) ||
+          (options.splitCExceptionDispatch && functionHasTryCatch(function))) {
+        generatedFunctions = generateOutlinedBundleFunction(
             *function,
-            emitter,
             moduleGen,
             nextWriteCacheIdx,
             nextReadCacheIdx,
             nextPrivateNameCacheIdx,
+            cOptimizationLevel,
             options);
-      }
-      sourceOS.flush();
-      size_t instructionCount = 0;
-      for (const auto &block : *function) {
-        for (const auto &instruction : block) {
-          (void)instruction;
-          ++instructionCount;
+      } else {
+        std::string source;
+        llvh::raw_string_ostream sourceOS(source);
+        {
+          sh::LineDirectiveEmitter emitter(sourceOS);
+          generateFunction(
+              *function,
+              emitter,
+              moduleGen,
+              nextWriteCacheIdx,
+              nextReadCacheIdx,
+              nextPrivateNameCacheIdx,
+              options);
         }
+        sourceOS.flush();
+        size_t instructionCount = 0;
+        for (const auto &block : *function) {
+          for (const auto &instruction : block) {
+            (void)instruction;
+            ++instructionCount;
+          }
+        }
+        auto oversizeReason = sh::SHCBundleOversizeReason::None;
+        if (source.size() > options.cBundleShardSize) {
+          if (instructionCount == 1)
+            oversizeReason = sh::SHCBundleOversizeReason::SingleInstruction;
+          else
+            oversizeReason = sh::SHCBundleOversizeReason::NoOutlineableRun;
+        }
+        generatedFunctions.push_back({
+            function,
+            std::move(source),
+            cOptimizationLevel == sh::SHCBundleCOptimizationLevel::O0,
+            0,
+            0,
+            cOptimizationLevel,
+            oversizeReason,
+        });
       }
-      auto oversizeReason = sh::SHCBundleOversizeReason::None;
-      if (source.size() > options.cBundleShardSize) {
-        if (instructionCount == 1)
-          oversizeReason = sh::SHCBundleOversizeReason::SingleInstruction;
-        else
-          oversizeReason = sh::SHCBundleOversizeReason::NoOutlineableRun;
-      }
-      generatedFunctions.push_back({
-          function,
-          std::move(source),
-          cOptimizationLevel == sh::SHCBundleCOptimizationLevel::O0,
-          0,
-          0,
-          cOptimizationLevel,
-          oversizeReason,
-      });
-    }
 
-    for (auto &generated : generatedFunctions) {
-      const uint64_t functionBytes = generated.source.size();
-      const bool isolate = generated.isolate;
-      if (!bufferedFunctions.empty() &&
-          (isolate || bufferedBytes >= options.cBundleShardSize ||
-           functionBytes > options.cBundleShardSize - bufferedBytes)) {
-        if (!flushShard())
+      for (auto &generated : generatedFunctions) {
+        const uint64_t functionBytes = generated.source.size();
+        const bool isolate = generated.isolate;
+        if (!bufferedFunctions.empty() &&
+            (isolate || bufferedBytes >= options.cBundleShardSize ||
+             functionBytes > options.cBundleShardSize - bufferedBytes)) {
+          if (!flushShard())
+            return false;
+        }
+        bufferedBytes += functionBytes;
+        bufferedFunctions.push_back(std::move(generated));
+        if ((isolate || functionBytes > options.cBundleShardSize) &&
+            !flushShard())
           return false;
       }
-      bufferedBytes += functionBytes;
-      bufferedFunctions.push_back(std::move(generated));
-      if ((isolate || functionBytes > options.cBundleShardSize) &&
-          !flushShard())
-        return false;
     }
+    if (!flushShard())
+      return false;
   }
-  if (!flushShard())
-    return false;
+  assert(firstFunctionId == functionsByIndex.size() &&
+         "bundle manifest must cover every current function exactly once");
+
+  if (options.emitCBundleLayout) {
+    nextWriteCacheIdx =
+        functionLayout.cacheSize(sh::CBundleFunctionLayout::Write);
+    nextReadCacheIdx = functionLayout.cacheSize(sh::CBundleFunctionLayout::Read);
+    nextPrivateNameCacheIdx =
+        functionLayout.cacheSize(sh::CBundleFunctionLayout::PrivateName);
+    moduleGen.nextComputedReadCacheIdx =
+        functionLayout.cacheSize(sh::CBundleFunctionLayout::ComputedRead);
+    moduleGen.nextComputedWriteCacheIdx =
+        functionLayout.cacheSize(sh::CBundleFunctionLayout::ComputedWrite);
+  }
 
   // The metadata tables must be emitted after every body has allocated its
   // shared indexes.
@@ -4370,6 +5259,16 @@ bool generateModuleBundle(
             options);
       })) {
     return false;
+  }
+
+  if (options.emitCBundleLayout) {
+    if (!writeFile(
+            bundleFilePath(options.unitName, "_layout.json"),
+            [&](llvh::raw_ostream &OS) {
+              moduleGen.stringTable.generateLayout(
+                  OS, options.unitName, functionLayout);
+            }))
+      return false;
   }
 
   files.clear();

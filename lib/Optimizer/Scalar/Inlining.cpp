@@ -21,6 +21,7 @@
 #include "llvh/Support/Debug.h"
 
 STATISTIC(NumInlinedCalls, "Number of inlined calls");
+STATISTIC(NumRecordReturnCalls, "Record-producing calls inlined for object removal");
 STATISTIC(
     NumSpecInlinedCalls,
     "Number of inlined calls that are speculatively inlined");
@@ -176,7 +177,9 @@ static std::vector<Function *> orderFunctions(Module *M) {
 ///   \c canInline is true if the pass is capable of inlining \p F.
 ///   \c numSignificantInstructions the number of instructions that
 ///   aren't param/return. Only valid when canInline=true.
-static std::pair<bool, size_t> canBeInlined(Function *F) {
+static std::pair<bool, size_t> canBeInlined(
+    Function *F,
+    bool allowTryCatch = false) {
   size_t numSignificantInstructions = 0;
 
   // Allow inlining between functions of different strictness,
@@ -187,6 +190,13 @@ static std::pair<bool, size_t> canBeInlined(Function *F) {
         ++numSignificantInstructions;
       }
       switch (I.getKind()) {
+        case ValueKind::TryStartInstKind:
+          // SH can clone handlers and repair their enclosing catch targets.
+          // Only the bounded record-return policy opts into the extra spills.
+          if (allowTryCatch)
+            break;
+          return {false, 0};
+
         // TODO: We can allow LIRGetThisNSInst to be inlined but it needs to be
         // copied with other parameters.
         case ValueKind::LIRGetThisNSInstKind:
@@ -195,10 +205,6 @@ static std::pair<bool, size_t> canBeInlined(Function *F) {
         // on the function it is executed in.
         case ValueKind::CreateArgumentsLooseInstKind:
         case ValueKind::CreateArgumentsStrictInstKind:
-
-        // Don't inline try/catch because we can't JIT it and it forces register
-        // allocation to deopt in the native backend.
-        case ValueKind::TryStartInstKind:
 
         // CreateGenerator cannot be inlined because it implicitly accesses the
         // current closure and arguments.
@@ -512,6 +518,78 @@ static std::pair<bool, size_t> shouldTryToInline(
   return {true, numSignificantInstructions};
 }
 
+/// Identify direct parameter field reads as an inlining profitability hint.
+/// The existing object promotion pass still owns the complete escape/layout
+/// proof after the call has been exposed.
+static llvh::SmallSetVector<unsigned, 4> objectReadParameters(Function *F) {
+  llvh::SmallSetVector<unsigned, 4> parameters;
+  for (auto &BB : *F) {
+    for (auto &I : BB) {
+      Value *object = nullptr;
+      if (auto *load = llvh::dyn_cast<LoadPropertyInst>(&I))
+        object = load->getObject();
+      else if (auto *load = llvh::dyn_cast<PrLoadInst>(&I))
+        object = load->getObject();
+      if (auto *parameter = llvh::dyn_cast_or_null<LoadParamInst>(object))
+        parameters.insert(parameter->getParam()->getIndexInParamList());
+    }
+  }
+  return parameters;
+}
+
+/// Require a single fresh result whose identity never escapes the producer.
+/// The caller check below then makes its existing own fields promotable after
+/// inlining, without relying on input immutability or helper effect summaries.
+static AllocObjectLiteralInst *unpackedReturnRecord(Function *F) {
+  ReturnInst *result = nullptr;
+  for (auto &BB : *F) {
+    if (auto *ret = llvh::dyn_cast<ReturnInst>(BB.getTerminator())) {
+      if (result)
+        return nullptr;
+      result = ret;
+    }
+  }
+  auto *alloc = result
+      ? llvh::dyn_cast<AllocObjectLiteralInst>(result->getValue())
+      : nullptr;
+  if (!alloc || !alloc->getKeyValuePairCount() ||
+      alloc->getKeyValuePairCount() > 8)
+    return nullptr;
+  for (unsigned i = 0; i < alloc->getKeyValuePairCount(); ++i)
+    if (!llvh::isa<LiteralString>(alloc->getKey(i)))
+      return nullptr;
+  for (auto *user : alloc->getUsers()) {
+    if (user == result)
+      continue;
+    auto *store = llvh::dyn_cast<PrStoreInst>(user);
+    if (!store || store->getObject() != alloc ||
+        store->getStoredValue() == alloc ||
+        store->getPropIndex() >= alloc->getKeyValuePairCount())
+      return nullptr;
+  }
+  return alloc;
+}
+
+static bool onlyUnpacksRecord(
+    BaseCallInst *call,
+    AllocObjectLiteralInst *record) {
+  if (!call->hasUsers() || !call->getCalleeIsAlwaysClosure()->getValue() ||
+      !call->getNewTarget()->getType().isUndefinedType())
+    return false;
+  for (auto *user : call->getUsers()) {
+    auto *load = llvh::dyn_cast<LoadPropertyInst>(user);
+    if (!load || load->getObject() != call)
+      return false;
+    unsigned i = 0;
+    for (; i < record->getKeyValuePairCount(); ++i)
+      if (load->getProperty() == record->getKey(i))
+        break;
+    if (i == record->getKeyValuePairCount())
+      return false;
+  }
+  return true;
+}
+
 bool Inlining::runOnModule(Module *M) {
   if (!M->getContext().getOptimizationSettings().inlining)
     return false;
@@ -530,8 +608,11 @@ bool Inlining::runOnModule(Module *M) {
   auto *nonFunctionErrorLS =
       builder.getLiteralString("Trying to call a non-function");
 
-  // Find functions with try/catch blocks, to avoid inlining into them.
+  // Record try/catch callers for the stricter growth policy.
   llvh::DenseSet<Function *> functionsWithTryCatch{};
+  llvh::SmallDenseMap<Function *, size_t, 8> tryInliningGrowth;
+  llvh::SmallDenseMap<Function *, size_t, 8> recordInliningGrowth;
+  unsigned recordCallsites = 0;
   for (Function *FC : functionOrder) {
     if (functionHasTryCatch(FC)) {
       functionsWithTryCatch.insert(FC);
@@ -558,6 +639,21 @@ bool Inlining::runOnModule(Module *M) {
     // Check the heuristic before doing any work.
     auto [shouldInline, numSignificantInstructions] =
         shouldTryToInline(FC, callsites);
+    const auto &settings = M->getContext().getOptimizationSettings();
+    auto *returnRecord = settings.staticHermesInlining && settings.inlineRecordReturns
+        ? unpackedReturnRecord(FC)
+        : nullptr;
+    const bool recordOnly = !shouldInline;
+    const bool producerHasTry = returnRecord && functionHasTryCatch(FC);
+    constexpr size_t kRecordInlineSizeLimit = 256;
+    constexpr size_t kRecordInlineGrowthLimit = 512;
+    if (returnRecord && !shouldInline) {
+      auto [canInline, size] = canBeInlined(FC, true);
+      if (canInline && size <= kRecordInlineSizeLimit) {
+        shouldInline = true;
+        numSignificantInstructions = size;
+      }
+    }
     if (!shouldInline) {
       if (FC->getAlwaysInline()) {
         FC->getParent()->getContext().getSourceErrorManager().warning(
@@ -567,9 +663,24 @@ bool Inlining::runOnModule(Module *M) {
       continue;
     }
 
+    const auto objectParameters =
+        M->getContext().getOptimizationSettings().staticHermesInlining
+        ? objectReadParameters(FC)
+        : llvh::SmallSetVector<unsigned, 4>{};
+
     for (BaseCallInst *CI : callsites) {
       // We know the callee is an IR function, so it must be possible to inline.
       Function *intoFunction = CI->getParent()->getParent();
+      const bool unpackedRecord = returnRecord && recordCallsites < 128 &&
+          // Introducing the first handler roots every caller temporary in SH,
+          // which can cost more than eliminating the returned record saves.
+          (!producerHasTry || functionsWithTryCatch.count(intoFunction)) &&
+          numSignificantInstructions <= kRecordInlineSizeLimit &&
+          recordInliningGrowth.lookup(intoFunction) + numSignificantInstructions <=
+              kRecordInlineGrowthLimit &&
+          onlyUnpacksRecord(CI, returnRecord);
+      if (recordOnly && !unpackedRecord)
+        continue;
 
       // If it's a recursive call, it can't be inlined.
       if (FC == intoFunction) {
@@ -599,13 +710,38 @@ bool Inlining::runOnModule(Module *M) {
       // Very small functions are still worth inlining regardless, because the
       // JIT/native backend deopt is more expensive than the code size.
       static constexpr size_t kTryCatchInlineSizeLimit = 5;
+      bool objectReaderInTry = false;
       if (functionsWithTryCatch.count(intoFunction) &&
-          numSignificantInstructions >= kTryCatchInlineSizeLimit) {
-        LLVM_DEBUG(
-            llvh::dbgs() << "Cannot inline function '"
-                         << FC->getInternalNameStr()
-                         << "': contains try/catch\n");
-        continue;
+          numSignificantInstructions >= kTryCatchInlineSizeLimit &&
+          !unpackedRecord) {
+        // SH already stores every value of a try/catch caller in rooted locals
+        // across longjmp. A small reader of a freshly allocated argument can
+        // remove that allocation and its field operations after inlining.
+        // Bound both individual copies and total added instructions per caller
+        // per pass; keep the ordinary JIT/bytecode policy unchanged.
+        static constexpr size_t kObjectReaderInlineSizeLimit = 32;
+        static constexpr size_t kTryInlineGrowthLimit = 128;
+        if (numSignificantInstructions <= kObjectReaderInlineSizeLimit &&
+            tryInliningGrowth.lookup(intoFunction) +
+                    numSignificantInstructions <=
+                kTryInlineGrowthLimit &&
+            CI->getCalleeIsAlwaysClosure()->getValue()) {
+          for (unsigned index : objectParameters) {
+            if (index < CI->getNumArguments() &&
+                llvh::isa<BaseAllocObjectLiteralInst>(
+                    CI->getArgument(index))) {
+              objectReaderInTry = true;
+              break;
+            }
+          }
+        }
+        if (!objectReaderInTry) {
+          LLVM_DEBUG(
+              llvh::dbgs() << "Cannot inline function '"
+                           << FC->getInternalNameStr()
+                           << "': contains try/catch\n");
+          continue;
+        }
       }
 
       // We cannot inline into a potentially constructing call if the callee
@@ -647,6 +783,8 @@ bool Inlining::runOnModule(Module *M) {
           llvh::dbgs() << "\n";);
 
       intoFunctions.insert(intoFunction);
+      if (objectReaderInTry)
+        tryInliningGrowth[intoFunction] += numSignificantInstructions;
 
       // Split the block in two and move all instructions following the call
       // to the new block.
@@ -686,6 +824,14 @@ bool Inlining::runOnModule(Module *M) {
       auto *returnValue = inlineFunction(builder, FC, CI, nextBlock);
       CI->replaceAllUsesWith(returnValue);
       CI->eraseFromParent();
+
+      if (unpackedRecord) {
+        recordInliningGrowth[intoFunction] += numSignificantInstructions;
+        ++recordCallsites;
+        ++NumRecordReturnCalls;
+        if (producerHasTry)
+          functionsWithTryCatch.insert(intoFunction);
+      }
 
       ++NumInlinedCalls;
       changed = true;

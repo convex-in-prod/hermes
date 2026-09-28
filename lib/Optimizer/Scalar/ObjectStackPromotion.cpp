@@ -7,15 +7,115 @@
 
 #define DEBUG_TYPE "objectstackpromotion"
 
+#include "hermes/IR/CFG.h"
 #include "hermes/IR/IRBuilder.h"
 #include "hermes/IR/Instrs.h"
 #include "hermes/Optimizer/PassManager/Pass.h"
 #include "hermes/Support/Statistic.h"
 
+#include <memory>
+
 STATISTIC(ObjsEliminated, "Object allocations eliminated");
 
 namespace hermes {
 namespace {
+
+/// Distribute a copy of branch-local literal objects into their incoming
+/// blocks. Only phis may precede the copy, so each write remains after the
+/// source evaluation and before the same following effects. The destination
+/// must already exist and the source objects must have no observable aliases.
+bool lowerConditionalObjectCopies(Function *F) {
+  std::unique_ptr<DominanceInfo> dominance;
+  IRBuilder builder(F);
+  IRBuilder::InstructionDestroyer destroyer;
+  bool changed = false;
+  for (auto &BB : *F) {
+    auto first = BB.begin();
+    while (first != BB.end() && llvh::isa<PhiInst>(&*first))
+      ++first;
+    if (first == BB.end())
+      continue;
+    auto *copy = llvh::dyn_cast<CallBuiltinInst>(&*first);
+    if (!copy || copy->getBuiltinIndex() !=
+            BuiltinMethod::HermesBuiltin_copyDataProperties ||
+        copy->getNumArguments() != 3)
+      continue;
+    auto *target = llvh::dyn_cast<AllocObjectLiteralInst>(copy->getArgument(1));
+    auto *phi = llvh::dyn_cast<PhiInst>(copy->getArgument(2));
+    if (!target || !phi || phi->getParent() != &BB || !phi->hasOneUser() ||
+        phi->getNumEntries() > 8)
+      continue;
+    if (!dominance)
+      dominance = std::make_unique<DominanceInfo>(F);
+
+    struct Source {
+      BasicBlock *block;
+      llvh::SmallVector<std::pair<Literal *, Value *>, 8> fields;
+    };
+    llvh::SmallVector<Source, 2> sources;
+    bool eligible = true;
+    for (unsigned i = 0; i < phi->getNumEntries(); ++i) {
+      auto [value, block] = phi->getEntry(i);
+      auto *alloc = llvh::dyn_cast<AllocObjectLiteralInst>(value);
+      // Only an ordinary branch may move the definitions to the predecessor;
+      // TryStart/TryEnd terminators would cross an exception-handler boundary.
+      auto *branch = llvh::dyn_cast<BranchInst>(block->getTerminator());
+      if (!alloc || alloc->getParent() != block || !branch ||
+          branch->getBranchDest() != &BB ||
+          !dominance->properlyDominates(target, branch) ||
+          alloc->getKeyValuePairCount() > 8) {
+        eligible = false;
+        break;
+      }
+      for (const auto &source : sources)
+        if (source.block == block)
+          eligible = false;
+      Source source{block, {}};
+      for (unsigned key = 0; key < alloc->getKeyValuePairCount(); ++key) {
+        auto *name = alloc->getKey(key);
+        if (!llvh::isa<LiteralString>(name) &&
+            !llvh::isa<LiteralNumber>(name))
+          eligible = false;
+        source.fields.emplace_back(name, alloc->getValue(key));
+      }
+      for (auto *user : alloc->getUsers()) {
+        if (user == phi)
+          continue;
+        auto *store = llvh::dyn_cast<PrStoreInst>(user);
+        if (!store || store->getParent() != block ||
+            store->getObject() != alloc || store->getStoredValue() == alloc ||
+            store->getPropIndex() >= source.fields.size()) {
+          eligible = false;
+          break;
+        }
+      }
+      if (!eligible)
+        break;
+      // Use the last store to each own data field, in execution order. Calls
+      // producing these values remain at their original positions.
+      for (auto &I : *block)
+        if (auto *store = llvh::dyn_cast<PrStoreInst>(&I))
+          if (store->getObject() == alloc)
+            source.fields[store->getPropIndex()].second = store->getStoredValue();
+      sources.push_back(std::move(source));
+    }
+    if (!eligible)
+      continue;
+    for (const auto &source : sources) {
+      builder.setInsertionPoint(source.block->getTerminator());
+      builder.setLocation(copy->getLocation());
+      for (auto [key, value] : source.fields)
+        builder.createDefineOwnPropertyInst(
+            value, target, key, IRBuilder::PropEnumerable::Yes);
+    }
+    copy->replaceAllUsesWith(target);
+    // Remove the use now, so the phi is dead before the promotion scan below.
+    copy->eraseFromParent();
+    destroyer.add(phi);
+    changed = true;
+  }
+  return changed;
+}
 
 /// Try to promote the given object to a series of AllocStackInsts if it does
 /// not escape its enclosing function. If successful, \p alloc and all of its
@@ -239,7 +339,7 @@ bool tryPromoteObject(
 }
 
 bool runObjectStackPromotion(Function *F) {
-  bool changed = false;
+  bool changed = lowerConditionalObjectCopies(F);
   // Iterate over all instructions in the function and try to promote any
   // BaseAllocObjectLiteralInsts.
   IRBuilder::InstructionDestroyer destroyer;

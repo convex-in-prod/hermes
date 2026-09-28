@@ -13,6 +13,11 @@
 #endif
 
 NATIVE_FUNCTION(arrayBufferConstructor)
+NATIVE_FUNCTION(hermesInternalCreateNativePromiseCore)
+NATIVE_FUNCTION(nativePromiseOperation)
+NATIVE_FUNCTION(nativePromiseConstructor)
+NATIVE_FUNCTION(nativePromiseResolveFunction)
+NATIVE_FUNCTION(nativePromiseReactionJob)
 NATIVE_FUNCTION(arrayBufferIsView)
 
 NATIVE_FUNCTION(arrayBufferPrototypeByteLength)

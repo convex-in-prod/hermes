@@ -95,6 +95,7 @@ LowerBuiltinCallsContext::LowerBuiltinCallsContext(StringTable &strTab)
 
   calleeNamesToTryOptimize_.insert(applyID);
   calleeNamesToTryOptimize_.insert(callID);
+  calleeNamesToTryOptimize_.insert(strTab.getIdentifier("some"));
 }
 
 hermes::OptValue<BuiltinMethod::Enum>
@@ -158,10 +159,14 @@ static bool tryLowerStaticBuiltin(
       llvh::dbgs() << "Found builtin [" << (int)*builtinIndex << "] "
                    << getBuiltinMethodName(*builtinIndex) << "()\n");
 
-  // Always lower HermesInternal.xxx() calls, but only lower the rest if
-  // -fstatic-builtins is enabled.
+  // Embedders may replace random without replacing the deterministic Math
+  // methods. Keep that narrower contract separate from all-static builtins.
+  const auto &settings = F->getContext().getOptimizationSettings();
+  const bool staticMath = settings.staticMathBuiltins &&
+      objLit->getValue().str() == "Math" &&
+      propLit->getValue().str() != "random";
   if (objLit->getValue() != builtins.hermesInternalID &&
-      !F->getContext().getOptimizationSettings().staticBuiltins) {
+      !settings.staticBuiltins && !staticMath) {
     return false;
   }
 
@@ -189,6 +194,99 @@ static bool tryLowerStaticBuiltin(
   return true;
 }
 
+/// Lower a known predicate before inlining. Only the receiver's length is
+/// snapshotted: each iteration still tests presence and reads the current value,
+/// so holes, inherited accessors and callback mutations retain their effects.
+static bool tryOptimizeArraySome(
+    IRBuilder &builder,
+    Function *F,
+    CallInst *call) {
+  if (!F->getContext().getOptimizationSettings().arrayCallbacks ||
+      call->getNumArguments() < 2 || call->getNumArguments() > 3 ||
+      !call->getNewTarget()->getType().isUndefinedType())
+    return false;
+  auto *callback = llvh::dyn_cast<CreateFunctionInst>(call->getArgument(1));
+  if (!callback || !llvh::isa<NormalFunction>(callback->getFunctionCode()))
+    return false;
+  unsigned instructions = 0;
+  for (auto &block : *callback->getFunctionCode())
+    for (auto &inst : block) {
+      (void)inst;
+      if (++instructions > 128)
+        return false;
+    }
+
+  builder.setLocation(call->getLocation());
+  auto *before = call->getParent();
+  auto *join = splitBasicBlock(before, call->getIterator());
+  auto *arrayGuard = builder.createBasicBlock(F);
+  auto *slow = builder.createBasicBlock(F);
+  auto *header = builder.createBasicBlock(F);
+  auto *present = builder.createBasicBlock(F);
+  auto *invoke = builder.createBasicBlock(F);
+  auto *next = builder.createBasicBlock(F);
+  auto *found = builder.createBasicBlock(F);
+  auto *receiver = call->getThis();
+
+  // The original method lookup and argument evaluations already happened.
+  // Compare the actual callee, not a mutable Array.prototype property.
+  builder.setInsertionBlock(before);
+  builder.createBranchIfBuiltinInst(
+      BuiltinMethod::HermesBuiltin_arrayPrototypeSome,
+      call->getCallee(),
+      arrayGuard,
+      slow);
+  builder.setInsertionBlock(arrayGuard);
+  auto *length = builder.createCallBuiltinInst(
+      BuiltinMethod::HermesBuiltin_arrayIterationLength, {receiver});
+  auto *isArray = builder.createBinaryOperatorInst(
+      length,
+      builder.getLiteralPositiveZero(),
+      ValueKind::BinaryGreaterThanOrEqualInstKind);
+  builder.createCondBranchInst(isArray, header, slow);
+
+  builder.setInsertionBlock(header);
+  auto *index = builder.createPhiInst();
+  index->addEntry(builder.getLiteralPositiveZero(), arrayGuard);
+  auto *inBounds = builder.createBinaryOperatorInst(
+      index, length, ValueKind::BinaryLessThanInstKind);
+  builder.createCondBranchInst(inBounds, present, join);
+  builder.setInsertionBlock(present);
+  auto *hasElement = builder.createBinaryOperatorInst(
+      index, receiver, ValueKind::BinaryInInstKind);
+  builder.createCondBranchInst(hasElement, invoke, next);
+  builder.setInsertionBlock(invoke);
+  auto *element = builder.createLoadPropertyInst(receiver, index);
+  auto *test = builder.createCallInst(
+      callback,
+      callback->getFunctionCode(),
+      /* calleeIsAlwaysClosure */ true,
+      callback->getScope(),
+      builder.getLiteralUndefined(),
+      call->getNumArguments() == 3 ? call->getArgument(2)
+                                   : builder.getLiteralUndefined(),
+      {element, index, receiver});
+  builder.createCondBranchInst(test, found, next);
+  builder.setInsertionBlock(next);
+  auto *increment = builder.createBinaryOperatorInst(
+      index, builder.getLiteralNumber(1), ValueKind::BinaryAddInstKind);
+  builder.createBranchInst(header);
+  index->addEntry(increment, next);
+  builder.setInsertionBlock(found);
+  builder.createBranchInst(join);
+
+  builder.setInsertionBlock(slow);
+  auto *continuation = builder.createBranchInst(join);
+  call->moveBefore(continuation);
+  builder.setInsertionPoint(&join->front());
+  auto *result = builder.createPhiInst();
+  call->replaceAllUsesWith(result);
+  result->addEntry(call, slow);
+  result->addEntry(builder.getLiteralBool(false), header);
+  result->addEntry(builder.getLiteralBool(true), found);
+  return true;
+}
+
 static bool tryOptimizeKnownCallable(
     IRBuilder &builder,
     Function *F,
@@ -199,6 +297,9 @@ static bool tryOptimizeKnownCallable(
 
   auto &builtins = LowerBuiltinCallsContext::get(F->getParent());
   IRBuilder::InstructionDestroyer destroyer;
+
+  if (propLit->getValue().str() == "some")
+    return tryOptimizeArraySome(builder, F, callInst);
 
   if (propLit->getValue() == builtins.callID) {
     // Add a fast path for "call" by splitting the basic block and trying to
@@ -336,9 +437,12 @@ static bool run(Function *F, bool optimize) {
   }
 
   // Optimize calls to known callables.
+  unsigned arraySites = 0;
   for (auto *callInst : callsToOptimize) {
     auto *loadProp = llvh::cast<BaseLoadPropertyInst>(callInst->getCallee());
     auto *propLit = llvh::cast<LiteralString>(loadProp->getProperty());
+    if (propLit->getValue().str() == "some" && arraySites++ >= 8)
+      continue;
     changed |=
         tryOptimizeKnownCallable(builder, F, callInst, loadProp, propLit);
   }

@@ -93,13 +93,15 @@ HermesValue createArrayConstructor(Runtime &runtime) {
       nullptr,
       arrayPrototypeConcat,
       1);
-  defineMethod(
-      runtime,
-      arrayPrototype,
-      Predefined::getSymbolID(Predefined::join),
-      nullptr,
-      arrayPrototypeJoin,
-      1);
+  runtime.registerBuiltin(
+      BuiltinMethod::HermesBuiltin_arrayPrototypeJoin,
+      defineMethod(
+          runtime,
+          arrayPrototype,
+          Predefined::getSymbolID(Predefined::join),
+          nullptr,
+          arrayPrototypeJoin,
+          1));
   defineMethod(
       runtime,
       arrayPrototype,
@@ -275,13 +277,15 @@ HermesValue createArrayConstructor(Runtime &runtime) {
       nullptr,
       arrayPrototypeEvery,
       1);
-  defineMethod(
-      runtime,
-      arrayPrototype,
-      Predefined::getSymbolID(Predefined::some),
-      nullptr,
-      arrayPrototypeSome,
-      1);
+  runtime.registerBuiltin(
+      BuiltinMethod::HermesBuiltin_arrayPrototypeSome,
+      defineMethod(
+          runtime,
+          arrayPrototype,
+          Predefined::getSymbolID(Predefined::some),
+          nullptr,
+          arrayPrototypeSome,
+          1));
   defineMethod(
       runtime,
       arrayPrototype,

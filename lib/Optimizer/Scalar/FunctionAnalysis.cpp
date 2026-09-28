@@ -464,6 +464,85 @@ void analyzeFunctionCallsites(Function *F) {
   }
 }
 
+/// Resolve a closure's code through closed call arguments and returned closures.
+/// This never substitutes the closure object or its environment: separate calls
+/// to a factory may return the same code with different captured values.
+class KnownClosureTargets {
+  llvh::DenseMap<Value *, Function *> targets_;
+
+  Function *resolve(Value *value, unsigned &remaining) {
+    if (remaining == 0)
+      return nullptr;
+    --remaining;
+    auto inserted = targets_.try_emplace(value, nullptr);
+    if (!inserted.second)
+      return inserted.first->second;
+
+    Function *target = nullptr;
+    auto merge = [&](Value *candidate) {
+      auto *next = resolve(candidate, remaining);
+      if (!next || (target && target != next))
+        return false;
+      target = next;
+      return true;
+    };
+    if (auto *create = llvh::dyn_cast<BaseCreateCallableInst>(value)) {
+      target = create->getFunctionCode();
+    } else if (auto *phi = llvh::dyn_cast<PhiInst>(value)) {
+      for (unsigned i = 0; i < phi->getNumEntries(); ++i)
+        if (!merge(phi->getEntry(i).first))
+          return nullptr;
+    } else if (auto *narrow = llvh::dyn_cast<UnionNarrowTrustedInst>(value)) {
+      target = resolve(narrow->getSingleOperand(), remaining);
+    } else if (auto *parameter = llvh::dyn_cast<LoadParamInst>(value)) {
+      auto *function = parameter->getFunction();
+      // Strict functions with no unknown callers cannot acquire another
+      // callback through external invocation or an aliased arguments object.
+      if (!function->allCallsitesKnown() ||
+          function->getNumUsers() > remaining)
+        return nullptr;
+      unsigned index = parameter->getParam()->getIndexInParamList();
+      auto callsites = getKnownCallsites(function);
+      if (callsites.size() > remaining)
+        return nullptr;
+      for (auto *call : callsites)
+        if (index >= call->getNumArguments() ||
+            !merge(call->getArgument(index)))
+          return nullptr;
+    } else if (auto *call = llvh::dyn_cast<BaseCallInst>(value)) {
+      auto *function = llvh::dyn_cast<Function>(call->getTarget());
+      if (!function || !call->getNewTarget()->getType().isUndefinedType())
+        return nullptr;
+      for (auto &BB : *function) {
+        if (remaining == 0)
+          return nullptr;
+        --remaining;
+        if (auto *ret = llvh::dyn_cast<ReturnInst>(BB.getTerminator()))
+          if (!merge(ret->getValue()))
+            return nullptr;
+      }
+    }
+    // Recursive dependencies encounter the null entry above and remain unknown.
+    // Reacquire the map entry because recursive insertions can reallocate it.
+    targets_[value] = target;
+    return target;
+  }
+
+ public:
+  void analyze(BaseCallInst *call) {
+    if (!llvh::isa<EmptySentinel>(call->getTarget()))
+      return;
+    unsigned remaining = 128;
+    auto *target = resolve(call->getCallee(), remaining);
+    if (!target)
+      return;
+    call->setTarget(target);
+    call->setCalleeIsAlwaysClosure(call->getModule()->getLiteralBool(true));
+    // Leave environment empty. Inlining/direct calls must obtain the scope
+    // from the actual callback, rather than any factory's creation site.
+  }
+};
+
 } // namespace
 
 Pass *createFunctionAnalysis() {
@@ -481,6 +560,12 @@ Pass *createFunctionAnalysis() {
       for (Function &F : *M) {
         analyzeFunctionCallsites(&F);
       }
+      KnownClosureTargets targets;
+      for (Function &F : *M)
+        for (auto &BB : F)
+          for (auto &I : BB)
+            if (auto *call = llvh::dyn_cast<BaseCallInst>(&I))
+              targets.analyze(call);
       return true;
     }
   };

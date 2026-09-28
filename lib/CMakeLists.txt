@@ -10,6 +10,10 @@ add_hermes_library(hermesOptimizer
   Optimizer/PassManager/Pipeline.cpp
   Optimizer/Scalar/SimplifyCFG.cpp
   Optimizer/Scalar/CSE.cpp
+  Optimizer/Scalar/GuardedRecordLoadDedup.cpp
+  Optimizer/Scalar/GuardedDataPropertyDefinitions.cpp
+  Optimizer/Scalar/GuardedByteArrayLoops.cpp
+  Optimizer/Scalar/ScopedNormalizationReuse.cpp
   Optimizer/Scalar/CodeMotion.cpp
   Optimizer/Scalar/DCE.cpp
   Optimizer/Scalar/MetroRequireOpt.cpp
@@ -24,14 +28,19 @@ add_hermes_library(hermesOptimizer
   Optimizer/Scalar/SimpleStackPromotion.cpp
   Optimizer/Scalar/ObjectMergeNewStores.cpp
   Optimizer/Scalar/ObjectStackPromotion.cpp
+  Optimizer/Scalar/ObjectLateMaterialization.cpp
   Optimizer/Scalar/InstSimplify.cpp
   Optimizer/Scalar/Auditor.cpp
   Optimizer/Scalar/ResolveStaticRequire.cpp
   Optimizer/Scalar/FuncSigOpts.cpp
   Optimizer/Scalar/Utils.cpp
   Optimizer/Scalar/FunctionAnalysis.cpp
+  Optimizer/Scalar/GuardedMethodCalls.cpp
   Optimizer/Scalar/Inlining.cpp
   Optimizer/Scalar/InstructionEscapeAnalysis.cpp
+  Optimizer/Scalar/RecordUseAnalysis.cpp
+  Optimizer/Scalar/RecordReturnAnalysis.cpp
+  Optimizer/Scalar/RecordReturnLoadForwarding.cpp
   Optimizer/Scalar/TDZDedup.cpp
   Optimizer/Scalar/PrivateBrandCheckDedup.cpp
   Optimizer/Scalar/StripDebugInsts.cpp

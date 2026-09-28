@@ -11,6 +11,7 @@
 #include "hermes/BCGen/HBC/BCProvider.h"
 #include "hermes/BCGen/SerializedLiteralGenerator.h"
 #include "hermes/BCGen/ShapeTableEntry.h"
+#include "hermes/Support/StringTableEntry.h"
 #include "llvh/ADT/DenseMap.h"
 
 namespace hermes {
@@ -31,6 +32,25 @@ struct LiteralOffset {
 
 using LiteralOffsetMapTy = llvh::DenseMap<const Instruction *, LiteralOffset>;
 
+/// Validated allocation hints for serialized literals. Current literals are
+/// serialized normally and matched by exact bytes before retaining an offset.
+/// An empty instance requests cold layout capture; nullptr leaves it disabled.
+struct RetainedBuffers {
+  std::vector<unsigned char> values;
+  std::vector<unsigned char> keys;
+  std::vector<StringTableEntry> valueEntries;
+  std::vector<StringTableEntry> keyEntries;
+  std::vector<ShapeTableEntry> shapes;
+  /// ValueKind of each shape's allocation; typed shapes cannot share caches
+  /// with ordinary or typed non-enumerable object shapes.
+  std::vector<uint8_t> shapeKinds;
+  size_t liveValueEntries{0};
+  size_t liveKeyEntries{0};
+  size_t liveShapes{0};
+  size_t liveValueBytes{0};
+  size_t liveKeyBytes{0};
+};
+
 /// The LiteralBufferBuilder will build this struct as its output.
 struct Result {
   std::vector<unsigned char> literalValBuffer;
@@ -48,7 +68,8 @@ Result generate(
     const SerializedLiteralGenerator::StringLookupFn &getIdentifier,
     const SerializedLiteralGenerator::StringLookupFn &getString,
     bool optimize,
-    hbc::BCProviderBase *bcProvider = nullptr);
+    hbc::BCProviderBase *bcProvider = nullptr,
+    RetainedBuffers *retainedBuffers = nullptr);
 } // namespace LiteralBufferBuilder
 } // namespace hermes
 

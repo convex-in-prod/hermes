@@ -469,6 +469,7 @@ Runtime::Runtime(
   jsLibFlags.enableHermesInternal = runtimeConfig.getEnableHermesInternal();
   jsLibFlags.enableHermesInternalTestMethods =
       runtimeConfig.getEnableHermesInternalTestMethods();
+  jsLibFlags.enableNativePromise = runtimeConfig.getEnableNativePromise();
   initGlobalObject(*this, jsLibFlags);
 
   // Once the global object has been initialized, populate native builtins to
@@ -1892,25 +1893,30 @@ void Runtime::initNativeBuiltins() {
 }
 
 static const struct JSBuiltin {
-  uint16_t symID, builtinIndex;
+  const char *name;
+  uint16_t builtinIndex;
 } jsBuiltins[] = {
 #define NORMAL_OBJECT(object)
 #define NORMAL_METHOD(object, method)
 #define BUILTIN_METHOD(object, method)
 #define PRIVATE_BUILTIN(name)
 #define JS_BUILTIN(name) \
-  {(uint16_t)Predefined::name, (uint16_t)BuiltinMethod::HermesBuiltin##_##name},
+  {#name, (uint16_t)BuiltinMethod::HermesBuiltin##_##name},
 #include "hermes/FrontEndDefs/Builtins.def"
 };
 
 void Runtime::initJSBuiltins(Handle<JSObject> jsBuiltinsObj) {
   for (const JSBuiltin &jsBuiltin : jsBuiltins) {
-    auto symID = jsBuiltin.symID;
     auto builtinIndex = jsBuiltin.builtinIndex;
+
+    // Private builtin names are resolved only during initialization. They need
+    // no predefined symbol IDs that would shift unrelated runtime symbols.
+    auto symID = ignoreAllocationFailure(identifierTable_.getSymbolHandle(
+        *this, createASCIIRef(jsBuiltin.name)));
 
     // Try to get the JS function from jsBuiltinsObj.
     auto getRes = JSObject::getNamed_RJS(
-        jsBuiltinsObj, *this, Predefined::getSymbolID((Predefined::Str)symID));
+        jsBuiltinsObj, *this, *symID);
     assert(
         getRes == ExecutionStatus::RETURNED &&
         !getRes.getValue()->isUndefined() && "Failed to get JS builtin.");

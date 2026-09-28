@@ -858,6 +858,25 @@ HermesValue createHermesInternalObject(
   // absent or false.
   defineInternMethodAndSymbol("test262Enabled", hermesInternalTest262Enabled);
 
+  if (flags.enableNativePromise) {
+    // Internal JavaScript captures and deletes this factory during runtime
+    // initialization, before any application code can obtain the core methods.
+    auto bootstrapDPF = constantDPF;
+    bootstrapDPF.configurable = 1;
+    auto name = runtime.ignoreAllocationFailure(
+        runtime.getIdentifierTable().getSymbolHandle(
+            runtime, createASCIIRef("createNativePromiseCore")));
+    (void)defineMethod(
+        runtime,
+        lv.intern,
+        *name,
+        *name,
+        nullptr,
+        hermesInternalCreateNativePromiseCore,
+        1,
+        bootstrapDPF);
+  }
+
 #ifdef HERMES_ENABLE_FUZZILLI
   defineInternMethod(P::fuzzilli, hermesInternalFuzzilli);
 #endif

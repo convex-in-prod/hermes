@@ -2102,7 +2102,10 @@ CallResult<bool> JSObject::defineOwnPropertyInternal(
     SymbolID name,
     DefinePropertyFlags dpFlags,
     Handle<> valueOrAccessor,
-    PropOpFlags opFlags) {
+    PropOpFlags opFlags,
+    SHUnit *unit,
+    WritePropertyCacheEntry *cacheEntry) {
+  assert(!cacheEntry || unit);
   assert(
       !opFlags.getMustExist() && "cannot use mustExist with defineOwnProperty");
   assert(
@@ -2156,11 +2159,13 @@ CallResult<bool> JSObject::defineOwnPropertyInternal(
     // initialize it and try again.
     JSObject::initializeLazyObject(runtime, selfHandle);
     return defineOwnPropertyInternal(
-        selfHandle, runtime, name, dpFlags, valueOrAccessor, opFlags);
+        selfHandle, runtime, name, dpFlags, valueOrAccessor, opFlags, unit,
+        cacheEntry);
   }
 
   return addOwnProperty(
-      selfHandle, runtime, name, dpFlags, valueOrAccessor, opFlags);
+      selfHandle, runtime, name, dpFlags, valueOrAccessor, opFlags,
+      /*runtimeModule*/ nullptr, unit, cacheEntry);
 }
 
 ExecutionStatus JSObject::defineNewOwnProperty(

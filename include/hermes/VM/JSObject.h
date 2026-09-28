@@ -454,6 +454,13 @@ class JSObject : public GCCell {
     return flags_.fastIndexProperties;
   }
 
+  /// \return true if indirect storage has been allocated for named slots.
+  /// This is intentionally exposed only as a predicate; callers must still
+  /// use the ordinary property APIs to allocate or update that storage.
+  bool hasPropertyStorage() const {
+    return static_cast<bool>(propStorage_);
+  }
+
   /// \return the `__proto__` internal property, which may be nullptr.
   JSObject *getParent(PointerBase &runtime) const {
     return getParentGCPtr().get(runtime);
@@ -1091,6 +1098,8 @@ class JSObject : public GCCell {
   /// \param valueOrAccessor the value of the new property. If the property is
   ///   an accessor, it should be an instance of \c PropertyAccessor.
   /// \param opFlags flags modifying the behavior in case of error.
+  /// \param unit owner of the optional property-addition cache.
+  /// \param cacheEntry cache to populate for an ordinary property addition.
   /// \return \c true on success. In case of failure it returns an exception
   ///   or false, depending on the value of \c opFlags.ThrowOnError.
   /// Note: This can throw even if ThrowOnError is false,
@@ -1104,7 +1113,9 @@ class JSObject : public GCCell {
       SymbolID name,
       DefinePropertyFlags dpFlags,
       Handle<> valueOrAccessor,
-      PropOpFlags opFlags = PropOpFlags()) {
+      PropOpFlags opFlags = PropOpFlags(),
+      SHUnit *unit = nullptr,
+      WritePropertyCacheEntry *cacheEntry = nullptr) {
 #ifdef HERMES_SLOW_DEBUG
     // In slow debug, check if the symbol looks like an array index. If that's
     // the case, it should be using defineOwnComputed instead.
@@ -1114,7 +1125,8 @@ class JSObject : public GCCell {
         "Array index property should use defineOwnComputed instead");
 #endif
     return defineOwnPropertyInternal(
-        selfHandle, runtime, name, dpFlags, valueOrAccessor, opFlags);
+        selfHandle, runtime, name, dpFlags, valueOrAccessor, opFlags, unit,
+        cacheEntry);
   }
 
   /// Same as \c defineOwnProperty, except the name can be a valid array index.
@@ -1125,7 +1137,9 @@ class JSObject : public GCCell {
       SymbolID name,
       DefinePropertyFlags dpFlags,
       Handle<> valueOrAccessor,
-      PropOpFlags opFlags = PropOpFlags());
+      PropOpFlags opFlags = PropOpFlags(),
+      SHUnit *unit = nullptr,
+      WritePropertyCacheEntry *cacheEntry = nullptr);
 
   /// Define a new property, which must not already exist in this object.
   /// This is similar in intent to ES5.1 \c defineOwnProperty(), but is simpler

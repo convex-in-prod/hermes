@@ -65,12 +65,54 @@ struct OptimizationSettings {
   static constexpr unsigned kDefaultInlineMaxSize = 50;
   unsigned inlineMaxSize{kDefaultInlineMaxSize};
 
+  /// Use bounded Static Hermes inlining opportunities that expose temporary
+  /// objects in callers whose values already live in rooted exception frames.
+  bool staticHermesInlining{false};
+
+  /// Inline bounded record producers when the caller only unpacks their fields.
+  bool inlineRecordReturns{false};
+
+  /// Start internal async generators directly from the current SH call frame.
+  bool asyncFrameArguments{false};
+
+  /// Call private async state machines directly and reuse their result record.
+  bool asyncGeneratorResults{false};
+
   /// Reuse property cache entries for same property name.
   bool reusePropCache{true};
 
   /// Recognize calls to global functions like Object.keys() and turn them
   /// into builtin calls.
   bool staticBuiltins{false};
+
+  /// Assume Math methods other than random retain their original definitions.
+  bool staticMathBuiltins{false};
+
+  /// Assume the intrinsic Object.prototype is nonextensible, has a null parent,
+  /// and has no nonstandard string keys before this code can execute.
+  bool staticObjectPrototype{false};
+
+  /// Expose known array predicate callbacks to the optimizer behind guards.
+  bool arrayCallbacks{false};
+
+  /// Reuse record reads within regions guarded against accessors and effects.
+  bool guardedRecordLoads{false};
+  bool guardedDataPropertyDefinitions{false};
+
+  /// Specialize effect-free numeric loops behind a byte-array range guard.
+  bool guardedByteArrayLoops{false};
+
+  /// Expose lexically available method bodies behind exact closure guards.
+  bool guardedMethodCalls{false};
+
+  /// Reuse proved string computations within an embedding-owned invocation scope.
+  bool scopedNormalizationReuse{false};
+
+  /// Fuse trim-result comparisons behind primitive and builtin guards.
+  bool stringTrimComparisons{false};
+
+  /// Keep proved integer temporaries in native integer storage during SH emission.
+  bool nativeIntegerRegisters{false};
 
   /// Attempt to resolve CommonJS require() calls at compile time.
   bool staticRequire{false};
