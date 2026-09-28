@@ -794,6 +794,11 @@ ExecutionStatus Interpreter::putByValTransient_RJS(
     Handle<> name,
     Handle<> value,
     bool strictMode) {
+  // Reject an uncoercible receiver before converting the key. Key conversion
+  // can execute user code and must not run for a null or undefined receiver.
+  if (LLVM_UNLIKELY(base->isNull() || base->isUndefined()))
+    return runtime.raiseTypeError("Cannot set a property on null or undefined");
+
   auto idRes = valueToSymbolID(runtime, name);
   if (idRes == ExecutionStatus::EXCEPTION)
     return ExecutionStatus::EXCEPTION;

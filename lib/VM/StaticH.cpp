@@ -7,6 +7,7 @@
 
 #include "SHUnitExt.h"
 #include "hermes/BCGen/SerializedLiteralParser.h"
+#include "hermes/Platform/Unicode/PlatformUnicode.h"
 #include "hermes/Support/UTF8.h"
 #include "hermes/VM/ArrayStorage.h"
 #include "hermes/VM/Callable.h"
@@ -21,6 +22,7 @@
 #include "hermes/VM/JSRegExp.h"
 #include "hermes/VM/JSTypedArray.h"
 #include "hermes/VM/ModuleExportsCache-inline.h"
+#include "hermes/VM/PrimitiveBox.h"
 #include "hermes/VM/PropertyAccessor.h"
 #include "hermes/VM/SerializedLiteralOperations.h"
 #include "hermes/VM/ScopedStringReuse.h"
@@ -31,6 +33,7 @@
 
 #include "JSLib/JSLibInternal.h"
 
+#include <algorithm>
 #include <cstdarg>
 #include <cmath>
 #include <limits>
@@ -215,6 +218,350 @@ extern "C" void _sh_ljs_reify_arguments_strict(
   reifyArguments(shr, frame, lazyReg, true);
 }
 
+static int32_t readIndexedCharacter(
+    SHRuntime *shr,
+    SHLegacyValue source,
+    SHLegacyValue key) {
+  auto value = *toPHV(&source);
+  auto keyValue = *toPHV(&key);
+  uint32_t index;
+  if (value.isString() && keyValue.isNumber() &&
+      sh_tryfast_f64_to_u32(keyValue.getNumber(), index) &&
+      index < value.getString()->getStringLength())
+    return value.getString()->at(index);
+
+  Runtime &runtime = getRuntime(shr);
+  auto result = [&]() -> CallResult<int32_t> {
+    GCScopeMarkerRAII marker{runtime};
+    struct : Locals {
+      PinnedValue<> source;
+      PinnedValue<> key;
+    } lv;
+    LocalsRAII lraii{runtime, &lv};
+    // Native calls pass values by copy. Root both before property-key coercion
+    // or a getter can collect, and leave every RAII scope before throwing to JS.
+    lv.source = value;
+    lv.key = keyValue;
+    auto read = lv.source->isObject()
+        ? JSObject::getComputed_RJS(
+              Handle<JSObject>::vmcast(&lv.source), runtime, lv.key)
+        : Interpreter::getByValTransient_RJS(runtime, lv.source, lv.key);
+    if (LLVM_UNLIKELY(read == ExecutionStatus::EXCEPTION))
+      return ExecutionStatus::EXCEPTION;
+    auto observed = read->getHermesValue();
+    if (observed.isString() && observed.getString()->getStringLength() == 1)
+      return int32_t(observed.getString()->at(0));
+    return -1;
+  }();
+  if (LLVM_UNLIKELY(result == ExecutionStatus::EXCEPTION))
+    _sh_throw_current(shr);
+  return result.getValue();
+}
+
+extern "C" bool _sh_ljs_is_plain_record(
+    SHRuntime *shr,
+    SHLegacyValue source) {
+  auto &runtime = getRuntime(shr);
+  const auto value = *toPHV(&source);
+  if (!value.isObject())
+    return false;
+  auto *object = vmcast<JSObject>(value);
+  // Do not initialize lazy state, invoke host hooks or follow custom prototypes.
+  if (object->getKind() != CellKind::JSObjectKind || object->isHostObject() ||
+      object->isLazy())
+    return false;
+  auto *clazz = object->getClass(runtime);
+  if (clazz->isDictionary() || clazz->isTyped() || clazz->getMayHaveAccessor())
+    return false;
+  auto *parent = object->getParent(runtime);
+  return parent == nullptr || parent == *runtime.objectPrototype;
+}
+
+extern "C" bool _sh_ljs_can_define_data_property(
+    SHRuntime *shr,
+    SHLegacyValue callee,
+    SHLegacyValue source) {
+  auto *function = dyn_vmcast<NativeFunction>(*toPHV(&callee));
+  const auto value = *toPHV(&source);
+  if (!function || function->getFunctionPtr() != objectDefineProperty ||
+      !value.isObject())
+    return false;
+  auto &runtime = getRuntime(shr);
+  auto *object = vmcast<JSObject>(value);
+  // Skipping `in` must not remove a proxy/host hook or lazy initialization,
+  // including one on a prototype. This probe neither allocates nor calls JS.
+  for (unsigned depth = 0; object && depth < 16; ++depth) {
+    if (object->getKind() != CellKind::JSObjectKind || object->isHostObject() ||
+        object->isProxyObject() || object->isLazy() ||
+        object->getClass(runtime)->isTyped())
+      return false;
+    object = object->getParent(runtime);
+  }
+  return object == nullptr;
+}
+
+extern "C" int32_t _sh_ljs_try_string_trim_equal(
+    SHLegacyValue callee,
+    SHLegacyValue source) {
+  const auto value = *toPHV(&source);
+  const auto method = *toPHV(&callee);
+  auto *function = dyn_vmcast<NativeFunction>(method);
+  if (!value.isString() || !function ||
+      function->getFunctionPtr() != stringPrototypeTrim)
+    return -1;
+
+  auto *string = value.getString();
+  const auto length = string->getStringLength();
+  if (!length)
+    return 1;
+  // Equality only depends on the endpoints. No substring, call frame or
+  // coercion is needed, including when the complete string is whitespace.
+  const char16_t first = string->at(0);
+  const char16_t last = string->at(length - 1);
+  return !(isWhiteSpaceChar(first) || isLineTerminatorChar(first) ||
+           isWhiteSpaceChar(last) || isLineTerminatorChar(last));
+}
+
+extern "C" bool _sh_ljs_has_array_join(SHRuntime *shr) {
+  auto &runtime = getRuntime(shr);
+  NamedPropertyDescriptor descriptor;
+  if (!JSObject::getOwnNamedDescriptor(
+          runtime.arrayPrototype, runtime,
+          Predefined::getSymbolID(Predefined::join), descriptor) ||
+      descriptor.flags.accessor)
+    return false;
+  auto value = JSObject::getNamedSlotValueUnsafe(
+      *runtime.arrayPrototype, runtime, descriptor).unboxToHV(runtime);
+  return value.isObject() && value.getObject() == runtime.getBuiltinCallable(
+      BuiltinMethod::HermesBuiltin_arrayPrototypeJoin);
+}
+
+template <typename Key>
+static bool hasOwnNativeMethod(
+    Runtime &runtime,
+    Handle<JSObject> object,
+    Key key,
+    NativeFunctionPtr expected) {
+  NamedPropertyDescriptor descriptor;
+  if (!JSObject::getOwnNamedDescriptor(
+          object, runtime, Predefined::getSymbolID(key), descriptor) ||
+      descriptor.flags.accessor)
+    return false;
+  auto value = JSObject::getNamedSlotValueUnsafe(
+      object.get(), runtime, descriptor).unboxToHV(runtime);
+  auto *function = dyn_vmcast<NativeFunction>(value);
+  // Several string methods share an entry point with different contexts.
+  return function && function->getFunctionPtr() == expected &&
+      function->getContext() == nullptr;
+}
+
+extern "C" bool _sh_ljs_has_normalization_builtins(SHRuntime *shr) {
+  auto &runtime = getRuntime(shr);
+  if (!runtime.activeStringReuse)
+    return false;
+  auto *callee = vmcast<NativeJSFunction>(
+      runtime.getCurrentFrame().getCalleeClosureUnsafe());
+  if (!runtime.activeStringReuse->allowsReuse(callee->getFunctionInfo()))
+    return false;
+  return hasOwnNativeMethod(runtime, runtime.stringPrototype,
+                            Predefined::trim, stringPrototypeTrim) &&
+      hasOwnNativeMethod(runtime, runtime.stringPrototype,
+                         Predefined::includes, stringPrototypeIncludesOrStartsWith) &&
+      hasOwnNativeMethod(runtime, runtime.arrayPrototype,
+                         Predefined::join, arrayPrototypeJoin);
+}
+
+extern "C" bool _sh_ljs_has_scan_reuse_builtins(SHRuntime *shr) {
+  auto &runtime = getRuntime(shr);
+  if (!runtime.activeStringReuse)
+    return false;
+  auto *callee = vmcast<NativeJSFunction>(
+      runtime.getCurrentFrame().getCalleeClosureUnsafe());
+  if (!runtime.activeStringReuse->allowsReuse(callee->getFunctionInfo()))
+    return false;
+  GCScopeMarkerRAII marker{runtime};
+  if (runtime.arrayPrototype->getParent(runtime) != *runtime.objectPrototype ||
+      runtime.stringPrototype->getParent(runtime) != *runtime.objectPrototype ||
+      runtime.objectPrototype->getParent(runtime) != nullptr ||
+      vmcast<JSArray>(*runtime.arrayPrototype)->getEndIndex() != 0)
+    return false;
+  const std::array<Handle<JSObject>, 3> prototypes{
+      runtime.arrayPrototype, runtime.stringPrototype, runtime.objectPrototype};
+  if (!runtime.activeStringReuse->hasScanNumericKeyProof(prototypes)) {
+    for (auto prototype : prototypes) {
+      auto clazz = runtime.makeHandle(prototype->getClass(runtime));
+      if (clazz->isDictionary() || clazz->getHasIndexLikeProperties())
+        return false;
+      // Numeric string indexing can observe inherited negative, fractional,
+      // NaN or Infinity keys as well as array indices. Never invoke a getter.
+      if (!HiddenClass::forEachPropertyWhile(clazz, runtime,
+          [](Runtime &runtime, SymbolID key, NamedPropertyDescriptor) {
+            if (!isPropertyNamePrimitive(key))
+              return true;
+            auto name = runtime.getIdentifierTable().getStringView(runtime, key);
+            if (name.length() == 0)
+              return true;
+            auto first = name[0];
+            return !((first >= '0' && first <= '9') || first == '-' ||
+                     first == 'N' || first == 'I');
+          }))
+        return false;
+    }
+    runtime.activeStringReuse->rememberScanNumericKeyProof(prototypes);
+  }
+  return hasOwnNativeMethod(runtime, runtime.stringPrototype,
+                            Predefined::trim, stringPrototypeTrim) &&
+      hasOwnNativeMethod(runtime, runtime.stringPrototype,
+                         Predefined::slice, stringPrototypeSlice) &&
+      hasOwnNativeMethod(runtime, runtime.arrayPrototype,
+                         Predefined::push, arrayPrototypePush);
+}
+
+/// Copy only bounded dense string arrays. The compiler proves local ownership;
+/// this representation check avoids exposing cached identities even when other
+/// successful paths return nested records, sparse arrays or large results.
+static CallResult<HermesValue> copyScanResult(
+    Runtime &runtime,
+    Handle<> result,
+    uint64_t remaining = ScopedStringReuse::maxEntryStorageBytes) {
+  if (result->isString())
+    return ScopedStringReuse::consumeStringStorage(result->getString(), remaining)
+        ? result.getHermesValue()
+        : HermesValue::encodeUndefinedValue();
+  auto array = Handle<JSArray>::dyn_vmcast(result);
+  if (!array || array->getParent(runtime) != *runtime.arrayPrototype ||
+      !array->hasFastIndexProperties() || !array->isExtensible() ||
+      array->getClass(runtime)->getNumProperties() !=
+          runtime.arrayClass->getNumProperties())
+    return HermesValue::encodeUndefinedValue();
+  auto length = JSArray::getLength(*array, runtime);
+  if (length > 128 || array->getBeginIndex() != 0 || array->getEndIndex() != length)
+    return HermesValue::encodeUndefinedValue();
+  const uint64_t elementBytes = uint64_t(length) * sizeof(SmallHermesValue);
+  if (elementBytes > remaining)
+    return HermesValue::encodeUndefinedValue();
+  remaining -= elementBytes;
+  for (uint32_t i = 0; i < length; ++i) {
+    auto value = array->at(runtime, i);
+    if (!value.isString() || !ScopedStringReuse::consumeStringStorage(
+                                 value.getString(runtime), remaining))
+      return HermesValue::encodeUndefinedValue();
+  }
+  auto created = JSArray::create(runtime, length, length);
+  if (created == ExecutionStatus::EXCEPTION)
+    return ExecutionStatus::EXCEPTION;
+  auto copy = runtime.makeHandle(std::move(*created));
+  for (uint32_t i = 0; i < length; ++i)
+    JSArray::unsafeSetExistingElementAt(*copy, runtime, i, array->at(runtime, i));
+  return copy.getHermesValue();
+}
+
+extern "C" SHLegacyValue _sh_ljs_scan_reuse_lookup(
+    SHRuntime *shr, SHLegacyValue input) {
+  auto &runtime = getRuntime(shr);
+  auto copied = [&]() -> CallResult<HermesValue> {
+    GCScopeMarkerRAII marker{runtime};
+    auto *scope = runtime.activeStringReuse;
+    assert(scope && "scan guard must establish an active invocation scope");
+    auto *callee = vmcast<NativeJSFunction>(
+        runtime.getCurrentFrame().getCalleeClosureUnsafe());
+    auto snapshot = runtime.makeHandle(scope->lookup(
+        callee->getFunctionInfo(), {toPHV(&input), 1}));
+    return copyScanResult(runtime, snapshot);
+  }();
+  if (copied == ExecutionStatus::EXCEPTION)
+    _sh_throw_current(shr);
+  return *copied;
+}
+
+extern "C" void _sh_ljs_scan_reuse_store(
+    SHRuntime *shr, SHLegacyValue input, SHLegacyValue result) {
+  auto &runtime = getRuntime(shr);
+  auto status = [&]() -> ExecutionStatus {
+    GCScopeMarkerRAII marker{runtime};
+    auto key = runtime.makeHandle(*toPHV(&input));
+    auto value = runtime.makeHandle(*toPHV(&result));
+    uint64_t remaining = ScopedStringReuse::maxEntryStorageBytes;
+    if (!ScopedStringReuse::consumeStringStorage(key->getString(), remaining))
+      return ExecutionStatus::RETURNED;
+    auto copied = copyScanResult(runtime, value, remaining);
+    if (copied == ExecutionStatus::EXCEPTION)
+      return ExecutionStatus::EXCEPTION;
+    if (copied->isUndefined())
+      return ExecutionStatus::RETURNED;
+    auto *callee = vmcast<NativeJSFunction>(
+        runtime.getCurrentFrame().getCalleeClosureUnsafe());
+    const PinnedHermesValue storedInput{key.getHermesValue()};
+    runtime.activeStringReuse->store(
+        callee->getFunctionInfo(), {&storedInput, 1}, *copied);
+    return ExecutionStatus::RETURNED;
+  }();
+  if (status == ExecutionStatus::EXCEPTION)
+    _sh_throw_current(shr);
+}
+
+extern "C" SHLegacyValue _sh_ljs_string_reuse_lookup(
+    SHRuntime *shr, uint32_t count, ...) {
+  auto &runtime = getRuntime(shr);
+  if (!runtime.activeStringReuse)
+    return HermesValue::encodeUndefinedValue();
+  assert(count > 0 && count <= ScopedStringReuse::maxInputs);
+  std::array<PinnedHermesValue, ScopedStringReuse::maxInputs> inputs;
+  va_list arguments;
+  va_start(arguments, count);
+  for (unsigned i = 0; i < count; ++i) {
+    auto value = va_arg(arguments, SHLegacyValue);
+    inputs[i] = *toPHV(&value);
+  }
+  va_end(arguments);
+  auto *callee = vmcast<NativeJSFunction>(
+      runtime.getCurrentFrame().getCalleeClosureUnsafe());
+  return runtime.activeStringReuse->lookup(
+      callee->getFunctionInfo(), {inputs.data(), count});
+}
+
+extern "C" void _sh_ljs_string_reuse_store(
+    SHRuntime *shr, SHLegacyValue result, uint32_t count, ...) {
+  auto &runtime = getRuntime(shr);
+  if (!runtime.activeStringReuse)
+    return;
+  assert(count > 0 && count <= ScopedStringReuse::maxInputs);
+  std::array<PinnedHermesValue, ScopedStringReuse::maxInputs> inputs;
+  va_list arguments;
+  va_start(arguments, count);
+  for (unsigned i = 0; i < count; ++i) {
+    auto value = va_arg(arguments, SHLegacyValue);
+    inputs[i] = *toPHV(&value);
+  }
+  va_end(arguments);
+  auto *callee = vmcast<NativeJSFunction>(
+      runtime.getCurrentFrame().getCalleeClosureUnsafe());
+  runtime.activeStringReuse->store(callee->getFunctionInfo(),
+      {inputs.data(), count}, *toPHV(&result));
+}
+
+LLVM_ATTRIBUTE_NOINLINE
+extern "C" SHLegacyValue _sh_ljs_get_indexed_char_code(
+    SHRuntime *shr,
+    SHLegacyValue source,
+    SHLegacyValue key) {
+  return HermesValue::encodeTrustedNumberValue(
+      readIndexedCharacter(shr, source, key));
+}
+
+LLVM_ATTRIBUTE_NOINLINE
+extern "C" SHLegacyValue _sh_ljs_string_index_compare(
+    SHRuntime *shr,
+    SHLegacyValue source,
+    double key,
+    uint16_t character,
+    uint8_t invert) {
+  assert(toPHV(&source)->isString() && "compiler must prove a primitive string");
+  int32_t code = readIndexedCharacter(
+      shr, source, HermesValue::encodeTrustedNumberValue(key));
+  return HermesValue::encodeBoolValue((code == character) != invert);
+}
+
 LLVM_ATTRIBUTE_NOINLINE
 extern "C" SHLegacyValue _sh_ljs_get_by_val_with_receiver_rjs(
     SHRuntime *shr,
@@ -292,6 +639,64 @@ _sh_ljs_get_by_index_rjs(SHRuntime *shr, SHLegacyValue *source, uint32_t key) {
     _sh_throw_current(shr);
   }
   return res->getHermesValue();
+}
+
+LLVM_ATTRIBUTE_NOINLINE
+extern "C" SHLegacyValue _sh_ljs_get_by_val_cached_rjs(
+    SHRuntime *shr,
+    SHLegacyValue *source,
+    SHLegacyValue *key,
+    SHComputedReadCacheEntry *cache) {
+  Runtime &runtime = getRuntime(shr);
+  const auto sourceValue = *toPHV(source);
+  const auto keyValue = *toPHV(key);
+  if (sourceValue.isObject()) {
+    SymbolID id{};
+    if (keyValue.isSymbol()) {
+      id = keyValue.getSymbol();
+    } else if (keyValue.isString() && keyValue.getString()->isUniqued()) {
+      id = keyValue.getString()->getUniqueID(runtime);
+    }
+    if (id.isValid()) {
+      auto *obj = vmcast<JSObject>(sourceValue);
+      const CompressedPointer clazzPtr{obj->getClassGCPtr()};
+      constexpr unsigned associativity = SH_COMPUTED_READ_CACHE_ASSOCIATIVITY;
+      constexpr unsigned sets = SH_COMPUTED_READ_CACHE_WAYS / associativity;
+      static_assert(SH_COMPUTED_READ_CACHE_WAYS % associativity == 0);
+      auto *entries = reinterpret_cast<ComputedReadCacheEntry *>(cache) +
+          (id.unsafeGetRaw() % sets) * associativity;
+      for (unsigned i = 0; i < associativity; ++i) {
+        if (entries[i].clazz == clazzPtr && entries[i].key == id) {
+          return JSObject::getNamedSlotValueUnsafe(obj, runtime, entries[i].slot)
+              .unboxToHV(runtime);
+        }
+      }
+      // Restrict insertion to ordinary objects and immutable shapes. No key
+      // coercion, allocation or user code occurs between lookup and slot read.
+      if (obj->getKind() == CellKind::JSObjectKind &&
+          !obj->getFlags().hostObject && !obj->getFlags().lazyObject &&
+          !obj->getClass(runtime)->isDictionary()) {
+        NamedPropertyDescriptor desc;
+        auto found = JSObject::tryGetOwnNamedDescriptorFast(obj, runtime, id, desc);
+        if (found && *found && !desc.flags.accessor) {
+          // FIFO replacement within this key's set. Moving weak entries is safe
+          // here because descriptor lookup and the slot read cannot collect.
+          for (unsigned i = associativity - 1; i > 0; --i) {
+            entries[i].clazz = entries[i - 1].clazz.getNoBarrierUnsafe();
+            entries[i].key = entries[i - 1].key;
+            entries[i].slot = entries[i - 1].slot;
+          }
+          auto &entry = entries[0];
+          entry.clazz = clazzPtr;
+          entry.key = id;
+          entry.slot = desc.slot;
+          return JSObject::getNamedSlotValueUnsafe(obj, runtime, desc)
+              .unboxToHV(runtime);
+        }
+      }
+    }
+  }
+  return _sh_ljs_get_by_val_with_receiver_rjs(shr, source, key, source);
 }
 
 LLVM_ATTRIBUTE_NOINLINE
@@ -813,6 +1218,8 @@ static inline void putById_RJS(
         sh_unit_get_add_cache_entry(unit, cacheEntry->getAddCacheIndex());
     if (LLVM_LIKELY(addCacheEntry.startClazz == clazzPtr) &&
         LLVM_LIKELY(addCacheEntry.resultClazz) &&
+        // preventExtensions changes an object flag without changing its shape.
+        LLVM_LIKELY(obj->isExtensible()) &&
         LLVM_LIKELY(
             addCacheEntry.getParentEpoch() == runtime.getParentCacheEpoch()) &&
         LLVM_LIKELY(addCacheEntry.parent == obj->getParentGCPtr())) {
@@ -1043,6 +1450,91 @@ extern "C" void _sh_ljs_put_by_val_strict_rjs(
   putByVal_RJS(shr, target, key, value, true);
 }
 
+template <bool strictMode>
+static void putByValCached_RJS(
+    SHRuntime *shr,
+    SHUnit *unit,
+    SHLegacyValue *target,
+    SHLegacyValue *key,
+    SHLegacyValue *value,
+    SHComputedWriteCacheEntry *cache) {
+  Runtime &runtime = getRuntime(shr);
+  const auto targetValue = *toPHV(target);
+  const auto keyValue = *toPHV(key);
+  if (targetValue.isObject()) {
+    auto *obj = vmcast<JSObject>(targetValue);
+    SymbolID id{};
+    if (keyValue.isSymbol()) {
+      id = keyValue.getSymbol();
+    } else if (keyValue.isString() && keyValue.getString()->isUniqued()) {
+      id = keyValue.getString()->getUniqueID(runtime);
+    }
+    // Indexed/exotic receivers keep their computed-property semantics. Key
+    // coercion also stays on the original path, at the original program point.
+    if (id.isValid() && obj->getKind() == CellKind::JSObjectKind &&
+        !obj->isHostObject() && !obj->getFlags().lazyObject) {
+      constexpr unsigned associativity = SH_COMPUTED_WRITE_CACHE_ASSOCIATIVITY;
+      constexpr unsigned sets = SH_COMPUTED_WRITE_CACHE_WAYS / associativity;
+      static_assert(SH_COMPUTED_WRITE_CACHE_WAYS % associativity == 0);
+      auto *entries = reinterpret_cast<ComputedWriteCacheEntry *>(cache) +
+          (id.unsafeGetRaw() % sets) * associativity;
+      ComputedWriteCacheEntry *unused = nullptr;
+      for (unsigned i = 0; i < associativity; ++i) {
+        auto &entry = entries[i];
+        if (entry.initialized && entry.key == id) {
+          putById_RJS<false, strictMode>(
+              runtime, unit, toPHV(target), id, toPHV(value), &entry.write);
+          return;
+        }
+        if (!unused && (!entry.initialized || entry.key.isInvalid()))
+          unused = &entry;
+      }
+      if (unused &&
+          (!keyValue.isString() || !toArrayIndex(keyValue.getString()))) {
+        // Keep each live key bound to this entry even during recursive setters.
+        // A collected key can be reused, but its old shape and transition must
+        // be invalidated first. Reuse the add-cache index to bound storage.
+        unused->write.clazz = CompressedPointer{nullptr};
+        if (unused->write.hasAddCacheIndex()) {
+          auto &add = sh_unit_get_add_cache_entry(
+              unit, unused->write.getAddCacheIndex());
+          add.startClazz = CompressedPointer{nullptr};
+          add.resultClazz = CompressedPointer{nullptr};
+          add.parent = CompressedPointer{nullptr};
+        }
+        unused->key = id;
+        unused->initialized = 1;
+        putById_RJS<false, strictMode>(
+            runtime, unit, toPHV(target), id, toPHV(value), &unused->write);
+        return;
+      }
+    }
+  }
+  putByVal_RJS(shr, target, key, value, strictMode);
+}
+
+LLVM_ATTRIBUTE_NOINLINE
+extern "C" void _sh_ljs_put_by_val_cached_loose_rjs(
+    SHRuntime *shr,
+    SHUnit *unit,
+    SHLegacyValue *target,
+    SHLegacyValue *key,
+    SHLegacyValue *value,
+    SHComputedWriteCacheEntry *cache) {
+  putByValCached_RJS<false>(shr, unit, target, key, value, cache);
+}
+
+LLVM_ATTRIBUTE_NOINLINE
+extern "C" void _sh_ljs_put_by_val_cached_strict_rjs(
+    SHRuntime *shr,
+    SHUnit *unit,
+    SHLegacyValue *target,
+    SHLegacyValue *key,
+    SHLegacyValue *value,
+    SHComputedWriteCacheEntry *cache) {
+  putByValCached_RJS<true>(shr, unit, target, key, value, cache);
+}
+
 static inline void putByIndex_RJS(
     SHRuntime *shr,
     SHLegacyValue *target,
@@ -1270,8 +1762,25 @@ static inline HermesValue getByIdWithReceiver_RJS(
     CallResult<PseudoHandle<>> resPH{ExecutionStatus::EXCEPTION};
     {
       GCScopeMarkerRAII marker{runtime};
-      resPH = Interpreter::getByIdTransientWithReceiver_RJS(
-          runtime, source, symID, receiver);
+      if (source->isString() && cacheEntry &&
+          symID != Predefined::getSymbolID(Predefined::length)) {
+        auto prototype = Handle<JSObject>::vmcast(&runtime.stringPrototype);
+        // Cache the prototype's own data slot, not its current value. Replacing
+        // a method keeps reading the new slot value; changing property flags
+        // or deleting it invalidates the class match. Accessors keep the
+        // primitive receiver on the ordinary lookup path.
+        if (cacheEntry->clazz == prototype->getClassGCPtr()) {
+          return JSObject::getNamedSlotValueUnsafe(
+                     *prototype, runtime, cacheEntry->getSlot())
+              .unboxToHV(runtime);
+        }
+        resPH = JSObject::getNamedWithReceiver_RJS(
+            prototype, runtime, symID, receiver,
+            DEFAULT_PROP_OP_FLAGS(false), cacheEntry);
+      } else {
+        resPH = Interpreter::getByIdTransientWithReceiver_RJS(
+            runtime, source, symID, receiver);
+      }
     }
     if (LLVM_UNLIKELY(resPH == ExecutionStatus::EXCEPTION))
       _sh_throw_current(getSHRuntime(runtime));
@@ -1418,6 +1927,36 @@ extern "C" SHLegacyValue _sh_ljs_get_by_id_rjs(
 }
 
 LLVM_ATTRIBUTE_NOINLINE
+extern "C" SHLegacyValue _sh_ljs_get_by_id_polymorphic_rjs(
+    SHRuntime *shr,
+    const SHLegacyValue *source,
+    SHSymbolID symID,
+    SHReadPropertyCacheEntry *cache) {
+  auto &runtime = getRuntime(shr);
+  auto *entries = reinterpret_cast<ReadPropertyCacheEntry *>(cache);
+  if (toPHV(source)->isObject()) {
+    auto *object = vmcast<JSObject>(*toPHV(source));
+    const CompressedPointer clazz{object->getClassGCPtr()};
+    for (unsigned i = 0; i < SH_NAMED_READ_CACHE_WAYS; ++i) {
+      if (entries[i].clazz == clazz) {
+        return JSObject::getNamedSlotValueUnsafe(
+                   object, runtime, entries[i].getSlot())
+            .unboxToHV(runtime);
+      }
+    }
+  }
+  // Rotate before the potentially allocating lookup, keeping every weak pointer
+  // in the unit's traced storage. The oldest entry becomes the replacement slot;
+  // uncachable reads retain both entries. Prototype validation stays in getById.
+  std::rotate(
+      cache,
+      cache + SH_NAMED_READ_CACHE_WAYS - 1,
+      cache + SH_NAMED_READ_CACHE_WAYS);
+  return getById_RJS<false>(
+      runtime, Handle<>{toPHV(source)}, SymbolID::unsafeCreate(symID), entries);
+}
+
+LLVM_ATTRIBUTE_NOINLINE
 extern "C" SHLegacyValue _sh_ljs_get_by_id_with_receiver_rjs(
     SHRuntime *shr,
     const SHLegacyValue *source,
@@ -1432,9 +1971,12 @@ extern "C" SHLegacyValue _sh_ljs_get_by_id_with_receiver_rjs(
       reinterpret_cast<ReadPropertyCacheEntry *>(propCacheEntry));
 }
 
-LLVM_ATTRIBUTE_NOINLINE
-extern "C" void _sh_ljs_define_own_by_id(
+// Specialize the legacy and unit-owned entry points without an extra runtime
+// call or unused addition-cache checks on the legacy path.
+LLVM_ATTRIBUTE_ALWAYS_INLINE
+static inline void defineOwnById(
     SHRuntime *shr,
+    SHUnit *unit,
     SHLegacyValue *target,
     SHSymbolID key,
     SHLegacyValue *value,
@@ -1455,6 +1997,24 @@ extern "C" void _sh_ljs_define_own_by_id(
   if (LLVM_LIKELY(cacheEntry && cacheEntry->clazz == clazzPtr)) {
     JSObject::setNamedSlotValueUnsafe(obj, runtime, cacheEntry->getSlot(), shv);
     return;
+  }
+  // An object's shape alone does not rule out exotic or lazy behavior. Reuse
+  // the existing assignment transition cache only for ordinary receivers,
+  // retaining its parent/epoch checks and its traced weak references.
+  const bool cacheAddition = unit && cacheEntry &&
+      obj->getKind() == CellKind::JSObjectKind && !obj->isHostObject() &&
+      !obj->isLazy() && !obj->getClass(runtime)->isTyped();
+  if (cacheAddition) {
+    const auto &add =
+        sh_unit_get_add_cache_entry(unit, cacheEntry->getAddCacheIndex());
+    if (add.startClazz == clazzPtr && add.resultClazz && obj->isExtensible() &&
+        add.getParentEpoch() == runtime.getParentCacheEpoch() &&
+        add.parent == obj->getParentGCPtr()) {
+      JSObject::addNewOwnPropertyInSlot(
+          obj, runtime, add.resultClazz.getNonNull(runtime, runtime.getHeap()),
+          add.getSlot(), shv);
+      return;
+    }
   }
   NamedPropertyDescriptor desc;
   OptValue<bool> hasOwnProp =
@@ -1486,10 +2046,33 @@ extern "C" void _sh_ljs_define_own_by_id(
         symID,
         DefinePropertyFlags::getDefaultNewPropertyFlags(),
         Handle<>(valuePHV),
-        PropOpFlags().plusThrowOnError());
+        PropOpFlags().plusThrowOnError(),
+        unit,
+        cacheAddition ? cacheEntry : nullptr);
   }
   if (LLVM_UNLIKELY(putRes == ExecutionStatus::EXCEPTION))
     _sh_throw_current(getSHRuntime(runtime));
+}
+
+LLVM_ATTRIBUTE_NOINLINE
+extern "C" void _sh_ljs_define_own_by_id(
+    SHRuntime *shr,
+    SHLegacyValue *target,
+    SHSymbolID key,
+    SHLegacyValue *value,
+    SHWritePropertyCacheEntry *propCacheEntry) {
+  defineOwnById(shr, nullptr, target, key, value, propCacheEntry);
+}
+
+LLVM_ATTRIBUTE_NOINLINE
+extern "C" void _sh_ljs_define_own_by_id_in_unit(
+    SHRuntime *shr,
+    SHUnit *unit,
+    SHLegacyValue *target,
+    SHSymbolID key,
+    SHLegacyValue *value,
+    SHWritePropertyCacheEntry *propCacheEntry) {
+  defineOwnById(shr, unit, target, key, value, propCacheEntry);
 }
 
 LLVM_ATTRIBUTE_NOINLINE

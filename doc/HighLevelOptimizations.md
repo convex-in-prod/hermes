@@ -32,6 +32,22 @@ Index-like keys, duplicate names and dictionary layouts retain their existing
 definition path. The four layout statistics keep their existing meaning;
 `hermes_objectLayoutHintHits` additionally counts the direct hint path.
 
+# Fresh ordinary object spread
+
+`copyDataProperties` has a bounded fast path for a fresh empty ordinary target
+and an ordinary source with at most five direct named properties. The source
+properties must be default enumerable data properties in direct slots, with no
+symbols, index-like properties, accessors, proxies, hosts, indirect storage or
+exclusion list. Custom and null prototypes are allowed because only own data
+properties are observed. The target adopts the source's data-only hidden class
+and copies its slots without an own-key walk or one hidden-class transition per
+property.
+
+Every unsupported layout uses the existing generic path. The fast path does not
+retain object identity or values across calls, and its slot writes remain rooted
+and barriered. Embeddings should validate semantics and dynamic reach before
+expecting a runtime benefit; the bounded path is not a general object clone.
+
 # Spreading and modifying existing structures
 
 An example of some sample code found in input to Hermes to clone a Map and add an element:

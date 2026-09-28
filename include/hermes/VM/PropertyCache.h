@@ -136,6 +136,45 @@ struct PrivateNameCacheEntry {
   SlotIndex slot{0};
 };
 
+/// Own data-property reads with a dynamic, already interned key. Both the
+/// shape and key are weak: collecting either must prevent a future cache hit.
+struct ComputedReadCacheEntry {
+  WeakRoot<HiddenClass> clazz{nullptr};
+  WeakRootSymbolID key{};
+  SlotIndex slot{0};
+};
+
+/// A dynamic key's named-write cache. A live key is never replaced: setters may
+/// reenter the same site while putNamed_RJS still owns a pointer to this entry.
+/// The initialization bit distinguishes zero-filled SH storage from symbol 0.
+struct ComputedWriteCacheEntry {
+  WritePropertyCacheEntry write;
+  WeakRootSymbolID key{};
+  uint32_t initialized{0};
+};
+
+static_assert(sizeof(SHComputedWriteCacheEntry) == sizeof(ComputedWriteCacheEntry));
+static_assert(
+    offsetof(SHComputedWriteCacheEntry, write) ==
+    offsetof(ComputedWriteCacheEntry, write));
+static_assert(
+    offsetof(SHComputedWriteCacheEntry, key) ==
+    offsetof(ComputedWriteCacheEntry, key));
+static_assert(
+    offsetof(SHComputedWriteCacheEntry, initialized) ==
+    offsetof(ComputedWriteCacheEntry, initialized));
+
+static_assert(sizeof(SHComputedReadCacheEntry) == sizeof(ComputedReadCacheEntry));
+static_assert(
+    offsetof(SHComputedReadCacheEntry, clazz) ==
+    offsetof(ComputedReadCacheEntry, clazz));
+static_assert(
+    offsetof(SHComputedReadCacheEntry, key) ==
+    offsetof(ComputedReadCacheEntry, key));
+static_assert(
+    offsetof(SHComputedReadCacheEntry, slot) ==
+    offsetof(ComputedReadCacheEntry, slot));
+
 /// A cache entry for adding a property and transitioning the HiddenClass.
 /// Stored in a list in RuntimeModule to save memory in WritePropertyCacheEntry.
 /// In order to hit this cache entry:

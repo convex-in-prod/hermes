@@ -29,6 +29,7 @@
 #include "hermes/Support/DenseMapInfoSpecializations.h"
 #include "hermes/Support/HashString.h"
 #include "hermes/Support/UTF8.h"
+#include "hermes/VMLayouts/PropertyCache.h"
 #include "hermes/VMLayouts/StackFrameLayout.h"
 #include "llvh/ADT/MapVector.h"
 
@@ -485,6 +486,8 @@ class SHNativeJSFunctionTable {
 };
 
 struct ModuleGen {
+  uint32_t nextComputedReadCacheIdx{0};
+  uint32_t nextComputedWriteCacheIdx{0};
   /// Table containing uniqued strings for the current module.
   SHStringTable stringTable{};
 
@@ -696,9 +699,10 @@ class InstrGen {
   }
   llvh::raw_ostream &genStringConstReadIC(
       LiteralString *LS,
-      Value *optValue = nullptr) {
+      Value *optValue = nullptr,
+      uint32_t entries = 1) {
     genStringConstICCommon(LS, optValue);
-    return genReadIC(LS);
+    return genReadIC(LS, entries);
   }
 
   /// Generate a cache index. This must be used when passing parameters to API
@@ -712,10 +716,12 @@ class InstrGen {
       return os_ << "shUnit->write_prop_cache + " << nextWriteCacheIdx_++;
     return os_ << "get_write_prop_cache(shUnit) + " << nextWriteCacheIdx_++;
   }
-  llvh::raw_ostream &genReadIC(LiteralString *LS) {
+  llvh::raw_ostream &genReadIC(LiteralString *LS, uint32_t entries = 1) {
+    const auto index = nextReadCacheIdx_;
+    nextReadCacheIdx_ += entries;
     if (options_.emitCBundle)
-      return os_ << "shUnit->read_prop_cache + " << nextReadCacheIdx_++;
-    return os_ << "get_read_prop_cache(shUnit) + " << nextReadCacheIdx_++;
+      return os_ << "shUnit->read_prop_cache + " << index;
+    return os_ << "get_read_prop_cache(shUnit) + " << index;
   }
   llvh::raw_ostream &genPrivateNameIC(Value *privateName) {
     if (options_.emitCBundle)
@@ -1322,10 +1328,10 @@ class InstrGen {
       os_ << ".raw";
     } else {
       assert(funcUntypedOp);
-      os_ << funcUntypedOp << "(shr, &";
-      generateRegister(*inst.getLeftHandSide());
-      os_ << ", &";
-      generateRegister(*inst.getRightHandSide());
+      os_ << funcUntypedOp << "(shr, ";
+      generateRegisterPtr(*inst.getLeftHandSide());
+      os_ << ", ";
+      generateRegisterPtr(*inst.getRightHandSide());
       os_ << ")";
     }
     if (boolConv)
@@ -1394,16 +1400,18 @@ class InstrGen {
     }
 
     if (strictMode)
-      os_ << "_sh_ljs_put_by_val_strict_rjs";
+      os_ << "_sh_ljs_put_by_val_cached_strict_rjs";
     else
-      os_ << "_sh_ljs_put_by_val_loose_rjs";
-    os_ << "(shr,&";
+      os_ << "_sh_ljs_put_by_val_cached_loose_rjs";
+    os_ << "(shr, shUnit, &";
     generateRegister(*inst.getObject());
     os_ << ", &";
     generateRegister(*inst.getProperty());
     os_ << ", &";
     generateRegister(*inst.getStoredValue());
-    os_ << ");\n";
+    os_ << ", shUnit->computed_write_cache + "
+        << moduleGen_.nextComputedWriteCacheIdx++
+        << " * SH_COMPUTED_WRITE_CACHE_WAYS);\n";
   }
   void generateStorePropertyLooseInst(StorePropertyLooseInst &inst) {
     generateStorePropertyInstImpl(inst, false);
@@ -1465,7 +1473,7 @@ class InstrGen {
       assert(
           inst.getIsEnumerable() &&
           "Non-enumerable properties with literal keys should be handled by LoadConstants");
-      os_ << "_sh_ljs_define_own_by_id(shr,&";
+      os_ << "_sh_ljs_define_own_by_id_in_unit(shr,shUnit,&";
       generateRegister(*inst.getObject());
       os_ << ", ";
       genStringConstWriteIC(LS, inst.getStoredValue()) << ");\n";
@@ -1565,29 +1573,46 @@ class InstrGen {
     generateValue(inst);
     os_ << " = ";
     if (auto *LS = llvh::dyn_cast<LiteralString>(inst.getProperty())) {
-      os_ << (options_.smallC ? "_sh_ljs_get_by_id_rjs"
-                              : "_sh_ljs_get_by_id_rjs_inline")
+      os_ << (options_.smallC ? "_sh_ljs_get_by_id_polymorphic_rjs"
+                             : "_sh_ljs_get_by_id_polymorphic_rjs_inline")
           << "(shr,&";
       generateRegister(*inst.getObject());
       os_ << ",";
-      genStringConstReadIC(LS) << ");\n";
+      genStringConstReadIC(LS, nullptr, SH_NAMED_READ_CACHE_WAYS) << ");\n";
       return;
     }
     // If the prop is an index-like constant, generate the special bytecode.
     if (auto *litNum = llvh::dyn_cast<LiteralNumber>(inst.getProperty())) {
       if (auto idxOpt = doubleToArrayIndex(litNum->getValue())) {
-        os_ << "_sh_ljs_get_by_index_rjs(shr,&";
+        os_ << (options_.smallC ? "_sh_ljs_get_by_index_rjs"
+                               : "_sh_ljs_get_by_index_rjs_inline")
+            << "(shr,&";
         generateRegister(*inst.getObject());
         os_ << ", ";
         os_ << *idxOpt << ");\n";
         return;
       }
     }
-    os_ << "_sh_ljs_get_by_val_rjs(shr,&";
+    if (inst.getProperty()->getType().isNumberType()) {
+      // Numeric-only sites cannot use a named-property cache.
+      os_ << (options_.smallC ? "_sh_ljs_get_by_val_rjs"
+                             : "_sh_ljs_get_by_val_rjs_inline")
+          << "(shr,&";
+      generateRegister(*inst.getObject());
+      os_ << ", &";
+      generateRegister(*inst.getProperty());
+      os_ << ");\n";
+      return;
+    }
+    os_ << (options_.smallC ? "_sh_ljs_get_by_val_cached_rjs"
+                           : "_sh_ljs_get_by_val_cached_rjs_inline")
+        << "(shr,&";
     generateRegister(*inst.getObject());
     os_ << ", &";
     generateRegister(*inst.getProperty());
-    os_ << ");\n";
+    os_ << ", shUnit->computed_read_cache + "
+        << moduleGen_.nextComputedReadCacheIdx++
+        << " * SH_COMPUTED_READ_CACHE_WAYS);\n";
   }
   void generateLoadPropertyWithReceiverInst(
       LoadPropertyWithReceiverInst &inst) {
@@ -3217,6 +3242,10 @@ void generateUnitData(
      << nextReadCacheIdx << "];\n"
      << "  SHPrivateNameCacheEntry private_name_cache_data["
      << nextPrivateNameCacheIdx << "];\n"
+     << "  SHComputedReadCacheEntry computed_read_cache_data["
+     << moduleGen.nextComputedReadCacheIdx << " * SH_COMPUTED_READ_CACHE_WAYS];\n"
+     << "  SHComputedWriteCacheEntry computed_write_cache_data["
+     << moduleGen.nextComputedWriteCacheIdx << " * SH_COMPUTED_WRITE_CACHE_WAYS];\n"
      << "  SHCompressedPointer object_literal_class_cache["
      << moduleGen.literalBuffers.objShapeTable.size() << "];\n};\n"
      << "SHUnit *CREATE_THIS_UNIT(void) {\n"
@@ -3228,11 +3257,18 @@ void generateUnitData(
   OS << ",.num_symbols =" << moduleGen.stringTable.size()
      << ", .num_write_prop_cache_entries = " << nextWriteCacheIdx
      << ", .num_read_prop_cache_entries = " << nextReadCacheIdx
+     << ", .num_private_name_cache_entries = " << nextPrivateNameCacheIdx
+     << ", .num_computed_read_cache_entries = "
+     << moduleGen.nextComputedReadCacheIdx << " * SH_COMPUTED_READ_CACHE_WAYS"
+     << ", .num_computed_write_cache_entries = "
+     << moduleGen.nextComputedWriteCacheIdx << " * SH_COMPUTED_WRITE_CACHE_WAYS"
      << ", .ascii_pool = s_ascii_pool, .u16_pool = s_u16_pool,"
      << ".strings = s_strings, .symbols = unit_data->symbol_data,"
      << ".write_prop_cache = unit_data->write_prop_cache_data,"
      << ".read_prop_cache = unit_data->read_prop_cache_data, "
      << ".private_name_cache = unit_data->private_name_cache_data, "
+     << ".computed_read_cache = unit_data->computed_read_cache_data, "
+     << ".computed_write_cache = unit_data->computed_write_cache_data, "
      << ".obj_key_buffer = s_obj_key_buffer, .obj_key_buffer_size = "
      << moduleGen.literalBuffers.objKeyBuffer.size() << ", "
      << ".literal_val_buffer = s_literal_val_buffer, .literal_val_buffer_size = "

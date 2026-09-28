@@ -937,14 +937,10 @@ static CallResult<HermesValue> convertCase(
     Handle<StringPrimitive> S,
     const bool upperCase,
     const bool useCurrentLocale) {
-  // Copying is unavoidable in this function, do it early on.
-  SmallU16String<32> buff;
-  // Must copy instead of just getting the reference, because later operations
-  // may trigger GC and hence invalid pointers inside S.
-  S->appendUTF16String(buff);
-  UTF16Ref str = buff.arrayRef();
-
   {
+    // Keep the source rooted across output allocation, without first copying
+    // unchanged ASCII strings into a temporary UTF-16 buffer.
+    auto str = StringPrimitive::createStringView(runtime, S);
     // Try a fast path for ASCII strings.
     // First, bitwise-or all the characters to see if any one isn't ASCII.
     char16_t mask = 0;
@@ -964,8 +960,8 @@ static CallResult<HermesValue> convertCase(
       }
     }
     // localeAffectsCasing() is only consulted once the scan says the fast
-    // path is otherwise available: the ICU and Java backends query the host
-    // locale on every call (a JNI round trip on Java), and a non-ASCII
+    // path is otherwise available: the CoreFoundation and Java backends check
+    // the locale on every call (a JNI round trip on Java), and a non-ASCII
     // string can never take this path, so asking first would charge every
     // locale-sensitive conversion for an answer it cannot use.
     if (mask <= 127 &&
@@ -975,7 +971,7 @@ static CallResult<HermesValue> convertCase(
         return S.getHermesValue();
       }
 
-      if (str.size() == 1) {
+      if (str.length() == 1) {
         // Use the Runtime stored representations of single-character strings.
         char16_t c = str[0];
         if (upperCase) {
@@ -1013,6 +1009,9 @@ static CallResult<HermesValue> convertCase(
       return HermesValue::encodeStringValue(*builder->getStringPrimitive());
     }
   }
+  // Unicode/locale conversion can resize the buffer and invoke platform code.
+  SmallU16String<32> buff;
+  S->appendUTF16String(buff);
   platform_unicode::convertToCase(
       buff,
       upperCase ? platform_unicode::CaseConversion::ToUpper

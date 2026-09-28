@@ -128,7 +128,13 @@ JSArrayBuffer::JSArrayBuffer(
     Runtime &runtime,
     Handle<JSObject> parent,
     Handle<HiddenClass> clazz)
-    : JSObject(runtime, *parent, *clazz), attached_(false) {}
+    : JSObject(runtime, *parent, *clazz), attached_(false) {
+  static_assert(sizeof(JSArrayBuffer) == sizeof(SHJSArrayBuffer));
+  static_assert(offsetof(JSArrayBuffer, data_) == offsetof(SHJSArrayBuffer, data));
+  static_assert(offsetof(JSArrayBuffer, size_) == offsetof(SHJSArrayBuffer, size));
+  static_assert(
+      offsetof(JSArrayBuffer, attached_) == offsetof(SHJSArrayBuffer, attached));
+}
 
 void JSArrayBuffer::_finalizeImpl(GCCell *cell, GC &gc) {
   auto *self = vmcast<JSArrayBuffer>(cell);
