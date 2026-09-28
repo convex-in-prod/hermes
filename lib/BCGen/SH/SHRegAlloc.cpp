@@ -10,6 +10,7 @@
 #include "../LivenessRegAllocIRPrinter.h"
 #include "hermes/IR/CFG.h"
 #include "hermes/IR/IRBuilder.h"
+#include "hermes/Optimizer/Scalar/Utils.h"
 #include "hermes/Support/PerfSection.h"
 #include "hermes/Utils/Dumper.h"
 
@@ -103,7 +104,10 @@ Register RegisterFile::tailAllocateConsecutive(RegClass regClass, unsigned n) {
   return Register(regClass, firstClear);
 }
 
-RegisterAllocator::RegisterAllocator(Function *func) : F(func) {
+RegisterAllocator::RegisterAllocator(
+    Function *func,
+    bool separateIntegerRegisters)
+    : F(func), separateIntegerRegisters_(separateIntegerRegisters) {
   for (auto &BB : *F) {
     if (llvh::isa<TryStartInst>(BB.getTerminator())) {
       hasTry_ = true;
@@ -472,6 +476,11 @@ void RegisterAllocator::coalesce(
         dest = map[dest];
       }
 
+      // Keep native integer storage separate when a phi also accepts general
+      // numbers, including negative zero. Its incoming move performs boxing.
+      if (separateIntegerRegisters_ && getRegClass(op) != getRegClass(dest))
+        continue;
+
       unsigned destIdx = getInstructionNumber(dest);
       unsigned opIdx = getInstructionNumber(op);
       Interval &destIvl = instructionInterval_[destIdx];
@@ -520,6 +529,8 @@ RegClass RegisterAllocator::getRegClass(Instruction *inst) {
   // handle exceptions, and the setjmp will be at the start of the function.
   if (hasTry_)
     return RegClass::LocalPtr;
+  if (separateIntegerRegisters_ && getKnownIntegerRange(inst))
+    return RegClass::LocalInteger;
   return inst->getModule()->getTypeContext().isNonPtr(inst->getType())
       ? RegClass::LocalNonPtr
       : RegClass::LocalPtr;
@@ -913,6 +924,9 @@ llvh::raw_ostream &operator<<(llvh::raw_ostream &OS, Register reg) {
         break;
       case RegClass::LocalNonPtr:
         OS << "np" << reg.getIndex();
+        break;
+      case RegClass::LocalInteger:
+        OS << "ni" << reg.getIndex();
         break;
       case RegClass::RegStack:
         OS << "stack[" << reg.getIndex() << ']';

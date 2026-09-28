@@ -25,6 +25,7 @@
 #include "hermes/IR/IR.h"
 #include "hermes/IR/IRVerifier.h"
 #include "hermes/IR/Instrs.h"
+#include "hermes/Optimizer/Scalar/Utils.h"
 #include "hermes/Support/BigIntSupport.h"
 #include "hermes/Support/DenseMapInfoSpecializations.h"
 #include "hermes/Support/HashString.h"
@@ -603,11 +604,20 @@ class InstrGen {
         enclosingTrys_(enclosingTrys),
         registerStorage_(registerStorage) {
     (void)options_;
+    selectIntegerRegisters();
+  }
+
+  uint8_t integerRegisterRange(unsigned index) const {
+    return integerRegisters_.empty() ? 0 : integerRegisters_[index];
   }
 
   /// Converts Instruction \p I into valid C code and outputs it through the
   /// ostream.
   void generate(Instruction &I) {
+    if (nativeIntegerRange(&I)) {
+      generateIntegerInstruction(I);
+      return;
+    }
     switch (I.getKind()) {
 #define DEF_VALUE(CLASS, PARENT) \
   case ValueKind::CLASS##Kind:   \
@@ -662,6 +672,207 @@ class InstrGen {
 
   /// Where LocalPtr and LocalNonPtr registers are stored in generated C.
   RegisterStorage registerStorage_;
+
+  /// A register can be reused by unrelated SSA values. Every definition and
+  /// consumer must support the representation, including lowered phi moves.
+  llvh::SmallVector<uint8_t, 16> integerRegisters_;
+
+  /// A generic operation may coerce operands but still produce a proved integer.
+  /// Use its existing emitter and unbox the result into the integer destination.
+  Instruction *boxedIntegerResult_{nullptr};
+
+  uint8_t nativeIntegerRange(Value *value) const {
+    if (integerRegisters_.empty())
+      return 0;
+    auto reg = ra_.getOptionalRegister(value);
+    return reg && reg->getClass() == sh::RegClass::LocalInteger
+        ? integerRegisters_[reg->getIndex()]
+        : 0;
+  }
+
+  void selectIntegerRegisters() {
+    if (!F_.getContext().getOptimizationSettings().nativeIntegerRegisters ||
+        registerStorage_ != RegisterStorage::LocalsAndNonPtrVariables ||
+        !tryIDs_.empty())
+      return;
+    constexpr uint8_t all = IntegerRangeInt32 | IntegerRangeUint32 |
+        IntegerRangeInt32OrUint32;
+    integerRegisters_.assign(
+        ra_.getMaxRegisterUsage(sh::RegClass::LocalInteger), all);
+    llvh::BitVector seen(integerRegisters_.size());
+    for (auto &block : F_) {
+      for (auto &inst : block) {
+        auto reg = ra_.getOptionalRegister(&inst);
+        if (!reg || reg->getClass() != sh::RegClass::LocalInteger)
+          continue;
+        const auto index = reg->getIndex();
+        seen.set(index);
+        auto &range = integerRegisters_[index];
+        if (!range)
+          continue;
+        range &= getKnownIntegerRange(&inst);
+        bool supported = false;
+        switch (inst.getKind()) {
+          case ValueKind::AsInt32InstKind:
+          case ValueKind::AsUint32InstKind:
+          case ValueKind::MovInstKind:
+          case ValueKind::LIRSpillMovInstKind:
+          case ValueKind::LIRLoadConstInstKind:
+          case ValueKind::UnionNarrowTrustedInstKind:
+          case ValueKind::PhiInstKind:
+            supported = true;
+            break;
+          case ValueKind::BinaryAndInstKind:
+          case ValueKind::BinaryOrInstKind:
+          case ValueKind::BinaryXorInstKind:
+          case ValueKind::BinaryLeftShiftInstKind:
+          case ValueKind::BinaryRightShiftInstKind:
+          case ValueKind::BinaryUnsignedRightShiftInstKind:
+            supported = true;
+            break;
+          case ValueKind::CallBuiltinInstKind:
+            supported = llvh::cast<CallBuiltinInst>(&inst)->getBuiltinIndex() ==
+                BuiltinMethod::Math_imul;
+            break;
+          default:
+            break;
+        }
+        for (auto *user : inst.getUsers()) {
+          if (llvh::isa<BinaryOperatorInst>(user) ||
+              llvh::isa<FUnaryMathInst>(user) ||
+              llvh::isa<FBinaryMathInst>(user) ||
+              llvh::isa<FCompareInst>(user)) {
+            continue;
+          }
+          switch (user->getKind()) {
+            case ValueKind::MovInstKind:
+            case ValueKind::LIRSpillMovInstKind:
+            case ValueKind::ImplicitMovInstKind:
+            case ValueKind::UnionNarrowTrustedInstKind:
+            case ValueKind::PhiInstKind:
+            case ValueKind::AsInt32InstKind:
+            case ValueKind::AsUint32InstKind:
+            case ValueKind::ReturnInstKind:
+            case ValueKind::StoreFrameInstKind:
+            case ValueKind::TypeOfIsInstKind:
+            case ValueKind::CallBuiltinInstKind:
+            case ValueKind::AllocArrayInstKind:
+              break;
+            default:
+              supported = false;
+              break;
+          }
+        }
+        if (!supported)
+          range = 0;
+      }
+    }
+    for (unsigned i = 0; i < integerRegisters_.size(); ++i)
+      if (!seen.test(i))
+        integerRegisters_[i] = 0;
+  }
+
+  void generateIntegerInstruction(Instruction &inst) {
+    if (llvh::isa<PhiInst>(inst))
+      return;
+    const auto destination = ra_.getRegister(&inst);
+    if (auto *binary = llvh::dyn_cast<BinaryOperatorInst>(&inst)) {
+      if (!binary->getLeftHandSide()->getType().isNumberType() ||
+          !binary->getRightHandSide()->getType().isNumberType()) {
+        os_ << "  { SHLegacyValue boxed;\n";
+        boxedIntegerResult_ = &inst;
+        generateBinaryOperatorInst(*binary);
+        boxedIntegerResult_ = nullptr;
+        os_ << "    ";
+        generateRegister(destination);
+        // The operation's result is narrower than a reused destination that
+        // carries both signed and unsigned values at different program points.
+        os_ << (inst.getKind() == ValueKind::BinaryUnsignedRightShiftInstKind
+                    ? " = (uint32_t)"
+                    : " = (int32_t)")
+            << "_sh_ljs_get_double(boxed); }\n";
+        return;
+      }
+    }
+    if (llvh::isa<MovInst>(inst) || llvh::isa<LIRSpillMovInst>(inst) ||
+        llvh::isa<LIRLoadConstInst>(inst) ||
+        llvh::isa<UnionNarrowTrustedInst>(inst)) {
+      os_ << "  ";
+      generateRegister(destination);
+      os_ << " = ";
+      auto *input = inst.getOperand(0);
+      if (nativeIntegerRange(input)) {
+        generateRegister(ra_.getRegister(input));
+      } else {
+        const auto inputRange = getKnownIntegerRange(input);
+        os_ << (inputRange & IntegerRangeInt32 ? "(int32_t)"
+                : inputRange & IntegerRangeUint32 ? "(uint32_t)"
+                                                 : "(int64_t)")
+            << "_sh_ljs_get_double(";
+        generateValue(*input);
+        os_ << ")";
+      }
+      os_ << ";\n";
+      return;
+    }
+    if (llvh::isa<AsInt32Inst>(inst) || llvh::isa<AsUint32Inst>(inst)) {
+      const bool signedResult = llvh::isa<AsInt32Inst>(inst);
+      os_ << "  ";
+      generateRegister(destination);
+      os_ << " = ";
+      auto *input = inst.getOperand(0);
+      if (input->getType().isNumberType()) {
+        generateNumberToInt32(input, signedResult);
+      } else {
+        os_ << (signedResult ? "_sh_ljs_to_int32_rjs_inline(shr, "
+                             : "_sh_ljs_to_uint32_rjs_inline(shr, ");
+        generateRegisterPtr(*input);
+        os_ << ")";
+      }
+      os_ << ";\n";
+      return;
+    }
+    if (auto *call = llvh::dyn_cast<CallBuiltinInst>(&inst)) {
+      if (call->getNumArguments() != 3 ||
+          !call->getArgument(1)->getType().isNumberType() ||
+          !call->getArgument(2)->getType().isNumberType()) {
+        os_ << "  ";
+        generateRegister(destination);
+        os_ << " = (int32_t)_sh_ljs_get_double(_sh_ljs_call_builtin(shr, frame, "
+            << call->getNumArguments() - 1 << ", "
+            << static_cast<uint32_t>(call->getBuiltinIndex()) << "));\n";
+        return;
+      }
+    }
+    // Compute wrapping bits unsigned; converting their high half via int64_t
+    // avoids relying on an out-of-range unsigned-to-signed C conversion.
+    os_ << "  { uint32_t bits = ";
+    bool unsignedResult = false;
+    if (auto *call = llvh::dyn_cast<CallBuiltinInst>(&inst)) {
+      generateNumberToInt32(call->getArgument(1), false);
+      os_ << " * ";
+      generateNumberToInt32(call->getArgument(2), false);
+    } else {
+      auto *binary = llvh::cast<BinaryOperatorInst>(&inst);
+      const bool signedShift =
+          inst.getKind() == ValueKind::BinaryRightShiftInstKind;
+      unsignedResult =
+          inst.getKind() == ValueKind::BinaryUnsignedRightShiftInstKind;
+      generateNumberToInt32(binary->getLeftHandSide(), signedShift);
+      os_ << " " << (unsignedResult ? ">>" : binary->getOperatorStr()) << " (";
+      generateNumberToInt32(binary->getRightHandSide(), false);
+      if (signedShift || unsignedResult ||
+          inst.getKind() == ValueKind::BinaryLeftShiftInstKind)
+        os_ << " & 31";
+      os_ << ")";
+    }
+    os_ << "; ";
+    generateRegister(destination);
+    os_ << (unsignedResult
+                ? " = bits; }\n"
+                : " = (int64_t)bits - ((bits & 0x80000000u) ? "
+                  "4294967296LL : 0); }\n");
+  }
 
   void unimplemented(Instruction &inst) {
     std::string err{"Unimplemented "};
@@ -780,6 +991,10 @@ class InstrGen {
         os_ << "np" << reg.getIndex();
         break;
 
+      case sh::RegClass::LocalInteger:
+        os_ << "ni" << reg.getIndex();
+        break;
+
       case sh::RegClass::RegStack:
         os_ << "frame[" << (hbc::StackFrameLayout::FirstLocal + reg.getIndex())
             << ']';
@@ -793,6 +1008,16 @@ class InstrGen {
   /// Helper to generate a value that must always have an allocated register,
   /// for instance because we need to assign to it or take its address.
   void generateRegister(Value &val) {
+    if (&val == boxedIntegerResult_) {
+      os_ << "boxed";
+      return;
+    }
+    if (nativeIntegerRange(&val)) {
+      os_ << "_sh_ljs_double((double)";
+      generateRegister(ra_.getRegister(&val));
+      os_ << ")";
+      return;
+    }
     generateRegister(ra_.getRegister(&val));
   }
 
@@ -802,6 +1027,12 @@ class InstrGen {
   /// The pointer can be used to pass to API functions that will use it
   /// as a PinnedHermesValue.
   void generateRegisterPtr(Value &val) {
+    if (nativeIntegerRange(&val)) {
+      os_ << "&(SHLegacyValue){.f64 = (double)";
+      generateRegister(ra_.getRegister(&val));
+      os_ << "}";
+      return;
+    }
     os_ << "&";
     generateRegister(val);
   }
@@ -901,9 +1132,9 @@ class InstrGen {
     generateRegister(inst);
     os_ << " = ";
     if (inst.getSingleOperand()->getType().isNumberType()) {
-      os_ << "_sh_ljs_double((double)_sh_to_int32_double(_sh_ljs_get_double(";
-      generateRegister(*inst.getSingleOperand());
-      os_ << ")));\n";
+      os_ << "_sh_ljs_double((double)";
+      generateNumberToInt32(inst.getSingleOperand(), true);
+      os_ << ");\n";
     } else {
       os_
           << (options_.smallC
@@ -918,9 +1149,9 @@ class InstrGen {
     generateRegister(inst);
     os_ << " = ";
     if (inst.getSingleOperand()->getType().isNumberType()) {
-      os_ << "_sh_ljs_double((double)_sh_to_uint32_double(_sh_ljs_get_double(";
-      generateRegister(*inst.getSingleOperand());
-      os_ << ")));\n";
+      os_ << "_sh_ljs_double((double)";
+      generateNumberToInt32(inst.getSingleOperand(), false);
+      os_ << ");\n";
     } else {
       os_
           << (options_.smallC
@@ -1119,6 +1350,34 @@ class InstrGen {
     // Nothing to do here.
     os_ << "  // PhiInst\n";
   }
+
+  void generateNumberToInt32(Value *value, bool signedResult) {
+    if (nativeIntegerRange(value)) {
+      os_ << (signedResult ? "(int32_t)" : "(uint32_t)");
+      generateRegister(ra_.getRegister(value));
+      return;
+    }
+    const uint8_t range = getKnownIntegerRange(value);
+    if (range) {
+      // Cast the double into a type which represents every proved input before
+      // narrowing. In particular, a negative double cannot be cast directly to
+      // uint32_t, even when the final Wasm instruction happens to saturate.
+      os_ << (signedResult ? "(int32_t)" : "(uint32_t)");
+      os_ << (range & IntegerRangeInt32 ? "(int32_t)"
+              : range & IntegerRangeUint32 ? "(uint32_t)"
+                                           : "(int64_t)");
+      os_ << "_sh_ljs_get_double(";
+      generateValue(*value);
+      os_ << ")";
+    } else {
+      os_ << (signedResult ? "_sh_to_int32_double("
+                          : "_sh_to_uint32_double(");
+      os_ << "_sh_ljs_get_double(";
+      generateValue(*value);
+      os_ << "))";
+    }
+  }
+
   void generateBinaryOperatorInst(BinaryOperatorInst &inst) {
     os_.indent(2);
     generateRegister(inst);
@@ -1144,6 +1403,52 @@ class InstrGen {
 
     bool bothDouble = inst.getLeftHandSide()->getType().isNumberType() &&
         inst.getRightHandSide()->getType().isNumberType();
+
+    // Proven numbers cannot invoke user coercions or BigInt operations. Keep
+    // ToInt32/ToUint32 semantics, including non-finite and out-of-range numbers,
+    // without retaining the generic operation's type checks and runtime call.
+    const char *numberBitOp = nullptr;
+    bool signedRightShift = false;
+    bool unsignedResult = false;
+    bool shift = false;
+    if (bothDouble) {
+      switch (inst.getKind()) {
+        case ValueKind::BinaryOrInstKind:
+          numberBitOp = "|";
+          break;
+        case ValueKind::BinaryAndInstKind:
+          numberBitOp = "&";
+          break;
+        case ValueKind::BinaryXorInstKind:
+          numberBitOp = "^";
+          break;
+        case ValueKind::BinaryLeftShiftInstKind:
+          numberBitOp = "<<";
+          shift = true;
+          break;
+        case ValueKind::BinaryRightShiftInstKind:
+          numberBitOp = ">>";
+          shift = signedRightShift = true;
+          break;
+        case ValueKind::BinaryUnsignedRightShiftInstKind:
+          numberBitOp = ">>";
+          shift = unsignedResult = true;
+          break;
+        default:
+          break;
+      }
+    }
+    if (numberBitOp) {
+      os_ << "_sh_ljs_double((double)";
+      if (!unsignedResult)
+        os_ << "(int32_t)";
+      os_ << "(";
+      generateNumberToInt32(inst.getLeftHandSide(), signedRightShift);
+      os_ << " " << numberBitOp << " (";
+      generateNumberToInt32(inst.getRightHandSide(), false);
+      os_ << (shift ? " & 31" : "") << ")));\n";
+      return;
+    }
 
     // NOTE: this used to check whether we know that both operands are numbers
     // in the int32 range. We no longer track that information, so for now this
@@ -2299,13 +2604,19 @@ class InstrGen {
     // new.target is set up in LowerCalls.
   }
   void generateCallInst(CallInst &inst) {
-    if (inst.getAttributes(inst.getModule()).isNativeJSFunction) {
+    auto *targetFunc = llvh::dyn_cast<Function>(inst.getTarget());
+    // An analyzed same-unit closure uses the same native entry convention as a
+    // typed function. Retain the actual closure in the outgoing frame: its
+    // environment can differ between invocations of the same function code.
+    // A target with non-callable alternatives still needs the runtime check.
+    if (inst.getAttributes(inst.getModule()).isNativeJSFunction ||
+        (targetFunc && inst.getCalleeIsAlwaysClosure()->getValue())) {
       // Fast paths for calling NativeJSFunction.
       setupCallInline(inst);
       os_.indent(2);
       generateRegister(inst);
       os_ << " = ";
-      if (auto *targetFunc = llvh::dyn_cast<Function>(inst.getTarget())) {
+      if (targetFunc) {
         // Fast path, avoid all indirection and just call the function.
         moduleGen_.nativeFunctionTable.generateFunctionLabel(targetFunc, os_);
         os_ << "(shr);\n";
@@ -2342,16 +2653,83 @@ class InstrGen {
         << (uint32_t)inst.getBuiltinIndex() << ");\n";
   }
   void generateCallBuiltinInst(CallBuiltinInst &inst) {
-    if (inst.getBuiltinIndex() == BuiltinMethod::Math_sqrt) {
-      if (inst.getNumArguments() == 2 &&
-          inst.getArgument(1)->getType().isNumberType()) {
+    if (inst.getBuiltinIndex() == BuiltinMethod::Math_imul &&
+        inst.getNumArguments() == 3 &&
+        inst.getArgument(1)->getType().isNumberType() &&
+        inst.getArgument(2)->getType().isNumberType()) {
+      os_.indent(2);
+      generateRegister(inst);
+      // Unsigned multiplication provides the specified modulo-2^32 result
+      // without C signed overflow. Convert the high half without an
+      // implementation-defined unsigned-to-signed cast.
+      if (getKnownIntegerRange(inst.getArgument(1)) ||
+          getKnownIntegerRange(inst.getArgument(2))) {
+        os_ << " = _sh_ljs_imul_uint32(";
+        generateNumberToInt32(inst.getArgument(1), false);
+        os_ << ", ";
+        generateNumberToInt32(inst.getArgument(2), false);
+      } else {
+        os_ << " = _sh_ljs_imul_number(";
+        generateValue(*inst.getArgument(1));
+        os_ << ", ";
+        generateValue(*inst.getArgument(2));
+      }
+      os_ << ");\n";
+      return;
+    }
+    // CallBuiltinInst already carries an intrinsic-identity proof. Restrict
+    // direct emission to numbers so coercions and their order stay in the VM.
+    if (inst.getNumArguments() == 2 &&
+        inst.getArgument(1)->getType().isNumberType()) {
+      const char *operation = nullptr;
+      switch (inst.getBuiltinIndex()) {
+        case BuiltinMethod::Math_abs:
+          operation = "fabs";
+          break;
+        case BuiltinMethod::Math_ceil:
+          operation = "ceil";
+          break;
+        case BuiltinMethod::Math_floor:
+          operation = "floor";
+          break;
+        case BuiltinMethod::Math_trunc:
+          operation = "trunc";
+          break;
+        case BuiltinMethod::Math_round:
+          operation = "hermesMathRound";
+          break;
+        case BuiltinMethod::Math_sqrt:
+          operation = "sqrt";
+          break;
+        default:
+          break;
+      }
+      if (operation) {
         os_.indent(2);
         generateRegister(inst);
-        os_ << " = _sh_ljs_double(sqrt(_sh_ljs_get_double(";
+        os_ << " = _sh_ljs_double(" << operation << "(_sh_ljs_get_double(";
         generateValue(*inst.getArgument(1));
         os_ << ")));\n";
         return;
       }
+    }
+    if ((inst.getBuiltinIndex() == BuiltinMethod::Math_min ||
+         inst.getBuiltinIndex() == BuiltinMethod::Math_max) &&
+        inst.getNumArguments() == 3 &&
+        inst.getArgument(1)->getType().isNumberType() &&
+        inst.getArgument(2)->getType().isNumberType()) {
+      os_.indent(2);
+      generateRegister(inst);
+      os_ << " = _sh_ljs_double("
+          << (inst.getBuiltinIndex() == BuiltinMethod::Math_min
+                  ? "hermesMathMin"
+                  : "hermesMathMax")
+          << "(_sh_ljs_get_double(";
+      generateValue(*inst.getArgument(1));
+      os_ << "), _sh_ljs_get_double(";
+      generateValue(*inst.getArgument(2));
+      os_ << ")));\n";
+      return;
     }
     os_.indent(2);
     generateRegister(inst);
@@ -2950,7 +3328,8 @@ void generateFunction(
 
   llvh::SmallVector<BasicBlock *, 16> order(PO.rbegin(), PO.rend());
 
-  sh::SHRegisterAllocator RA(&F);
+  sh::SHRegisterAllocator RA(
+      &F, F.getContext().getOptimizationSettings().nativeIntegerRegisters);
   RA.allocate(order);
 
   if (options.format == DumpRA) {
@@ -3098,6 +3477,20 @@ void generateFunction(
        i < e;
        ++i) {
     OS << "  SHLegacyValue np" << i << " = _sh_ljs_undefined();\n";
+  }
+  for (size_t i = 0, e = RA.getMaxRegisterUsage(sh::RegClass::LocalInteger);
+       i < e;
+       ++i) {
+    const auto range = instrGen.integerRegisterRange(i);
+    if (range) {
+      OS << "  "
+         << (range & IntegerRangeInt32 ? "int32_t"
+                 : range & IntegerRangeUint32 ? "uint32_t"
+                                              : "int64_t")
+         << " ni" << i << " = 0;\n";
+    } else {
+      OS << "  SHLegacyValue ni" << i << " = _sh_ljs_undefined();\n";
+    }
   }
 
   switch (F.getProhibitInvoke()) {

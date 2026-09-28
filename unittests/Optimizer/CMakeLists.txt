@@ -5,6 +5,7 @@
 
 set(OptimizerSources
   Scalar/InstructionEscapeAnalysisTest.cpp
+  Scalar/RecordUseAnalysisTest.cpp
   PassManager/PassManagerTest.cpp
   )
 

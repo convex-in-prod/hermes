@@ -130,6 +130,9 @@ class InstSimplifyImpl {
   Value *reduceAsInt32(AsInt32Inst *asInt32) {
     auto *op = asInt32->getSingleOperand();
 
+    if (getKnownIntegerRange(op) & IntegerRangeInt32)
+      return op;
+
     // If operand is a literal, try to evaluate ToNumber(operand).
     if (auto *lit = llvh::dyn_cast<Literal>(op)) {
       if (auto *result = evalToInt32(builder_, lit)) {
@@ -143,6 +146,9 @@ class InstSimplifyImpl {
 
   Value *reduceAsUint32(AsUint32Inst *asUint32) {
     auto *op = asUint32->getSingleOperand();
+
+    if (getKnownIntegerRange(op) & IntegerRangeUint32)
+      return op;
 
     // If operand is a literal, try to evaluate ToNumber(operand) then ToUint32.
     if (auto *lit = llvh::dyn_cast<Literal>(op)) {

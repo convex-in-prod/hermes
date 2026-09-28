@@ -140,8 +140,7 @@ function test_async() {
 
 // CHECK:function foo(x: number, y: number): number [allCallsitesKnownInStrictMode]
 // CHECK-NEXT:%BB0:
-// CHECK-NEXT:  %0 = FAddInst (:number) 1: number, 2: number
-// CHECK-NEXT:       ReturnInst %0: number
+// CHECK-NEXT:       ReturnInst 3: number
 // CHECK-NEXT:function_end
 
 // CHECK:function bar(x: any, y: any): string|number|bigint

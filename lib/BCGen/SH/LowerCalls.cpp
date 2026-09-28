@@ -30,6 +30,17 @@ static bool lowerCalls(Function *F, SHRegisterAllocator &RA) {
       // This also matches constructors.
       if (!call)
         continue;
+      if (F->getContext().getOptimizationSettings().nativeIntegerRegisters) {
+        if (auto *builtin = llvh::dyn_cast<CallBuiltinInst>(call)) {
+          // Numeric imul is emitted as native arithmetic. Keeping its operands
+          // in their allocated locals avoids a boxed argument-frame round trip.
+          if (builtin->getBuiltinIndex() == BuiltinMethod::Math_imul &&
+              builtin->getNumArguments() == 3 &&
+              builtin->getArgument(1)->getType().isNumberType() &&
+              builtin->getArgument(2)->getType().isNumberType())
+            continue;
+        }
+      }
       builder.setInsertionPoint(call);
       changed = true;
 

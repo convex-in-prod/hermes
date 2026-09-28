@@ -218,6 +218,36 @@ cl::opt<bool> KeepTemp(
     cl::desc("Keep temporary files made along the way (for debugging)"),
     cl::cat(CompilerCategory));
 
+cl::opt<bool> StaticMathBuiltins(
+    "fstatic-math-builtins",
+    cl::desc("Recognize original Math methods except random statically"),
+    cl::init(false),
+    cl::cat(CompilerCategory));
+
+cl::opt<bool> GuardedRecordLoads(
+    "fguarded-record-loads",
+    cl::desc("Reuse record fields within guarded regions without intervening effects"),
+    cl::init(false),
+    cl::cat(CompilerCategory));
+
+cl::opt<bool> GuardedDataPropertyDefinitions(
+    "fguarded-data-property-definitions",
+    cl::desc("Fuse guarded ordinary data-property construction sequences"),
+    cl::init(false),
+    cl::cat(CompilerCategory));
+
+cl::opt<bool> GuardedByteArrayLoops(
+    "fguarded-byte-array-loops",
+    cl::desc("Specialize effect-free numeric loops over guarded byte arrays"),
+    cl::init(false),
+    cl::cat(CompilerCategory));
+
+cl::opt<bool> InlineRecordReturns(
+    "finline-record-returns",
+    cl::desc("Inline bounded record producers to eliminate unpacked return objects"),
+    cl::init(false),
+    cl::cat(CompilerCategory));
+
 cl::opt<bool> AsyncFrameArguments(
     "fasync-frame-arguments",
     cl::desc("Avoid intermediate argument objects in internal async startup"),
@@ -227,6 +257,43 @@ cl::opt<bool> AsyncFrameArguments(
 cl::opt<bool> AsyncGeneratorResults(
     "fasync-generator-results",
     cl::desc("Remove private async generator wrappers and reuse completion records"),
+    cl::init(false),
+    cl::cat(CompilerCategory));
+
+cl::opt<bool> NativeIntegerRegisters(
+    "fnative-integer-registers",
+    cl::desc("Store proved integer temporaries in native integer registers"),
+    cl::init(false),
+    cl::cat(CompilerCategory));
+
+cl::opt<bool> GuardedMethodCalls(
+    "fguarded-method-calls",
+    cl::desc("Expose method bodies behind exact closure identity guards"),
+    cl::init(false),
+    cl::cat(CompilerCategory));
+
+cl::opt<bool> ScopedNormalizationReuse(
+    "fscoped-normalization-reuse",
+    cl::desc("Reuse proved string helper results within an embedding-owned invocation scope"),
+    cl::init(false),
+    cl::cat(CompilerCategory));
+
+cl::opt<bool> StringTrimComparisons(
+    "fstring-trim-comparisons",
+    cl::desc("Compare primitive strings with their trimmed form without materializing it"),
+    cl::init(false),
+    cl::cat(CompilerCategory));
+
+cl::opt<bool> ArrayCallbacks(
+    "farray-callbacks",
+    cl::desc("Expose known array callbacks behind intrinsic and receiver guards"),
+    cl::init(false),
+    cl::cat(CompilerCategory));
+
+cl::opt<bool> StaticObjectPrototype(
+    "fstatic-object-prototype",
+    cl::desc(
+        "Assume Object.prototype is nonextensible, null-parented, and has only standard string keys"),
     cl::init(false),
     cl::cat(CompilerCategory));
 
@@ -644,6 +711,8 @@ std::shared_ptr<Context> createContext() {
   optimizationOpts.inlining =
       cli::OptimizationLevel != OptLevel::O0 && cli::Inline;
   optimizationOpts.inlineMaxSize = cli::InlineMaxSize;
+  optimizationOpts.staticHermesInlining = true;
+  optimizationOpts.inlineRecordReturns = cli::InlineRecordReturns;
   optimizationOpts.asyncFrameArguments =
       cli::AsyncFrameArguments || cli::AsyncGeneratorResults;
   optimizationOpts.asyncGeneratorResults = cli::AsyncGeneratorResults;
@@ -658,6 +727,17 @@ std::shared_ptr<Context> createContext() {
   // parsing.
   optimizationOpts.staticBuiltins =
       cli::StaticBuiltins == StaticBuiltinSetting::ForceOn;
+  optimizationOpts.staticMathBuiltins = cli::StaticMathBuiltins;
+  optimizationOpts.staticObjectPrototype = cli::StaticObjectPrototype;
+  optimizationOpts.arrayCallbacks = cli::ArrayCallbacks;
+  optimizationOpts.guardedRecordLoads = cli::GuardedRecordLoads;
+  optimizationOpts.guardedDataPropertyDefinitions =
+      cli::GuardedDataPropertyDefinitions;
+  optimizationOpts.guardedByteArrayLoops = cli::GuardedByteArrayLoops;
+  optimizationOpts.guardedMethodCalls = cli::GuardedMethodCalls;
+  optimizationOpts.scopedNormalizationReuse = cli::ScopedNormalizationReuse;
+  optimizationOpts.stringTrimComparisons = cli::StringTrimComparisons;
+  optimizationOpts.nativeIntegerRegisters = cli::NativeIntegerRegisters;
 
   optimizationOpts.metroRequireOpt = cli::MetroRequireOpt;
 

@@ -26,6 +26,8 @@ enum class RegClass : uint8_t {
   LocalPtr,
   /// A native local that is guaranteed to not be a pointer.
   LocalNonPtr,
+  /// A nonpointer temporary with a proved int32/uint32 value range.
+  LocalInteger,
   /// An entry in the VM register stack.
   RegStack,
   /// The last entry.
@@ -403,6 +405,9 @@ class RegisterAllocator {
   /// Whether there are any try/catch statements in the function.
   bool hasTry_ = false;
 
+  /// Keep integer lifetimes separate from booleans and general numbers.
+  bool separateIntegerRegisters_;
+
  public:
   /// Dump the status of the allocator in a textual form.
   void dump(llvh::ArrayRef<BasicBlock *> order);
@@ -410,7 +415,9 @@ class RegisterAllocator {
   /// \returns the computed live interval for the instruction \p I.
   Interval &getInstructionInterval(Instruction *I);
 
-  explicit RegisterAllocator(Function *func);
+  explicit RegisterAllocator(
+      Function *func,
+      bool separateIntegerRegisters = false);
 
   virtual ~RegisterAllocator() = default;
 

@@ -50,6 +50,7 @@ void hermes::runFullOptimizationPasses(Module &M) {
   // Add the optimization passes.
 
   PM.addLowerGeneratorFunction();
+  PM.addGuardedMethodCalls();
   // We need to fold constant strings before staticrequire.
   PM.addInstSimplify();
   PM.addResolveStaticRequire();
@@ -67,10 +68,15 @@ void hermes::runFullOptimizationPasses(Module &M) {
   PM.addSimpleStackPromotion();
   PM.addScopeElimination();
   PM.addFunctionAnalysis();
+  // Promote private record parameters before inlining duplicates captured
+  // variable initializers into callers and obscures their single-store proof.
+  PM.addObjectMergeNewStores();
+  PM.addRecordArgumentPromotion();
   PM.addInlining();
   PM.addDCE();
   PM.addObjectMergeNewStores();
   PM.addObjectStackPromotion();
+  PM.addObjectLateMaterialization();
   PM.addTypeInference();
   PM.addSimpleStackPromotion();
   PM.addInstSimplify();
@@ -88,19 +94,26 @@ void hermes::runFullOptimizationPasses(Module &M) {
   PM.addScopeElimination();
   PM.addFunctionAnalysis();
   PM.addScopeHoisting();
+  // Promoted field parameters must reach inference and CSE before lowering.
+  PM.addFuncSigOpts();
   PM.addObjectStackPromotion();
 
   // Run type inference before CSE so that we can better reason about binopt.
   PM.addTypeInference();
+  PM.addGuardedRecordLoadDedup();
+  PM.addScopedNormalizationReuse();
   PM.addCSE();
   PM.addPrivateBrandCheckDedup();
   PM.addTDZDedup();
   PM.addSimplifyCFG();
 
   PM.addInstSimplify();
-  PM.addFuncSigOpts();
   PM.addDCE();
   PM.addSimplifyCFG();
+  // Inlined property-key conversions and their phis must be folded before
+  // recognizing the complete literal-key construction diamond.
+  PM.addGuardedDataPropertyDefinitions();
+  PM.addGuardedByteArrayLoops();
   PM.addFrameLoadStoreOpts();
   addMem2Reg();
   PM.addAuditor();
@@ -126,6 +139,7 @@ void hermes::runOptimizationPassesToFixedPoint(Module &M) {
 
   PM.addLowerGeneratorFunction();
 
+  PM.addGuardedMethodCalls();
   PM.beginFixedPointLoop("outer type inference loop");
   PM.addTypeInference();
 
@@ -145,9 +159,12 @@ void hermes::runOptimizationPassesToFixedPoint(Module &M) {
   PM.addScopeElimination();
   PM.addFunctionAnalysis();
   PM.addMetroRequire();
+  PM.addObjectMergeNewStores();
+  PM.addRecordArgumentPromotion();
   PM.addInlining();
   PM.addObjectMergeNewStores();
   PM.addObjectStackPromotion();
+  PM.addObjectLateMaterialization();
   PM.addCSE();
   PM.addPrivateBrandCheckDedup();
   PM.addTDZDedup();
