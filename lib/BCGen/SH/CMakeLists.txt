@@ -11,6 +11,7 @@ add_hermes_library(hermesSHBackend
   LowerNanBoxedUnionNarrowT.cpp
   PeepholeLowering.cpp
   RegExpLowering.cpp
+  CBundleLayout.cpp CBundleLayout.h
   SH.cpp
   SHRegAlloc.cpp SHRegAlloc.h
   LineDirectiveEmitter.cpp LineDirectiveEmitter.h

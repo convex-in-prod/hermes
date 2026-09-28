@@ -132,10 +132,25 @@ static cl::opt<bool> EmitCBundle(
     cl::init(false),
     cl::desc("Emit generated C as a manifest and multiple translation units"));
 
+static cl::opt<bool> SplitCExceptionDispatch(
+    "Xsplit-c-exceptions",
+    cl::init(false),
+    cl::desc("Separate exception dispatch from C bundle instruction bodies"));
+
 static cl::opt<unsigned> EmitCShardSize(
     "Xemit-c-shard-size",
     cl::init(2 * 1024 * 1024),
     cl::desc("Target function-body bytes per generated C translation unit"));
+
+static cl::opt<bool> EmitCBundleLayout(
+    "Xemit-c-layout",
+    cl::init(false),
+    cl::desc("Emit reusable function, cache and string assignments beside the C bundle"));
+
+static cl::opt<std::string> CBundleLayoutInput(
+    "Xc-layout-input",
+    cl::init(""),
+    cl::desc("Authenticated metadata layout from a previous C bundle"));
 
 cl::opt<DebugLevel> DebugInfoLevel(
     cl::desc("Choose debug info level:"),
@@ -1028,6 +1043,19 @@ bool compileFromCommandLineOptions() {
     llvh::errs() << "Error: -Xemit-c-shard-size must be positive.\n";
     return false;
   }
+  if (cli::SplitCExceptionDispatch && !cli::EmitCBundle) {
+    llvh::errs() << "Error: -Xsplit-c-exceptions requires -Xemit-c-bundle.\n";
+    return false;
+  }
+  if ((cli::EmitCBundleLayout || !cli::CBundleLayoutInput.empty()) &&
+      !cli::EmitCBundle) {
+    llvh::errs() << "Error: retained C layout requires -Xemit-c-bundle.\n";
+    return false;
+  }
+  if (!cli::CBundleLayoutInput.empty() && !cli::EmitCBundleLayout) {
+    llvh::errs() << "Error: -Xc-layout-input requires -Xemit-c-layout.\n";
+    return false;
+  }
   if (!cli::ExportedUnit.empty()) {
     if (cli::OutputLevel == OutputLevelKind::Run ||
         cli::OutputLevel == OutputLevelKind::Executable) {
@@ -1177,7 +1205,10 @@ bool compileFromCommandLineOptions() {
 
   genOptions.smallC = cli::SmallC;
   genOptions.emitCBundle = cli::EmitCBundle;
+  genOptions.splitCExceptionDispatch = cli::SplitCExceptionDispatch;
   genOptions.cBundleShardSize = cli::EmitCShardSize;
+  genOptions.emitCBundleLayout = cli::EmitCBundleLayout;
+  genOptions.cBundleLayoutInput = cli::CBundleLayoutInput;
 
   genOptions.emitSourceLocations =
       cli::DumpSourceLocation != LocationDumpMode::None;
