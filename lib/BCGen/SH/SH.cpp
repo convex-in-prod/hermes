@@ -2703,6 +2703,10 @@ class InstrGen {
   }
   /// Convert a JS value to its corresponding native argument type.
   void convertToNativeArg(NativeCType ctype, Value *arg) {
+    if (ctype == NativeCType::c_hermes_value) {
+      generateValue(*arg);
+      return;
+    }
     MachineType mt = nativeContext_.md.mapCType(ctype);
     const MachineDesc::MTD &mtd = nativeContext_.md.getMTD(mt);
     int parens = 1;

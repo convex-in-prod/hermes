@@ -13,6 +13,8 @@
 #include <memory>
 #include <ostream>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <hermes/Public/HermesExport.h>
 #include <hermes/Public/RuntimeConfig.h>
@@ -205,6 +207,12 @@ class HermesRuntime : public jsi::Runtime,
   ~HermesRuntime() override = default;
 
   using jsi::Runtime::castInterface;
+
+  /// Snapshot own enumerable string properties in Object.entries order without
+  /// allocating an entries array and pair arrays in the JavaScript heap.
+  /// Getters and proxy traps run in the same order as Object.entries.
+  virtual std::vector<std::pair<jsi::String, jsi::Value>>
+  getOwnEnumerableEntries(const jsi::Object &object) = 0;
 };
 
 /// Returns a pointer to an object that can be cast into IHermesRootAPI, which

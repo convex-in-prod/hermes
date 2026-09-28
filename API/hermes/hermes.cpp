@@ -32,8 +32,10 @@
 #include "hermes/VM/JSArrayBuffer.h"
 #include "hermes/VM/JSError.h"
 #include "hermes/VM/JSLib.h"
+#include "../../lib/VM/JSLib/Object.h"
 #include "hermes/VM/JSLib/JSLibStorage.h"
 #include "hermes/VM/JSLib/RuntimeJSONParse.h"
+#include "hermes/VM/JSProxy.h"
 #include "hermes/VM/JSTypedArray.h"
 #include "hermes/VM/NativeState.h"
 #include "hermes/VM/Operations.h"
@@ -881,6 +883,8 @@ class HermesRuntimeImpl final : public HermesRuntime,
   bool isHostObject(const jsi::Object &) const override;
   bool isHostFunction(const jsi::Function &) const override;
   jsi::Array getPropertyNames(const jsi::Object &) override;
+  std::vector<std::pair<jsi::String, jsi::Value>> getOwnEnumerableEntries(
+      const jsi::Object &) override;
 
   void setPrototypeOf(const jsi::Object &object, const jsi::Value &prototype)
       override;
@@ -3062,6 +3066,56 @@ jsi::Array HermesRuntimeImpl::getPropertyNames(const jsi::Object &obj) {
   }
 
   return ret;
+}
+
+std::vector<std::pair<jsi::String, jsi::Value>>
+HermesRuntimeImpl::getOwnEnumerableEntries(const jsi::Object &obj) {
+  ExecutionScopeRAII scopeRAII(mutatorScope);
+  vm::GCScope gcScope(runtime_);
+  auto object = handle(obj);
+  auto names_result = vm::getOwnPropertyKeysAsStrings(
+      object,
+      runtime_,
+      vm::OwnKeysFlags().plusIncludeNonSymbols().setIncludeNonEnumerable(
+          object->isProxyObject()));
+  checkStatus(names_result.getStatus());
+  vm::Handle<vm::JSArray> names =
+      runtime_.makeHandle(vm::vmcast<vm::JSArray>(*names_result));
+  const uint32_t length = vm::JSArray::getLength(*names, runtime_);
+  std::vector<std::pair<jsi::String, jsi::Value>> entries;
+  entries.reserve(length);
+  auto marker = gcScope.createMarker();
+  for (uint32_t index = 0; index < length; ++index) {
+    gcScope.flushToMarker(marker);
+    auto name = runtime_.makeHandle(names->at(runtime_, index).getString(runtime_));
+    vm::ComputedPropertyDescriptor descriptor;
+    auto descriptor_result = vm::JSObject::getOwnComputedPrimitiveDescriptor(
+        object, runtime_, name, vm::JSObject::IgnoreProxy::Yes, descriptor);
+    checkStatus(descriptor_result.getStatus());
+
+    jsi::Value value;
+    if (*descriptor_result && descriptor.flags.enumerable) {
+      auto value_result = vm::JSObject::getComputedPropertyValueInternal_RJS(
+          object, runtime_, object, descriptor);
+      checkStatus(value_result.getStatus());
+      value = valueFromHermesValue(value_result->get());
+    } else if (!object->isProxyObject()) {
+      continue;
+    } else {
+      descriptor_result =
+          vm::JSProxy::getOwnProperty(object, runtime_, name, descriptor, nullptr);
+      checkStatus(descriptor_result.getStatus());
+      if (!*descriptor_result || !descriptor.flags.enumerable) {
+        continue;
+      }
+      auto value_result = vm::JSProxy::getComputed(object, runtime_, name, object);
+      checkStatus(value_result.getStatus());
+      value = valueFromHermesValue(value_result->get());
+    }
+    auto key = valueFromHermesValue(name.getHermesValue()).asString(*this);
+    entries.emplace_back(std::move(key), std::move(value));
+  }
+  return entries;
 }
 
 jsi::WeakObject HermesRuntimeImpl::createWeakObject(const jsi::Object &obj) {

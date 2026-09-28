@@ -3112,7 +3112,7 @@ class FlowChecker::ExprVisitor {
       NativeCType natParamType;
       if (!parseNativeAnnotation(
               llvh::cast<ESTree::TypeAnnotationNode>(param->_typeAnnotation),
-              false,
+              allowHVOption,
               &natParamType))
         return;
       natParamTypes.push_back(natParamType);

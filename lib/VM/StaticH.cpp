@@ -7,6 +7,7 @@
 
 #include "SHUnitExt.h"
 #include "hermes/BCGen/SerializedLiteralParser.h"
+#include "hermes/Support/UTF8.h"
 #include "hermes/VM/ArrayStorage.h"
 #include "hermes/VM/Callable.h"
 #include "hermes/VM/FastArray.h"
@@ -25,10 +26,12 @@
 #include "hermes/VM/StackFrame-inline.h"
 #include "hermes/VM/StaticHUtils.h"
 #include "hermes/VM/StringBuilder.h"
+#include "hermes/VM/StringPrimitive.h"
 
 #include "JSLib/JSLibInternal.h"
 
 #include <cstdarg>
+#include <limits>
 
 using namespace hermes;
 using namespace hermes::vm;
@@ -2726,4 +2729,33 @@ _sh_asciiz_to_string(SHRuntime *shr, const char *str, ptrdiff_t len) {
   if (LLVM_UNLIKELY(res == ExecutionStatus::EXCEPTION))
     _sh_throw_current(shr);
   return *res;
+}
+
+LLVM_ATTRIBUTE_NOINLINE
+extern "C" ptrdiff_t _sh_string_write_utf8(
+    SHRuntime *shr,
+    SHLegacyValue value,
+    char *destination,
+    size_t capacity) {
+  if (LLVM_UNLIKELY(!_sh_ljs_is_string(value))) {
+    _sh_throw_type_error_ascii(shr, "Expected a string");
+  }
+  // No allocation occurs while reading the string, so the raw pointer remains
+  // valid through the conversion without a guest-visible property lookup.
+  auto *string = vmcast<StringPrimitive>(*toPHV(&value));
+  const uint32_t length = string->getStringLength();
+  if (string->isASCII()) {
+    if (length > capacity)
+      return -1;
+    memcpy(destination, string->getStringRef<char>().data(), length);
+    return length;
+  }
+  auto [read, written] = convertUTF16ToUTF8BufferWithReplacements(
+      llvh::MutableArrayRef<uint8_t>(
+          reinterpret_cast<uint8_t *>(destination), capacity),
+      string->getStringRef<char16_t>());
+  if (read != length ||
+      written > static_cast<size_t>(std::numeric_limits<ptrdiff_t>::max()))
+    return -1;
+  return written;
 }
