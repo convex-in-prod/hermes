@@ -50,6 +50,7 @@ enum class SHCBundleOversizeReason {
 struct SHCBundleFile {
   std::string path;
   SHCBundleFileRole role;
+  /// Dense coverage in bundle emission order, independent of runtime labels.
   uint32_t firstFunctionId{0};
   uint32_t lastFunctionId{0};
   uint32_t functionCount{0};

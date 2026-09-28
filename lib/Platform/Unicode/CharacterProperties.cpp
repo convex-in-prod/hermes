@@ -9,6 +9,7 @@
 #include "hermes/Platform/Unicode/CodePointSet.h"
 
 #include <algorithm>
+#include <array>
 #include <climits>
 #include <iterator>
 #include <string>
@@ -166,6 +167,36 @@ static bool operator<(const UnicodeTransformRange &m, uint32_t cp) {
   return m.start + m.count <= cp;
 }
 
+struct TransformPage {
+  uint16_t begin;
+  uint16_t end;
+};
+
+template <const auto &Ranges>
+static constexpr auto indexTransformPages() {
+  constexpr size_t size = std::size(Ranges);
+  static_assert(size <= UINT16_MAX, "transform indices must fit in a page");
+  constexpr size_t pageCount =
+      (Ranges[size - 1].start + Ranges[size - 1].count + 255) / 256;
+  std::array<TransformPage, pageCount> pages{};
+  size_t begin = 0;
+  for (size_t page = 0; page < pageCount; ++page) {
+    while (begin < size &&
+           Ranges[begin].start + Ranges[begin].count <= page * 256)
+      ++begin;
+    size_t end = begin;
+    while (end < size && Ranges[end].start < (page + 1) * 256)
+      ++end;
+    pages[page] = {static_cast<uint16_t>(begin), static_cast<uint16_t>(end)};
+  }
+  return pages;
+}
+
+// Retain ranges crossing a page boundary in both pages. Empty pages require
+// no search, and supplementary planes after the last transform need no table.
+static constexpr auto unicodeFoldPages = indexTransformPages<UNICODE_FOLDS>();
+static constexpr auto legacyCanonPages = indexTransformPages<LEGACY_CANONS>();
+
 /// Find all code points which canonicalize to a value in \p range, and add them
 /// to \p receiver. This is a slow linear search across all ranges.
 static void addPrecanonicalCharacters(
@@ -250,9 +281,16 @@ CodePointSet makeCanonicallyEquivalent(const CodePointSet &set, bool unicode) {
 }
 
 uint32_t canonicalize(uint32_t cp, bool unicode) {
-  const auto start =
+  const auto table =
       unicode ? std::begin(UNICODE_FOLDS) : std::begin(LEGACY_CANONS);
-  const auto end = unicode ? std::end(UNICODE_FOLDS) : std::end(LEGACY_CANONS);
+  const auto *pages = unicode ? unicodeFoldPages.data() : legacyCanonPages.data();
+  const size_t pageCount =
+      unicode ? unicodeFoldPages.size() : legacyCanonPages.size();
+  if ((cp >> 8) >= pageCount)
+    return cp;
+  const auto page = pages[cp >> 8];
+  const auto start = table + page.begin;
+  const auto end = table + page.end;
   auto where = std::lower_bound(start, end, cp);
   if (where != end && where->start <= cp && cp < where->start + where->count) {
     return applyTransform(*where, cp);

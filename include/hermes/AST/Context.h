@@ -65,12 +65,19 @@ struct OptimizationSettings {
   static constexpr unsigned kDefaultInlineMaxSize = 50;
   unsigned inlineMaxSize{kDefaultInlineMaxSize};
 
+  /// Use bounded Static Hermes inlining opportunities that expose temporary
+  /// objects in callers whose values already live in rooted exception frames.
+  bool staticHermesInlining{false};
+
   /// Reuse property cache entries for same property name.
   bool reusePropCache{true};
 
   /// Recognize calls to global functions like Object.keys() and turn them
   /// into builtin calls.
   bool staticBuiltins{false};
+
+  /// Assume Math methods other than random retain their original definitions.
+  bool staticMathBuiltins{false};
 
   /// Attempt to resolve CommonJS require() calls at compile time.
   bool staticRequire{false};

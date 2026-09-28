@@ -14,6 +14,7 @@
 #include "hermes/Inst/Inst.h"
 #include "hermes/Inst/InstDecode.h"
 #include "hermes/VM/ObjectAllocKind.h"
+#include "llvh/ADT/BitVector.h"
 
 namespace hermes::LiteralBufferBuilder::detail {
 /// The key with which to to deduplicate shape table entries in coordToIdx.
@@ -63,6 +64,28 @@ struct DenseMapInfo<ShapeTableDedupKey> {
 namespace hermes {
 namespace LiteralBufferBuilder {
 namespace {
+
+size_t liveStorageBytes(
+    llvh::ArrayRef<StringTableEntry> entries,
+    const llvh::BitVector &live) {
+  std::vector<std::pair<uint32_t, uint32_t>> ranges;
+  for (auto index : live.set_bits()) {
+    const auto &entry = entries[index];
+    ranges.emplace_back(entry.getOffset(), entry.getOffset() + entry.getLength());
+  }
+  std::sort(ranges.begin(), ranges.end());
+  uint32_t end = 0;
+  size_t bytes = 0;
+  // Optimized storage shares overlapping byte sequences. Count their union,
+  // not their summed lengths, when deciding whether retired storage is bounded.
+  for (auto range : ranges) {
+    if (range.second > end) {
+      bytes += range.second - std::max(end, range.first);
+      end = range.second;
+    }
+  }
+  return bytes;
+}
 
 /// A container that deduplicates byte sequences, while keeping the original
 /// insertion order with the duplicates. Note: strings are used as a
@@ -132,12 +155,16 @@ class Builder {
       const SerializedLiteralGenerator::StringLookupFn &getIdentifier,
       const SerializedLiteralGenerator::StringLookupFn &getString,
       bool optimize,
-      hbc::BCProviderBase *bcProvider)
+      hbc::BCProviderBase *bcProvider,
+      RetainedBuffers *retainedBuffers)
       : M_(m),
         shouldVisitFunction_(shouldVisitFunction),
         optimize_(optimize),
         literalGenerator_(getIdentifier, getString),
-        bcProvider_(bcProvider) {}
+        bcProvider_(bcProvider),
+        retainedBuffers_(retainedBuffers) {
+    assert(!(bcProvider && retainedBuffers) && "literal seeds are exclusive");
+  }
 
   /// Do everything: collect the literals, optionally deduplicate them.
   Result generate();
@@ -145,6 +172,8 @@ class Builder {
  private:
   /// Reseed the tables to be initialized with the base bytecode given.
   void reseedFromBaseBytecode();
+
+  void reseedFromRetainedBuffers();
 
   /// Traverse the module, skipping functions that should not be visited,
   /// and collect all serialized array and object literals and the corresponding
@@ -182,6 +211,8 @@ class Builder {
   SerializedLiteralGenerator literalGenerator_;
 
   hbc::BCProviderBase *bcProvider_;
+  RetainedBuffers *retainedBuffers_;
+  std::vector<uint8_t> shapeKinds_;
 
   /// Temporary buffer to serialize literals into. We keep it around instead
   /// of allocating a new one every time.
@@ -350,32 +381,78 @@ void Builder::reseedFromBaseBytecode() {
 
 void Builder::makeBufferStorages() {
   assert(
-      bcProvider_ ||
+      bcProvider_ || retainedBuffers_ ||
       (valueStorage_.count() == 0 && keyStorage_.count() == 0) &&
           "with no base bytecode, storages should be empty");
-  valueStorage_.appendStorage(
-      hbc::ConsecutiveStringStorage{
-          values_.beginSet() + valueStorage_.count(),
-          values_.endSet(),
-          std::true_type{},
-          optimize_});
-  keyStorage_.appendStorage(
-      hbc::ConsecutiveStringStorage{
-          objKeys_.beginSet() + keyStorage_.count(),
-          objKeys_.endSet(),
-          std::true_type{},
-          optimize_});
+  // Appending even an empty storage aligns the existing bytes. Avoid changing
+  // retained metadata when all current literals already have exact entries.
+  if (!retainedBuffers_ ||
+      values_.beginSet() + valueStorage_.count() != values_.endSet()) {
+    valueStorage_.appendStorage(
+        hbc::ConsecutiveStringStorage{
+            values_.beginSet() + valueStorage_.count(),
+            values_.endSet(),
+            std::true_type{},
+            optimize_});
+  }
+  if (!retainedBuffers_ ||
+      objKeys_.beginSet() + keyStorage_.count() != objKeys_.endSet()) {
+    keyStorage_.appendStorage(
+        hbc::ConsecutiveStringStorage{
+            objKeys_.beginSet() + keyStorage_.count(),
+            objKeys_.endSet(),
+            std::true_type{},
+            optimize_});
+  }
+}
+
+void Builder::reseedFromRetainedBuffers() {
+  auto &seed = *retainedBuffers_;
+  auto restore = [](UniquedStringVector &strings,
+                    hbc::ConsecutiveStringStorage &storage,
+                    std::vector<StringTableEntry> &entries,
+                    std::vector<unsigned char> &bytes) {
+    for (const auto &entry : entries) {
+      strings.push_back(llvh::StringRef{
+          bytes.empty()
+              ? ""
+              : reinterpret_cast<const char *>(bytes.data()) + entry.getOffset(),
+          entry.getLength()});
+    }
+    storage =
+        hbc::ConsecutiveStringStorage{std::move(entries), std::move(bytes)};
+  };
+  restore(values_, valueStorage_, seed.valueEntries, seed.values);
+  restore(objKeys_, keyStorage_, seed.keyEntries, seed.keys);
+  objShapeTable_ = std::move(seed.shapes);
+  shapeKinds_ = std::move(seed.shapeKinds);
+  for (uint32_t i = 0; i < objShapeTable_.size(); ++i) {
+    const auto &shape = objShapeTable_[i];
+    keyOffsetToShapeIdx_.insert({
+        {shape.keyBufferOffset,
+         shape.numProps,
+         static_cast<ValueKind>(shapeKinds_[i])},
+        i});
+  }
 }
 
 LiteralBufferBuilder::Result Builder::generate() {
   if (bcProvider_) {
     reseedFromBaseBytecode();
+  } else if (retainedBuffers_) {
+    reseedFromRetainedBuffers();
   }
   traverse();
   makeBufferStorages();
 
   // Populate the offset map.
   LiteralOffsetMapTy literalOffsetMap{};
+  llvh::BitVector liveValues, liveKeys, liveShapes;
+  if (retainedBuffers_) {
+    liveValues.resize(valueStorage_.count());
+    liveKeys.resize(keyStorage_.count());
+    liveShapes.resize(objShapeTable_.size());
+  }
 
   // Visit all object/array literal values.
   // Cast these to const to make sure we're calling the correct overload and no
@@ -389,6 +466,8 @@ LiteralBufferBuilder::Result Builder::generate() {
         literalOffsetMap.count(Inst) == 0 &&
         "instruction literal can't be serialized twice");
     uint32_t arrayIndexInSet = values_.indexInSet(idx);
+    if (retainedBuffers_)
+      liveValues.set(arrayIndexInSet);
     literalOffsetMap[Inst] = {UINT32_MAX, valView[arrayIndexInSet].getOffset()};
   }
 
@@ -422,14 +501,38 @@ LiteralBufferBuilder::Result Builder::generate() {
     if (success) {
       // This is a new entry, add it to the shape table.
       objShapeTable_.push_back({keyBufferOffset, len});
+      if (retainedBuffers_) {
+        shapeKinds_.push_back(static_cast<uint8_t>(allocKind));
+        liveShapes.resize(objShapeTable_.size());
+      }
+    }
+    if (retainedBuffers_) {
+      liveValues.set(valIndexInSet);
+      liveKeys.set(keyIndexInSet);
+      liveShapes.set(shapeID);
     }
     literalOffsetMap[Inst] =
         LiteralOffset{shapeID, valView[valIndexInSet].getOffset()};
   }
 
+  auto values = std::move(valueStorage_).acquireStringTableAndStorage();
+  auto keys = std::move(keyStorage_).acquireStringTableAndStorage();
+  if (retainedBuffers_) {
+    retainedBuffers_->liveValueBytes = liveStorageBytes(values.first, liveValues);
+    retainedBuffers_->liveKeyBytes = liveStorageBytes(keys.first, liveKeys);
+    retainedBuffers_->values = values.second;
+    retainedBuffers_->keys = keys.second;
+    retainedBuffers_->valueEntries = std::move(values.first);
+    retainedBuffers_->keyEntries = std::move(keys.first);
+    retainedBuffers_->shapes = objShapeTable_;
+    retainedBuffers_->shapeKinds = std::move(shapeKinds_);
+    retainedBuffers_->liveValueEntries = liveValues.count();
+    retainedBuffers_->liveKeyEntries = liveKeys.count();
+    retainedBuffers_->liveShapes = liveShapes.count();
+  }
   return {
-      std::move(valueStorage_).acquireStringTableAndStorage().second,
-      std::move(keyStorage_).acquireStringTableAndStorage().second,
+      std::move(values.second),
+      std::move(keys.second),
       std::move(objShapeTable_),
       std::move(literalOffsetMap)};
 }
@@ -547,14 +650,16 @@ Result generate(
     const SerializedLiteralGenerator::StringLookupFn &getIdentifier,
     const SerializedLiteralGenerator::StringLookupFn &getString,
     bool optimize,
-    hbc::BCProviderBase *bcProvider) {
+    hbc::BCProviderBase *bcProvider,
+    RetainedBuffers *retainedBuffers) {
   return Builder(
              m,
              shouldVisitFunction,
              getIdentifier,
              getString,
              optimize,
-             bcProvider)
+             bcProvider,
+             retainedBuffers)
       .generate();
 }
 

@@ -24,6 +24,13 @@ JSTypedArrayBase::JSTypedArrayBase(
       buffer_(nullptr),
       length_(0),
       offset_(0) {
+  static_assert(sizeof(JSTypedArrayBase) == sizeof(SHJSTypedArray));
+  static_assert(
+      offsetof(JSTypedArrayBase, buffer_) == offsetof(SHJSTypedArray, buffer));
+  static_assert(
+      offsetof(JSTypedArrayBase, length_) == offsetof(SHJSTypedArray, length));
+  static_assert(
+      offsetof(JSTypedArrayBase, offset_) == offsetof(SHJSTypedArray, offset));
   flags_.indexedStorage = true;
   flags_.fastIndexProperties = true;
 }

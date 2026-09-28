@@ -307,6 +307,14 @@ void hermes::vm::sh_unit_mark_weak_roots(
     }
 
     for (auto &entry : llvh::makeMutableArrayRef(
+             reinterpret_cast<ComputedReadCacheEntry *>(
+                 unit->computed_read_cache),
+             unit->num_computed_read_cache_entries)) {
+      acceptor.acceptWeak(entry.clazz);
+      acceptor.acceptWeakSym(entry.key);
+    }
+
+    for (auto &entry : llvh::makeMutableArrayRef(
              reinterpret_cast<WeakRootBase *>(unit->object_literal_class_cache),
              unit->obj_shape_table_count)) {
       acceptor.acceptWeak(entry);

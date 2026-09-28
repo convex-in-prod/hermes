@@ -512,6 +512,25 @@ static std::pair<bool, size_t> shouldTryToInline(
   return {true, numSignificantInstructions};
 }
 
+/// Identify direct parameter field reads as an inlining profitability hint.
+/// The existing object promotion pass still owns the complete escape/layout
+/// proof after the call has been exposed.
+static llvh::SmallSetVector<unsigned, 4> objectReadParameters(Function *F) {
+  llvh::SmallSetVector<unsigned, 4> parameters;
+  for (auto &BB : *F) {
+    for (auto &I : BB) {
+      Value *object = nullptr;
+      if (auto *load = llvh::dyn_cast<LoadPropertyInst>(&I))
+        object = load->getObject();
+      else if (auto *load = llvh::dyn_cast<PrLoadInst>(&I))
+        object = load->getObject();
+      if (auto *parameter = llvh::dyn_cast_or_null<LoadParamInst>(object))
+        parameters.insert(parameter->getParam()->getIndexInParamList());
+    }
+  }
+  return parameters;
+}
+
 bool Inlining::runOnModule(Module *M) {
   if (!M->getContext().getOptimizationSettings().inlining)
     return false;
@@ -530,8 +549,9 @@ bool Inlining::runOnModule(Module *M) {
   auto *nonFunctionErrorLS =
       builder.getLiteralString("Trying to call a non-function");
 
-  // Find functions with try/catch blocks, to avoid inlining into them.
+  // Record try/catch callers for the stricter growth policy.
   llvh::DenseSet<Function *> functionsWithTryCatch{};
+  llvh::SmallDenseMap<Function *, size_t, 8> tryInliningGrowth;
   for (Function *FC : functionOrder) {
     if (functionHasTryCatch(FC)) {
       functionsWithTryCatch.insert(FC);
@@ -567,6 +587,11 @@ bool Inlining::runOnModule(Module *M) {
       continue;
     }
 
+    const auto objectParameters =
+        M->getContext().getOptimizationSettings().staticHermesInlining
+        ? objectReadParameters(FC)
+        : llvh::SmallSetVector<unsigned, 4>{};
+
     for (BaseCallInst *CI : callsites) {
       // We know the callee is an IR function, so it must be possible to inline.
       Function *intoFunction = CI->getParent()->getParent();
@@ -599,13 +624,37 @@ bool Inlining::runOnModule(Module *M) {
       // Very small functions are still worth inlining regardless, because the
       // JIT/native backend deopt is more expensive than the code size.
       static constexpr size_t kTryCatchInlineSizeLimit = 5;
+      bool objectReaderInTry = false;
       if (functionsWithTryCatch.count(intoFunction) &&
           numSignificantInstructions >= kTryCatchInlineSizeLimit) {
-        LLVM_DEBUG(
-            llvh::dbgs() << "Cannot inline function '"
-                         << FC->getInternalNameStr()
-                         << "': contains try/catch\n");
-        continue;
+        // SH already stores every value of a try/catch caller in rooted locals
+        // across longjmp. A small reader of a freshly allocated argument can
+        // remove that allocation and its field operations after inlining.
+        // Bound both individual copies and total added instructions per caller
+        // per pass; keep the ordinary JIT/bytecode policy unchanged.
+        static constexpr size_t kObjectReaderInlineSizeLimit = 32;
+        static constexpr size_t kTryInlineGrowthLimit = 128;
+        if (numSignificantInstructions <= kObjectReaderInlineSizeLimit &&
+            tryInliningGrowth.lookup(intoFunction) +
+                    numSignificantInstructions <=
+                kTryInlineGrowthLimit &&
+            CI->getCalleeIsAlwaysClosure()->getValue()) {
+          for (unsigned index : objectParameters) {
+            if (index < CI->getNumArguments() &&
+                llvh::isa<BaseAllocObjectLiteralInst>(
+                    CI->getArgument(index))) {
+              objectReaderInTry = true;
+              break;
+            }
+          }
+        }
+        if (!objectReaderInTry) {
+          LLVM_DEBUG(
+              llvh::dbgs() << "Cannot inline function '"
+                           << FC->getInternalNameStr()
+                           << "': contains try/catch\n");
+          continue;
+        }
       }
 
       // We cannot inline into a potentially constructing call if the callee
@@ -647,6 +696,8 @@ bool Inlining::runOnModule(Module *M) {
           llvh::dbgs() << "\n";);
 
       intoFunctions.insert(intoFunction);
+      if (objectReaderInTry)
+        tryInliningGrowth[intoFunction] += numSignificantInstructions;
 
       // Split the block in two and move all instructions following the call
       // to the new block.

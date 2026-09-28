@@ -429,6 +429,15 @@ bool compileToCBundle(
       return false;
     identities.push_back(std::move(*identity));
   }
+  const std::string layoutPath = generatedFilePrefix + "layout.json";
+  llvh::Optional<BundleFileIdentity> layoutIdentity;
+  if (params.genOptions.emitCBundleLayout) {
+    llvh::SmallString<128> fullPath(outputDirectory);
+    llvh::sys::path::append(fullPath, layoutPath);
+    layoutIdentity = identifyBundleFile(fullPath);
+    if (!layoutIdentity)
+      return false;
+  }
 
   OutputStream manifest;
   if (!manifest.open(outputFilename, llvh::sys::fs::F_None))
@@ -443,8 +452,13 @@ bool compileToCBundle(
   };
   OS << "{\"header\":{";
   emitCommonFields(0);
-  OS << "},\"kind\":\"static-hermes-c-bundle-v1\",\"schemaVersion\":1,"
-        "\"translationUnits\":[";
+  OS << "},\"kind\":\"static-hermes-c-bundle-v1\",";
+  if (layoutIdentity) {
+    OS << "\"layout\":{\"path\":\"" << layoutPath << "\",\"sha256\":\""
+       << layoutIdentity->sha256 << "\",\"size\":" << layoutIdentity->size
+       << "},";
+  }
+  OS << "\"schemaVersion\":1,\"translationUnits\":[";
   for (size_t index = 1; index < files.size(); ++index) {
     if (index != 1)
       OS << ',';

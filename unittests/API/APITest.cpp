@@ -3694,3 +3694,130 @@ INSTANTIATE_TEST_CASE_P(
     HermesRuntimeTest,
     ::testing::ValuesIn(runtimeGenerators()));
 } // namespace
+
+TEST(HermesNativeValuesTest, ObjectShapesAndOwnProperties) {
+  auto rt = makeHermesRuntime();
+  std::vector<std::pair<std::string, Value>> fields;
+  fields.emplace_back("name", String::createFromUtf8(*rt, "first"));
+  fields.emplace_back("__proto__", 42);
+  fields.emplace_back("nested", Object(*rt));
+  auto first = rt->createObjectWithProperties(fields);
+  rt->global().setProperty(*rt, "first", first);
+  rt->evaluateJavaScript(std::make_shared<StringBuffer>(
+      "delete first.name; first.extra = 9;"), "test");
+  rt->instrumentation().collectGarbage("shape reuse");
+  auto second = rt->createObjectWithProperties(fields);
+  rt->global().setProperty(*rt, "second", second);
+  auto result = rt->evaluateJavaScript(std::make_shared<StringBuffer>(
+      "Object.getPrototypeOf(second) === Object.prototype && "
+      "Object.keys(second).join(',') === 'name,__proto__,nested' && "
+      "second.name === 'first' && second.__proto__ === 42 && "
+      "Object.getOwnPropertyDescriptor(second, '__proto__').writable"), "test");
+  EXPECT_TRUE(result.getBool());
+  std::vector<std::pair<std::string, Value>> indexed;
+  indexed.emplace_back("2", 20);
+  indexed.emplace_back("1", 10);
+  indexed.emplace_back("2", 21);
+  indexed.emplace_back("01", 30);
+  auto object = rt->createObjectWithProperties(indexed);
+  rt->global().setProperty(*rt, "indexed", object);
+  EXPECT_TRUE(rt->evaluateJavaScript(std::make_shared<StringBuffer>(
+      "Object.keys(indexed).join(',') === '1,2,01' && indexed[2] === 21"),
+      "test").getBool());
+  std::vector<Value> elements;
+  elements.emplace_back(*rt, second);
+  elements.emplace_back(3);
+  auto dense = rt->createArrayWithValues(elements);
+  EXPECT_EQ(dense.size(*rt), 2);
+  EXPECT_TRUE(Value::strictEquals(*rt, dense.getValueAtIndex(*rt, 0), Value(*rt, second)));
+  EXPECT_EQ(dense.getValueAtIndex(*rt, 1).getNumber(), 3);
+  // Cache eviction must release only templates, never returned documents.
+  for (int i = 0; i < 80; ++i) {
+    std::vector<std::pair<std::string, Value>> varying;
+    varying.emplace_back("field" + std::to_string(i), i);
+    varying.emplace_back("unique" + std::to_string(i), i);
+    rt->createObjectWithProperties(varying);
+  }
+  EXPECT_EQ(second.getProperty(*rt, "name").asString(*rt).utf8(*rt), "first");
+}
+
+TEST(HermesNativeValuesTest, StreamingConstructionAcrossCollectionAndEviction) {
+  auto rt = makeHermesRuntime();
+  const std::vector<std::string> keys{"first", "nested", "__proto__"};
+  size_t decoded = 0;
+  auto object = rt->createObjectFromEntries(
+      keys.size(), [&](size_t i) { return std::string_view(keys[i]); },
+      [&](size_t i) -> Value {
+        EXPECT_EQ(i, decoded++);
+        if (i == 0)
+          return String::createFromUtf8(*rt, "retained");
+        // Evict the enclosing layout while the partially filled object is
+        // rooted, and collect before writing each nested array element.
+        for (size_t j = 0; j < 80; ++j) {
+          std::string key = "nested" + std::to_string(j);
+          rt->createObjectFromEntries(
+              1, [&](size_t) { return std::string_view(key); },
+              [&](size_t) { return Value(static_cast<double>(j)); });
+        }
+        return rt->createArrayFromValues(3, [&](size_t j) -> Value {
+          rt->instrumentation().collectGarbage("streamed values");
+          return String::createFromUtf8(*rt, std::to_string(j));
+        });
+      });
+  rt->global().setProperty(*rt, "streamed", object);
+  EXPECT_TRUE(rt->evaluateJavaScript(std::make_shared<StringBuffer>(
+      "streamed.first === 'retained' && streamed.nested.join(',') === '0,1,2' && "
+      "streamed.__proto__.join(',') === '0,1,2' && "
+      "Object.getPrototypeOf(streamed) === Object.prototype && "
+      "Object.keys(streamed).join(',') === 'first,nested,__proto__'"),
+      "test").getBool());
+  const auto info = rt->instrumentation().getHeapInfo(false);
+  EXPECT_GT(info.at("hermes_objectLayoutEvictions"), 0);
+
+  // Dictionary objects must remain independent even after their shape changes.
+  std::vector<std::string> wideKeys;
+  for (size_t i = 0; i < 80; ++i)
+    wideKeys.push_back("field" + std::to_string(i));
+  auto makeWide = [&] {
+    return rt->createObjectFromEntries(
+        wideKeys.size(), [&](size_t i) { return std::string_view(wideKeys[i]); },
+        [&](size_t i) { return Value(static_cast<double>(i)); });
+  };
+  rt->global().setProperty(*rt, "wideFirst", makeWide());
+  rt->global().setProperty(*rt, "wideSecond", makeWide());
+  EXPECT_TRUE(rt->evaluateJavaScript(std::make_shared<StringBuffer>(
+      "delete wideFirst.field30; wideFirst.extra = 1; "
+      "wideSecond.field30 === 30 && !('extra' in wideSecond) && "
+      "Object.keys(wideSecond).length === 80"), "test").getBool());
+}
+
+TEST(HermesNativeValuesTest, DescriptorSnapshots) {
+  auto rt = makeHermesRuntime();
+  auto eval = [&](const char *source) {
+    return rt->evaluateJavaScript(std::make_shared<StringBuffer>(source), "test");
+  };
+  auto object = eval(
+      "globalThis.key = Symbol('key'); globalThis.calls = 0;"
+      "globalThis.subject = { n: NaN, z: 0, [key]: 3, "
+      "get x() { ++calls; return 1; } }; subject").asObject(*rt);
+  auto keys = eval("Reflect.ownKeys(subject)").asObject(*rt).asArray(*rt);
+  auto matches = rt->createOwnPropertyValidator(object, keys, false);
+  rt->instrumentation().collectGarbage("snapshot roots");
+  EXPECT_TRUE(matches());
+  EXPECT_EQ(eval("calls").getNumber(), 0);
+  eval("subject.z = -0");
+  EXPECT_FALSE(matches());
+  eval("subject.z = 0; subject[key] = 4");
+  EXPECT_FALSE(matches());
+  eval("subject[key] = 3; Object.defineProperty(subject, 'x', {get() {return 1}})");
+  EXPECT_FALSE(matches());
+  auto current = rt->createOwnPropertyValidator(object, keys, false);
+  auto subset = rt->createOwnPropertyValidator(object, keys, true);
+  eval("subject.newField = 5");
+  EXPECT_FALSE(current());
+  EXPECT_TRUE(subset());
+  eval("delete subject.n");
+  EXPECT_FALSE(subset());
+  auto proxy = eval("new Proxy({}, {})").asObject(*rt);
+  EXPECT_THROW(rt->createOwnPropertyValidator(proxy, keys, false), JSINativeException);
+}

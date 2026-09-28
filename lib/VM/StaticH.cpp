@@ -7,6 +7,7 @@
 
 #include "SHUnitExt.h"
 #include "hermes/BCGen/SerializedLiteralParser.h"
+#include "hermes/Support/UTF8.h"
 #include "hermes/VM/ArrayStorage.h"
 #include "hermes/VM/Callable.h"
 #include "hermes/VM/FastArray.h"
@@ -25,15 +26,30 @@
 #include "hermes/VM/StackFrame-inline.h"
 #include "hermes/VM/StaticHUtils.h"
 #include "hermes/VM/StringBuilder.h"
+#include "hermes/VM/StringPrimitive.h"
 
 #include "JSLib/JSLibInternal.h"
 
+#include <algorithm>
 #include <cstdarg>
+#include <limits>
 
 using namespace hermes;
 using namespace hermes::vm;
 
 extern "C" void _SH_MODEL(void) {}
+
+extern "C" void _sh_get_heap_statistics(
+    SHRuntime *shr, SHHeapStatistics *statistics) {
+  GCBase::HeapInfo info;
+  getRuntime(shr).getHeap().getHeapInfo(info);
+  *statistics = {
+      info.numCollections,
+      info.totalAllocatedBytes,
+      info.allocatedBytes,
+      static_cast<uint64_t>(info.generalStats.gcWallTime.sum() * 1e9),
+      static_cast<uint64_t>(info.generalStats.gcCPUTime.sum() * 1e9)};
+}
 
 namespace {
 /// Convert the given \p cr to a \c CallResult<HermesValue>.
@@ -209,6 +225,68 @@ extern "C" void _sh_ljs_reify_arguments_strict(
   reifyArguments(shr, frame, lazyReg, true);
 }
 
+static int32_t readIndexedCharacter(
+    SHRuntime *shr,
+    SHLegacyValue source,
+    SHLegacyValue key) {
+  auto value = *toPHV(&source);
+  auto keyValue = *toPHV(&key);
+  uint32_t index;
+  if (value.isString() && keyValue.isNumber() &&
+      sh_tryfast_f64_to_u32(keyValue.getNumber(), index) &&
+      index < value.getString()->getStringLength())
+    return value.getString()->at(index);
+
+  Runtime &runtime = getRuntime(shr);
+  auto result = [&]() -> CallResult<int32_t> {
+    GCScopeMarkerRAII marker{runtime};
+    struct : Locals {
+      PinnedValue<> source;
+      PinnedValue<> key;
+    } lv;
+    LocalsRAII lraii{runtime, &lv};
+    // Native calls pass values by copy. Root both before property-key coercion
+    // or a getter can collect, and leave every RAII scope before throwing to JS.
+    lv.source = value;
+    lv.key = keyValue;
+    auto read = lv.source->isObject()
+        ? JSObject::getComputed_RJS(
+              Handle<JSObject>::vmcast(&lv.source), runtime, lv.key)
+        : Interpreter::getByValTransient_RJS(runtime, lv.source, lv.key);
+    if (LLVM_UNLIKELY(read == ExecutionStatus::EXCEPTION))
+      return ExecutionStatus::EXCEPTION;
+    auto observed = read->getHermesValue();
+    if (observed.isString() && observed.getString()->getStringLength() == 1)
+      return int32_t(observed.getString()->at(0));
+    return -1;
+  }();
+  if (LLVM_UNLIKELY(result == ExecutionStatus::EXCEPTION))
+    _sh_throw_current(shr);
+  return result.getValue();
+}
+
+LLVM_ATTRIBUTE_NOINLINE
+extern "C" SHLegacyValue _sh_ljs_get_indexed_char_code(
+    SHRuntime *shr,
+    SHLegacyValue source,
+    SHLegacyValue key) {
+  return HermesValue::encodeTrustedNumberValue(
+      readIndexedCharacter(shr, source, key));
+}
+
+LLVM_ATTRIBUTE_NOINLINE
+extern "C" SHLegacyValue _sh_ljs_string_index_compare(
+    SHRuntime *shr,
+    SHLegacyValue source,
+    double key,
+    uint16_t character,
+    uint8_t invert) {
+  assert(toPHV(&source)->isString() && "compiler must prove a primitive string");
+  int32_t code = readIndexedCharacter(
+      shr, source, HermesValue::encodeTrustedNumberValue(key));
+  return HermesValue::encodeBoolValue((code == character) != invert);
+}
+
 LLVM_ATTRIBUTE_NOINLINE
 extern "C" SHLegacyValue _sh_ljs_get_by_val_with_receiver_rjs(
     SHRuntime *shr,
@@ -286,6 +364,64 @@ _sh_ljs_get_by_index_rjs(SHRuntime *shr, SHLegacyValue *source, uint32_t key) {
     _sh_throw_current(shr);
   }
   return res->getHermesValue();
+}
+
+LLVM_ATTRIBUTE_NOINLINE
+extern "C" SHLegacyValue _sh_ljs_get_by_val_cached_rjs(
+    SHRuntime *shr,
+    SHLegacyValue *source,
+    SHLegacyValue *key,
+    SHComputedReadCacheEntry *cache) {
+  Runtime &runtime = getRuntime(shr);
+  const auto sourceValue = *toPHV(source);
+  const auto keyValue = *toPHV(key);
+  if (sourceValue.isObject()) {
+    SymbolID id{};
+    if (keyValue.isSymbol()) {
+      id = keyValue.getSymbol();
+    } else if (keyValue.isString() && keyValue.getString()->isUniqued()) {
+      id = keyValue.getString()->getUniqueID(runtime);
+    }
+    if (id.isValid()) {
+      auto *obj = vmcast<JSObject>(sourceValue);
+      const CompressedPointer clazzPtr{obj->getClassGCPtr()};
+      constexpr unsigned associativity = SH_COMPUTED_READ_CACHE_ASSOCIATIVITY;
+      constexpr unsigned sets = SH_COMPUTED_READ_CACHE_WAYS / associativity;
+      static_assert(SH_COMPUTED_READ_CACHE_WAYS % associativity == 0);
+      auto *entries = reinterpret_cast<ComputedReadCacheEntry *>(cache) +
+          (id.unsafeGetRaw() % sets) * associativity;
+      for (unsigned i = 0; i < associativity; ++i) {
+        if (entries[i].clazz == clazzPtr && entries[i].key == id) {
+          return JSObject::getNamedSlotValueUnsafe(obj, runtime, entries[i].slot)
+              .unboxToHV(runtime);
+        }
+      }
+      // Restrict insertion to ordinary objects and immutable shapes. No key
+      // coercion, allocation or user code occurs between lookup and slot read.
+      if (obj->getKind() == CellKind::JSObjectKind &&
+          !obj->getFlags().hostObject && !obj->getFlags().lazyObject &&
+          !obj->getClass(runtime)->isDictionary()) {
+        NamedPropertyDescriptor desc;
+        auto found = JSObject::tryGetOwnNamedDescriptorFast(obj, runtime, id, desc);
+        if (found && *found && !desc.flags.accessor) {
+          // FIFO replacement within this key's set. Moving weak entries is safe
+          // here because descriptor lookup and the slot read cannot collect.
+          for (unsigned i = associativity - 1; i > 0; --i) {
+            entries[i].clazz = entries[i - 1].clazz.getNoBarrierUnsafe();
+            entries[i].key = entries[i - 1].key;
+            entries[i].slot = entries[i - 1].slot;
+          }
+          auto &entry = entries[0];
+          entry.clazz = clazzPtr;
+          entry.key = id;
+          entry.slot = desc.slot;
+          return JSObject::getNamedSlotValueUnsafe(obj, runtime, desc)
+              .unboxToHV(runtime);
+        }
+      }
+    }
+  }
+  return _sh_ljs_get_by_val_with_receiver_rjs(shr, source, key, source);
 }
 
 LLVM_ATTRIBUTE_NOINLINE
@@ -1264,8 +1400,25 @@ static inline HermesValue getByIdWithReceiver_RJS(
     CallResult<PseudoHandle<>> resPH{ExecutionStatus::EXCEPTION};
     {
       GCScopeMarkerRAII marker{runtime};
-      resPH = Interpreter::getByIdTransientWithReceiver_RJS(
-          runtime, source, symID, receiver);
+      if (source->isString() && cacheEntry &&
+          symID != Predefined::getSymbolID(Predefined::length)) {
+        auto prototype = Handle<JSObject>::vmcast(&runtime.stringPrototype);
+        // Cache the prototype's own data slot, not its current value. Replacing
+        // a method keeps reading the new slot value; changing property flags
+        // or deleting it invalidates the class match. Accessors keep the
+        // primitive receiver on the ordinary lookup path.
+        if (cacheEntry->clazz == prototype->getClassGCPtr()) {
+          return JSObject::getNamedSlotValueUnsafe(
+                     *prototype, runtime, cacheEntry->getSlot())
+              .unboxToHV(runtime);
+        }
+        resPH = JSObject::getNamedWithReceiver_RJS(
+            prototype, runtime, symID, receiver,
+            DEFAULT_PROP_OP_FLAGS(false), cacheEntry);
+      } else {
+        resPH = Interpreter::getByIdTransientWithReceiver_RJS(
+            runtime, source, symID, receiver);
+      }
     }
     if (LLVM_UNLIKELY(resPH == ExecutionStatus::EXCEPTION))
       _sh_throw_current(getSHRuntime(runtime));
@@ -1409,6 +1562,36 @@ extern "C" SHLegacyValue _sh_ljs_get_by_id_rjs(
       Handle<>{toPHV(source)},
       SymbolID::unsafeCreate(symID),
       reinterpret_cast<ReadPropertyCacheEntry *>(propCacheEntry));
+}
+
+LLVM_ATTRIBUTE_NOINLINE
+extern "C" SHLegacyValue _sh_ljs_get_by_id_polymorphic_rjs(
+    SHRuntime *shr,
+    const SHLegacyValue *source,
+    SHSymbolID symID,
+    SHReadPropertyCacheEntry *cache) {
+  auto &runtime = getRuntime(shr);
+  auto *entries = reinterpret_cast<ReadPropertyCacheEntry *>(cache);
+  if (toPHV(source)->isObject()) {
+    auto *object = vmcast<JSObject>(*toPHV(source));
+    const CompressedPointer clazz{object->getClassGCPtr()};
+    for (unsigned i = 0; i < SH_NAMED_READ_CACHE_WAYS; ++i) {
+      if (entries[i].clazz == clazz) {
+        return JSObject::getNamedSlotValueUnsafe(
+                   object, runtime, entries[i].getSlot())
+            .unboxToHV(runtime);
+      }
+    }
+  }
+  // Rotate before the potentially allocating lookup, keeping every weak pointer
+  // in the unit's traced storage. The oldest entry becomes the replacement slot;
+  // uncachable reads retain both entries. Prototype validation stays in getById.
+  std::rotate(
+      cache,
+      cache + SH_NAMED_READ_CACHE_WAYS - 1,
+      cache + SH_NAMED_READ_CACHE_WAYS);
+  return getById_RJS<false>(
+      runtime, Handle<>{toPHV(source)}, SymbolID::unsafeCreate(symID), entries);
 }
 
 LLVM_ATTRIBUTE_NOINLINE
@@ -1790,6 +1973,25 @@ _sh_ljs_create_regexp(SHRuntime *shr, SHSymbolID pattern, SHSymbolID flags) {
     _sh_throw_current(shr);
 
   return *cr;
+}
+
+LLVM_ATTRIBUTE_NOINLINE
+extern "C" SHLegacyValue _sh_ljs_create_regexp_precompiled(
+    SHRuntime *shr,
+    SHSymbolID pattern,
+    SHSymbolID flags,
+    const uint8_t *bytecode,
+    uint32_t bytecodeSize) {
+  Runtime &runtime = getRuntime(shr);
+  GCScopeMarkerRAII marker{runtime};
+  Handle<JSRegExp> re = runtime.makeHandle(JSRegExp::create(runtime));
+  auto patternHandle = runtime.makeHandle(
+      runtime.getStringPrimFromSymbolID(SymbolID::unsafeCreate(pattern)));
+  auto flagsHandle = runtime.makeHandle(
+      runtime.getStringPrimFromSymbolID(SymbolID::unsafeCreate(flags)));
+  JSRegExp::initialize(
+      re, runtime, patternHandle, flagsHandle, {bytecode, bytecodeSize});
+  return re.getHermesValue();
 }
 
 LLVM_ATTRIBUTE_NOINLINE
@@ -2726,4 +2928,33 @@ _sh_asciiz_to_string(SHRuntime *shr, const char *str, ptrdiff_t len) {
   if (LLVM_UNLIKELY(res == ExecutionStatus::EXCEPTION))
     _sh_throw_current(shr);
   return *res;
+}
+
+LLVM_ATTRIBUTE_NOINLINE
+extern "C" ptrdiff_t _sh_string_write_utf8(
+    SHRuntime *shr,
+    SHLegacyValue value,
+    char *destination,
+    size_t capacity) {
+  if (LLVM_UNLIKELY(!_sh_ljs_is_string(value))) {
+    _sh_throw_type_error_ascii(shr, "Expected a string");
+  }
+  // No allocation occurs while reading the string, so the raw pointer remains
+  // valid through the conversion without a guest-visible property lookup.
+  auto *string = vmcast<StringPrimitive>(*toPHV(&value));
+  const uint32_t length = string->getStringLength();
+  if (string->isASCII()) {
+    if (length > capacity)
+      return -1;
+    memcpy(destination, string->getStringRef<char>().data(), length);
+    return length;
+  }
+  auto [read, written] = convertUTF16ToUTF8BufferWithReplacements(
+      llvh::MutableArrayRef<uint8_t>(
+          reinterpret_cast<uint8_t *>(destination), capacity),
+      string->getStringRef<char16_t>());
+  if (read != length ||
+      written > static_cast<size_t>(std::numeric_limits<ptrdiff_t>::max()))
+    return -1;
+  return written;
 }

@@ -158,10 +158,14 @@ static bool tryLowerStaticBuiltin(
       llvh::dbgs() << "Found builtin [" << (int)*builtinIndex << "] "
                    << getBuiltinMethodName(*builtinIndex) << "()\n");
 
-  // Always lower HermesInternal.xxx() calls, but only lower the rest if
-  // -fstatic-builtins is enabled.
+  // Embedders may replace random without replacing the deterministic Math
+  // methods. Keep that narrower contract separate from all-static builtins.
+  const auto &settings = F->getContext().getOptimizationSettings();
+  const bool staticMath = settings.staticMathBuiltins &&
+      objLit->getValue().str() == "Math" &&
+      propLit->getValue().str() != "random";
   if (objLit->getValue() != builtins.hermesInternalID &&
-      !F->getContext().getOptimizationSettings().staticBuiltins) {
+      !settings.staticBuiltins && !staticMath) {
     return false;
   }
 

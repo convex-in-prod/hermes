@@ -15,8 +15,73 @@
 #include "hermes/IR/Instrs.h"
 
 #include "llvh/ADT/SetVector.h"
+#include "llvh/ADT/SmallPtrSet.h"
 
 namespace hermes {
+
+uint8_t getKnownIntegerRange(Value *value) {
+  constexpr uint8_t all = IntegerRangeInt32 | IntegerRangeUint32 |
+      IntegerRangeInt32OrUint32;
+  uint8_t range = all;
+  bool hasInput = false;
+  llvh::SmallVector<Value *, 8> pending{value};
+  llvh::SmallPtrSet<Value *, 16> visited;
+  while (!pending.empty()) {
+    auto *input = pending.pop_back_val();
+    if (!visited.insert(input).second)
+      continue;
+    if (visited.size() > 64 || !input->getType().isNumberType())
+      return IntegerRangeUnknown;
+
+    uint8_t constraint = IntegerRangeUnknown;
+    if (auto *number = llvh::dyn_cast<LiteralNumber>(input)) {
+      if (number->isInt32Representible())
+        constraint |= IntegerRangeInt32 | IntegerRangeInt32OrUint32;
+      if (number->isUInt32Representible())
+        constraint |= IntegerRangeUint32 | IntegerRangeInt32OrUint32;
+    } else if (auto *phi = llvh::dyn_cast<PhiInst>(input)) {
+      // A cycle is only proved when all of its external inputs are proved.
+      // No constraint is inferred solely from a self-referential phi.
+      for (unsigned i = 0, e = phi->getNumEntries(); i < e; ++i)
+        pending.push_back(phi->getEntry(i).first);
+      continue;
+    } else if (auto *inst = llvh::dyn_cast<Instruction>(input)) {
+      switch (inst->getKind()) {
+        case ValueKind::MovInstKind:
+        case ValueKind::LIRLoadConstInstKind:
+        case ValueKind::LIRSpillMovInstKind:
+        case ValueKind::UnionNarrowTrustedInstKind:
+          pending.push_back(inst->getOperand(0));
+          continue;
+        case ValueKind::AsInt32InstKind:
+        case ValueKind::UnaryTildeInstKind:
+        case ValueKind::BinaryAndInstKind:
+        case ValueKind::BinaryOrInstKind:
+        case ValueKind::BinaryXorInstKind:
+        case ValueKind::BinaryLeftShiftInstKind:
+        case ValueKind::BinaryRightShiftInstKind:
+          constraint = IntegerRangeInt32 | IntegerRangeInt32OrUint32;
+          break;
+        case ValueKind::AsUint32InstKind:
+        case ValueKind::BinaryUnsignedRightShiftInstKind:
+          constraint = IntegerRangeUint32 | IntegerRangeInt32OrUint32;
+          break;
+        case ValueKind::CallBuiltinInstKind:
+          if (llvh::cast<CallBuiltinInst>(inst)->getBuiltinIndex() ==
+              BuiltinMethod::Math_imul)
+            constraint = IntegerRangeInt32 | IntegerRangeInt32OrUint32;
+          break;
+        default:
+          break;
+      }
+    }
+    range &= constraint;
+    if (!range)
+      return IntegerRangeUnknown;
+    hasInput = true;
+  }
+  return hasInput ? range : uint8_t(IntegerRangeUnknown);
+}
 
 Value *isStoreOnceVariable(Variable *V) {
   Value *res = nullptr;

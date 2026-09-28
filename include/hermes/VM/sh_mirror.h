@@ -10,6 +10,7 @@
 
 #include "hermes/VM/sh_legacy_value.h"
 #include "hermes/VM/sh_runtime.h"
+#include "hermes/VMLayouts/PropertyCache.h"
 
 #ifdef HERMESVM_COMPRESSED_POINTERS
 typedef uint32_t SHCompressedPointerRawType;
@@ -44,6 +45,12 @@ typedef struct SHPrivateNameCacheEntry {
   uint32_t slot;
 } SHPrivateNameCacheEntry;
 
+typedef struct SHComputedReadCacheEntry {
+  SHCompressedPointerRawType clazz;
+  SHWeakRootSymbolID key;
+  uint32_t slot;
+} SHComputedReadCacheEntry;
+
 /// Struct mirroring the layout of GCCell.
 typedef struct SHGCCell {
   SHCompressedPointerRawType kindAndSize;
@@ -53,6 +60,15 @@ typedef struct SHGCCell {
 #endif
 } SHGCCell;
 
+enum SHCellKind {
+#define CELL_KIND(name) SH_##name##Kind,
+#include "hermes/VM/CellKinds.def"
+};
+
+// KindAndSize uses the low 32 bits for size on uncompressed 64-bit hosts,
+// and the low 24 bits on 32-bit or compressed-pointer hosts.
+#define SH_CELL_KIND_SHIFT (sizeof(SHCompressedPointerRawType) > 4 ? 32 : 24)
+
 /// Struct mirroring the layout of JSObject (without the direct props).
 typedef struct SHJSObject {
   SHGCCell base;
@@ -61,6 +77,28 @@ typedef struct SHJSObject {
   SHCompressedPointerRawType clazz;
   SHCompressedPointerRawType propStorage;
 } SHJSObject;
+
+typedef struct SHJSTypedArray {
+  SHJSObject base;
+  SHCompressedPointer buffer;
+  uint32_t length;
+  uint32_t offset;
+} SHJSTypedArray;
+
+typedef struct SHArrayImpl {
+  SHJSObject base;
+  uint32_t beginIndex;
+  uint32_t elemCount;
+  SHCompressedPointer indexedStorage;
+} SHArrayImpl;
+
+typedef struct SHJSArrayBuffer {
+  SHJSObject base;
+  uint8_t *data;
+  uint32_t size;
+  bool external;
+  bool attached;
+} SHJSArrayBuffer;
 
 #ifdef HERMESVM_BOXED_DOUBLES
 typedef SHCompressedPointerRawType SHGCSmallHermesValue;

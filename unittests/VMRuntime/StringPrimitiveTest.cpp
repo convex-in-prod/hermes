@@ -38,6 +38,21 @@ TEST_F(StringPrimTest, CreateTest) {
           .equals(createUTF16Ref(u"foo")));
 }
 
+TEST_F(StringPrimTest, FullSliceRetainsPrimitive) {
+  for (auto input : {u"", u"a", u"unchanged", u"\u03b1\u03b2\u03b3"}) {
+    auto str = StringPrimitive::createNoThrow(runtime, createUTF16Ref(input));
+    auto full = StringPrimitive::slice(runtime, str, 0, str->getStringLength());
+    ASSERT_NE(full, ExecutionStatus::EXCEPTION);
+    EXPECT_EQ(full->getString(), str.get());
+  }
+  auto str = StringPrimitive::createNoThrow(runtime, "abcd");
+  auto part = StringPrimitive::slice(runtime, str, 1, 2);
+  ASSERT_NE(part, ExecutionStatus::EXCEPTION);
+  auto result = runtime.makeHandle(vmcast<StringPrimitive>(*part));
+  EXPECT_TRUE(StringPrimitive::createStringView(runtime, result)
+                  .equals(createUTF16Ref(u"bc")));
+}
+
 TEST_F(StringPrimTest, EqualityTest) {
   auto s1 = StringPrimitive::createNoThrow(runtime, createUTF16Ref(u"abc"));
   auto s2 = StringPrimitive::createNoThrow(runtime, createUTF16Ref(u"abc"));

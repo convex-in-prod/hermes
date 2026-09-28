@@ -137,6 +137,16 @@ static cl::opt<unsigned> EmitCShardSize(
     cl::init(2 * 1024 * 1024),
     cl::desc("Target function-body bytes per generated C translation unit"));
 
+static cl::opt<bool> EmitCBundleLayout(
+    "Xemit-c-layout",
+    cl::init(false),
+    cl::desc("Emit reusable function, cache and string assignments beside the C bundle"));
+
+static cl::opt<std::string> CBundleLayoutInput(
+    "Xc-layout-input",
+    cl::init(""),
+    cl::desc("Authenticated metadata layout from a previous C bundle"));
+
 cl::opt<DebugLevel> DebugInfoLevel(
     cl::desc("Choose debug info level:"),
     cl::init(DebugLevel::g0),
@@ -216,6 +226,12 @@ cl::opt<bool> KeepTemp(
     "keep-temp",
     cl::init(false),
     cl::desc("Keep temporary files made along the way (for debugging)"),
+    cl::cat(CompilerCategory));
+
+cl::opt<bool> StaticMathBuiltins(
+    "fstatic-math-builtins",
+    cl::desc("Recognize original Math methods except random statically"),
+    cl::init(false),
     cl::cat(CompilerCategory));
 
 cl::opt<StaticBuiltinSetting> StaticBuiltins(
@@ -632,6 +648,7 @@ std::shared_ptr<Context> createContext() {
   optimizationOpts.inlining =
       cli::OptimizationLevel != OptLevel::O0 && cli::Inline;
   optimizationOpts.inlineMaxSize = cli::InlineMaxSize;
+  optimizationOpts.staticHermesInlining = true;
 
   optimizationOpts.reusePropCache = cli::ReusePropCache;
 
@@ -643,6 +660,7 @@ std::shared_ptr<Context> createContext() {
   // parsing.
   optimizationOpts.staticBuiltins =
       cli::StaticBuiltins == StaticBuiltinSetting::ForceOn;
+  optimizationOpts.staticMathBuiltins = cli::StaticMathBuiltins;
 
   optimizationOpts.metroRequireOpt = cli::MetroRequireOpt;
 
@@ -933,6 +951,15 @@ bool compileFromCommandLineOptions() {
     llvh::errs() << "Error: -Xemit-c-shard-size must be positive.\n";
     return false;
   }
+  if ((cli::EmitCBundleLayout || !cli::CBundleLayoutInput.empty()) &&
+      !cli::EmitCBundle) {
+    llvh::errs() << "Error: retained C layout requires -Xemit-c-bundle.\n";
+    return false;
+  }
+  if (!cli::CBundleLayoutInput.empty() && !cli::EmitCBundleLayout) {
+    llvh::errs() << "Error: -Xc-layout-input requires -Xemit-c-layout.\n";
+    return false;
+  }
   if (!cli::ExportedUnit.empty()) {
     if (cli::OutputLevel == OutputLevelKind::Run ||
         cli::OutputLevel == OutputLevelKind::Executable) {
@@ -1083,6 +1110,8 @@ bool compileFromCommandLineOptions() {
   genOptions.smallC = cli::SmallC;
   genOptions.emitCBundle = cli::EmitCBundle;
   genOptions.cBundleShardSize = cli::EmitCShardSize;
+  genOptions.emitCBundleLayout = cli::EmitCBundleLayout;
+  genOptions.cBundleLayoutInput = cli::CBundleLayoutInput;
 
   genOptions.emitSourceLocations =
       cli::DumpSourceLocation != LocationDumpMode::None;

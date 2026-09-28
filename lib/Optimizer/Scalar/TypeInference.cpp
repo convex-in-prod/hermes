@@ -195,12 +195,12 @@ static Type inferBinaryBitwise(TypeContext &tc, BinaryOperatorInst *BOI) {
   Type LeftTy = BOI->getLeftHandSide()->getType();
   Type RightTy = BOI->getRightHandSide()->getType();
 
-  Type mayBeBigInt = tc.canBeBigInt(LeftTy) && tc.canBeBigInt(RightTy)
+  Type mayBeBigInt = isBigIntOrObject(tc, LeftTy) && isBigIntOrObject(tc, RightTy)
       ? Type::createBigInt()
       : Type::createNoType();
 
-  // ?? - ?? => Int32|?BigInt. BigInt is only possible if both operands can be
-  // BigInt due to the no automatic BigInt conversion.
+  // Object operands can produce BigInt through ToPrimitive. Number-only
+  // consumers must not bypass that possibility based on the object type.
   return tc.unionTy(Type::createInt32(), mayBeBigInt);
 }
 

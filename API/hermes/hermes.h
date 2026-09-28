@@ -13,6 +13,9 @@
 #include <memory>
 #include <ostream>
 #include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 #include <hermes/Public/HermesExport.h>
 #include <hermes/Public/RuntimeConfig.h>
@@ -205,6 +208,53 @@ class HermesRuntime : public jsi::Runtime,
   ~HermesRuntime() override = default;
 
   using jsi::Runtime::castInterface;
+
+  /// Snapshot own enumerable string properties in Object.entries order without
+  /// allocating an entries array and pair arrays in the JavaScript heap.
+  /// Getters and proxy traps run in the same order as Object.entries.
+  virtual std::vector<std::pair<jsi::String, jsi::Value>>
+  getOwnEnumerableEntries(const jsi::Object &object) = 0;
+
+  struct ObjectLayoutStatistics {
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t evictions;
+    uint64_t fallbacks;
+  };
+
+  /// Read cumulative construction counters without allocating or collecting.
+  virtual ObjectLayoutStatistics getObjectLayoutStatistics() const = 0;
+
+  /// Construct ordinary own data properties, bypassing inherited setters.
+  /// Repeated small non-indexed shapes reuse runtime-local keys and slots.
+  virtual jsi::Object createObjectWithProperties(
+      const std::vector<std::pair<std::string, jsi::Value>> &properties) = 0;
+
+  /// Decode into final rooted storage. Keys must remain valid for the call and
+  /// may be read repeatedly; values are read once each, in index order. Neither
+  /// callback may change the keys. No callback receives the unfinished object.
+  virtual jsi::Object createObjectFromEntries(
+      size_t count,
+      const std::function<std::string_view(size_t)> &keyAt,
+      const std::function<jsi::Value(size_t)> &valueAt) = 0;
+
+  /// Construct dense own array elements without property setters.
+  virtual jsi::Array createArrayWithValues(
+      const std::vector<jsi::Value> &values) = 0;
+
+  /// Read each element once, in order, into final rooted array storage.
+  virtual jsi::Array createArrayFromValues(
+      size_t count,
+      const std::function<jsi::Value(size_t)> &valueAt) = 0;
+
+  /// Capture descriptors without invoking accessors. The returned check must
+  /// not outlive this runtime. Extra keys are allowed only when requested.
+  /// Rejects proxies and host objects; intended for intrinsic state checks.
+  virtual std::function<bool()> createOwnPropertyValidator(
+      const jsi::Object &object,
+      const jsi::Array &keys,
+      bool allowAdditionalProperties) = 0;
+
 };
 
 /// Returns a pointer to an object that can be cast into IHermesRootAPI, which

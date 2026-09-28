@@ -32,11 +32,14 @@
 #include "hermes/VM/JSArrayBuffer.h"
 #include "hermes/VM/JSError.h"
 #include "hermes/VM/JSLib.h"
+#include "../../lib/VM/JSLib/Object.h"
 #include "hermes/VM/JSLib/JSLibStorage.h"
 #include "hermes/VM/JSLib/RuntimeJSONParse.h"
+#include "hermes/VM/JSProxy.h"
 #include "hermes/VM/JSTypedArray.h"
 #include "hermes/VM/NativeState.h"
 #include "hermes/VM/Operations.h"
+#include "hermes/VM/PropertyAccessor.h"
 #include "hermes/VM/Profiler/CodeCoverageProfiler.h"
 #include "hermes/VM/Profiler/SamplingProfiler.h"
 #include "hermes/VM/Runtime.h"
@@ -392,6 +395,7 @@ class HermesRuntimeImpl final : public HermesRuntime,
 
  public:
   ~HermesRuntimeImpl() override {
+    objectShapeCache_.clear();
 #ifdef HERMES_ENABLE_DEBUGGER
     // Deallocate the debugger so it frees any HermesPointerValues it may hold.
     // This must be done before we check hermesValues_ below.
@@ -474,6 +478,11 @@ class HermesRuntimeImpl final : public HermesRuntime,
 #endif
 
 #undef BRIDGE_INFO
+
+    jsInfo["hermes_objectLayoutHits"] = objectLayoutHits_;
+    jsInfo["hermes_objectLayoutMisses"] = objectLayoutMisses_;
+    jsInfo["hermes_objectLayoutEvictions"] = objectLayoutEvictions_;
+    jsInfo["hermes_objectLayoutFallbacks"] = objectLayoutFallbacks_;
 
     jsInfo["hermes_peakAllocatedBytes"] =
         runtime_.getHeap().getPeakAllocatedBytes();
@@ -881,6 +890,23 @@ class HermesRuntimeImpl final : public HermesRuntime,
   bool isHostObject(const jsi::Object &) const override;
   bool isHostFunction(const jsi::Function &) const override;
   jsi::Array getPropertyNames(const jsi::Object &) override;
+  std::vector<std::pair<jsi::String, jsi::Value>> getOwnEnumerableEntries(
+      const jsi::Object &) override;
+
+  jsi::Object createObjectWithProperties(
+      const std::vector<std::pair<std::string, jsi::Value>> &) override;
+  ObjectLayoutStatistics getObjectLayoutStatistics() const override {
+    return {objectLayoutHits_, objectLayoutMisses_, objectLayoutEvictions_, objectLayoutFallbacks_};
+  }
+  jsi::Object createObjectFromEntries(
+      size_t,
+      const std::function<std::string_view(size_t)> &,
+      const std::function<jsi::Value(size_t)> &) override;
+  jsi::Array createArrayWithValues(const std::vector<jsi::Value> &) override;
+  jsi::Array createArrayFromValues(
+      size_t, const std::function<jsi::Value(size_t)> &) override;
+  std::function<bool()> createOwnPropertyValidator(
+      const jsi::Object &, const jsi::Array &, bool) override;
 
   void setPrototypeOf(const jsi::Object &object, const jsi::Value &prototype)
       override;
@@ -1388,6 +1414,19 @@ class HermesRuntimeImpl final : public HermesRuntime,
   void *getVMRuntimeUnsafe() const override;
   size_t rootsListLengthForTests() const override;
 
+  // Templates hold no document values and are never exposed to JavaScript.
+  // JSI roots keep their classes and property identifiers alive through GC.
+  struct ObjectLayout {
+    std::vector<std::string> keys;
+    jsi::Object shape;
+    uint64_t lastUse;
+  };
+  std::unordered_multimap<size_t, ObjectLayout> objectShapeCache_;
+  uint64_t objectLayoutClock_{0};
+  uint64_t objectLayoutHits_{0};
+  uint64_t objectLayoutMisses_{0};
+  uint64_t objectLayoutEvictions_{0};
+  uint64_t objectLayoutFallbacks_{0};
   ManagedValues<vm::PinnedHermesValue> hermesValues_;
   ManagedValues<vm::WeakRoot<vm::JSObject>> weakHermesValues_;
   std::shared_ptr<::hermes::vm::Runtime> rt_;
@@ -3062,6 +3101,346 @@ jsi::Array HermesRuntimeImpl::getPropertyNames(const jsi::Object &obj) {
   }
 
   return ret;
+}
+
+jsi::Object HermesRuntimeImpl::createObjectWithProperties(
+    const std::vector<std::pair<std::string, jsi::Value>> &properties) {
+  return createObjectFromEntries(
+      properties.size(),
+      [&properties](size_t i) { return std::string_view(properties[i].first); },
+      [this, &properties](size_t i) {
+        return jsi::Value(*this, properties[i].second);
+      });
+}
+
+jsi::Object HermesRuntimeImpl::createObjectFromEntries(
+    size_t count,
+    const std::function<std::string_view(size_t)> &keyAt,
+    const std::function<jsi::Value(size_t)> &valueAt) {
+  ExecutionScopeRAII scopeRAII(mutatorScope);
+  vm::GCScope gcScope(runtime_);
+  if (count > vm::HiddenClass::maxNumProperties())
+    throw jsi::JSINativeException("Object field count exceeds the limit");
+
+  // Only immutable classes may be shared. Wide and index-like objects retain
+  // the ordinary definition path, with final storage reserved in advance.
+  bool cacheable = count <= vm::HiddenClass::kDictionaryThreshold;
+  size_t keyBytes = 0;
+  size_t hash = count;
+  if (cacheable) {
+    for (size_t i = 0; i < count; ++i) {
+      auto key = keyAt(i);
+      if (key.size() > 8192 - keyBytes ||
+          (!key.empty() && key[0] >= '0' && key[0] <= '9')) {
+        cacheable = false;
+        break;
+      }
+      keyBytes += key.size();
+      hash ^= std::hash<std::string_view>{}(key) + size_t(0x9e3779b9) +
+          (hash << 6) + (hash >> 2);
+    }
+  }
+
+  auto clazz = runtime_.makeMutableHandle<vm::HiddenClass>(nullptr);
+  if (cacheable) {
+    auto candidates = objectShapeCache_.equal_range(hash);
+    for (auto it = candidates.first; it != candidates.second; ++it) {
+      auto &layout = it->second;
+      if (layout.keys.size() != count)
+        continue;
+      size_t i = 0;
+      while (i < count && keyAt(i) == layout.keys[i])
+        ++i;
+      if (i == count) {
+        clazz = handle(layout.shape)->getClass(runtime_);
+        layout.lastUse = ++objectLayoutClock_;
+        ++objectLayoutHits_;
+        break;
+      }
+    }
+    if (!clazz) {
+      ++objectLayoutMisses_;
+      std::vector<std::string> keys;
+      std::vector<jsi::PropNameID> identifiers;
+      keys.reserve(count);
+      identifiers.reserve(count);
+      clazz = *runtime_.getHiddenClassForPrototype(
+          *vm::Handle<vm::JSObject>::vmcast(&runtime_.objectPrototype),
+          vm::JSObject::numOverlapSlots<vm::JSObject>());
+      auto marker = gcScope.createMarker();
+      for (size_t i = 0; i < count; ++i) {
+        gcScope.flushToMarker(marker);
+        auto key = keyAt(i);
+        identifiers.push_back(createPropNameIDFromUtf8(
+            reinterpret_cast<const uint8_t *>(key.data()), key.size()));
+        auto id = phv(identifiers.back()).getSymbol();
+        // Different UTF-8 spellings can resolve to the same property name.
+        // Duplicate fields must overwrite the original slot, not add a slot.
+        if (vm::HiddenClass::findPropertyNoAlloc(*clazz, runtime_, id)) {
+          cacheable = false;
+          break;
+        }
+        vm::PropertyFlags flags{};
+        flags.writable = flags.enumerable = flags.configurable = true;
+        auto added = vm::HiddenClass::addProperty(clazz, runtime_, id, flags);
+        checkStatus(added.getStatus());
+        clazz = *added->first;
+        assert(added->second == i && "New layout must have sequential slots");
+        keys.emplace_back(key);
+      }
+      if (cacheable) {
+        assert(!clazz->isDictionary() && "Cached layout must be immutable");
+        auto shape = runtime_.makeHandle(vm::JSObject::create(
+            runtime_, vm::Handle<vm::JSObject>::vmcast(&runtime_.objectPrototype),
+            clazz));
+        for (size_t i = 0; i < count; ++i)
+          vm::JSObject::setNamedSlotValueUnsafe(
+              *shape, runtime_, i, vm::SmallHermesValue::encodeUndefinedValue());
+        if (objectShapeCache_.size() == 64) {
+          auto oldest = std::min_element(
+              objectShapeCache_.begin(), objectShapeCache_.end(),
+              [](const auto &a, const auto &b) {
+                return a.second.lastUse < b.second.lastUse;
+              });
+          objectShapeCache_.erase(oldest);
+          ++objectLayoutEvictions_;
+        }
+        objectShapeCache_.emplace(hash, ObjectLayout{
+            std::move(keys), add<jsi::Object>(shape.getHermesValue()),
+            ++objectLayoutClock_});
+      }
+    }
+  }
+
+  if (cacheable) {
+    auto result = runtime_.makeHandle(vm::JSObject::create(
+        runtime_, vm::Handle<vm::JSObject>::vmcast(&runtime_.objectPrototype),
+        clazz));
+    // Recursive value decoding may collect or evict this layout. Root the
+    // object and initialize every slot before calling the first decoder.
+    for (size_t i = 0; i < count; ++i)
+      vm::JSObject::setNamedSlotValueUnsafe(
+          *result, runtime_, i, vm::SmallHermesValue::encodeUndefinedValue());
+    for (size_t i = 0; i < count; ++i) {
+      auto decoded = valueAt(i);
+      auto value = vm::SmallHermesValue::encodeHermesValue(
+          hvFromValue(decoded), runtime_);
+      vm::JSObject::setNamedSlotValueUnsafe(*result, runtime_, i, value);
+    }
+    return add<jsi::Object>(result.getHermesValue());
+  }
+
+  ++objectLayoutFallbacks_;
+  auto result = runtime_.makeHandle(vm::JSObject::create(runtime_, count));
+  auto marker = gcScope.createMarker();
+  for (size_t i = 0; i < count; ++i) {
+    gcScope.flushToMarker(marker);
+    auto key = keyAt(i);
+    auto name = createStringFromUtf8(
+        reinterpret_cast<const uint8_t *>(key.data()), key.size());
+    auto decoded = valueAt(i);
+    auto status = vm::JSObject::defineOwnComputedPrimitive(
+        result, runtime_, stringHandle(name),
+        vm::DefinePropertyFlags::getDefaultNewPropertyFlags(),
+        runtime_.makeHandle(hvFromValue(decoded)),
+        vm::PropOpFlags().plusThrowOnError());
+    checkStatus(status.getStatus());
+  }
+  return add<jsi::Object>(result.getHermesValue());
+}
+
+jsi::Array HermesRuntimeImpl::createArrayWithValues(
+    const std::vector<jsi::Value> &values) {
+  return createArrayFromValues(values.size(), [this, &values](size_t i) {
+    return jsi::Value(*this, values[i]);
+  });
+}
+
+jsi::Array HermesRuntimeImpl::createArrayFromValues(
+    size_t count,
+    const std::function<jsi::Value(size_t)> &valueAt) {
+  ExecutionScopeRAII scopeRAII(mutatorScope);
+  vm::GCScope gcScope(runtime_);
+  if (count > UINT32_MAX)
+    throw jsi::JSINativeException("Array element count exceeds the limit");
+  auto created = vm::JSArray::create(runtime_, count, count);
+  checkStatus(created.getStatus());
+  auto result = runtime_.makeHandle(std::move(*created));
+  for (size_t i = 0; i < count; ++i) {
+    auto decoded = valueAt(i);
+    auto value = vm::SmallHermesValue::encodeHermesValue(
+        hvFromValue(decoded), runtime_);
+    vm::JSArray::unsafeSetExistingElementAt(*result, runtime_, i, value);
+  }
+  return add<jsi::Array>(result.getHermesValue());
+}
+
+std::function<bool()> HermesRuntimeImpl::createOwnPropertyValidator(
+    const jsi::Object &object,
+    const jsi::Array &keys,
+    bool allowAdditionalProperties) {
+  ExecutionScopeRAII scopeRAII(mutatorScope);
+  vm::GCScope gcScope(runtime_);
+  auto target = handle(object);
+  if (target->isProxyObject() || target->isHostObject())
+    throw jsi::JSINativeException("Descriptor snapshots require ordinary objects");
+
+  struct Property {
+    jsi::Value key;
+    vm::PropertyFlags flags;
+    jsi::Value value;
+    jsi::Value setter;
+  };
+  struct Snapshot {
+    jsi::Object object;
+    jsi::Value prototype;
+    bool extensible;
+    std::vector<Property> properties;
+  };
+  auto snapshot = std::make_shared<Snapshot>(Snapshot{
+      jsi::Value(*this, object).asObject(*this), getPrototypeOf(object),
+      target->isExtensible(), {}});
+  const size_t count = keys.size(*this);
+  snapshot->properties.reserve(count);
+  auto marker = gcScope.createMarker();
+  for (size_t i = 0; i < count; ++i) {
+    gcScope.flushToMarker(marker);
+    auto key = keys.getValueAtIndex(*this, i);
+    if (!key.isString() && !key.isSymbol())
+      throw jsi::JSINativeException("Descriptor key must be a string or symbol");
+    vm::ComputedPropertyDescriptor desc;
+    auto value = runtime_.makeMutableHandle(vm::HermesValue::encodeUndefinedValue());
+    auto status = vm::JSObject::getOwnComputedDescriptor(
+        target, runtime_, runtime_.makeHandle(hvFromValue(key)), desc, value);
+    checkStatus(status.getStatus());
+    if (!*status)
+      throw jsi::JSINativeException("Descriptor snapshot property is missing");
+    jsi::Value savedValue;
+    jsi::Value savedSetter;
+    if (desc.flags.accessor) {
+      auto accessor = runtime_.makeHandle(
+          vm::vmcast<vm::PropertyAccessor>(value.getHermesValue()));
+      savedValue = accessor->getter
+          ? valueFromHermesValue(vm::HermesValue::encodeObjectValue(
+                accessor->getter.get(runtime_))) : jsi::Value::undefined();
+      savedSetter = accessor->setter
+          ? valueFromHermesValue(vm::HermesValue::encodeObjectValue(
+                accessor->setter.get(runtime_))) : jsi::Value::undefined();
+    } else {
+      savedValue = valueFromHermesValue(value.getHermesValue());
+    }
+    snapshot->properties.push_back(Property{
+        std::move(key), desc.flags, std::move(savedValue), std::move(savedSetter)});
+  }
+  return [this, snapshot, allowAdditionalProperties]() {
+    ExecutionScopeRAII scopeRAII(mutatorScope);
+    vm::GCScope gcScope(runtime_);
+    auto target = handle(snapshot->object);
+    if (target->isExtensible() != snapshot->extensible ||
+        !vm::isSameValue(hvFromValue(getPrototypeOf(snapshot->object)),
+                         hvFromValue(snapshot->prototype)))
+      return false;
+    if (!allowAdditionalProperties) {
+      size_t count = 0;
+      vm::JSObject::forEachOwnPropertyWhile(
+          target, runtime_,
+          [&count](vm::Runtime &, uint32_t,
+                   const vm::ComputedPropertyDescriptor &) {
+            ++count;
+            return true;
+          },
+          [&count](vm::Runtime &, vm::SymbolID id,
+                   const vm::NamedPropertyDescriptor &desc) {
+            if (!desc.flags.privateName &&
+                (vm::isPropertyNamePrimitive(id) || vm::isSymbolPrimitive(id)))
+              ++count;
+            return true;
+          });
+      if (count != snapshot->properties.size())
+        return false;
+    }
+    auto marker = gcScope.createMarker();
+    for (const auto &property : snapshot->properties) {
+      gcScope.flushToMarker(marker);
+      vm::ComputedPropertyDescriptor desc;
+      auto value = runtime_.makeMutableHandle(vm::HermesValue::encodeUndefinedValue());
+      auto status = vm::JSObject::getOwnComputedDescriptor(
+          target, runtime_, runtime_.makeHandle(hvFromValue(property.key)),
+          desc, value);
+      checkStatus(status.getStatus());
+      if (!*status || desc.flags.enumerable != property.flags.enumerable ||
+          desc.flags.configurable != property.flags.configurable ||
+          desc.flags.accessor != property.flags.accessor)
+        return false;
+      if (desc.flags.accessor) {
+        auto accessor = vm::vmcast<vm::PropertyAccessor>(value.getHermesValue());
+        auto getter = accessor->getter
+            ? vm::HermesValue::encodeObjectValue(accessor->getter.get(runtime_))
+            : vm::HermesValue::encodeUndefinedValue();
+        auto setter = accessor->setter
+            ? vm::HermesValue::encodeObjectValue(accessor->setter.get(runtime_))
+            : vm::HermesValue::encodeUndefinedValue();
+        if (!vm::isSameValue(getter, hvFromValue(property.value)) ||
+            !vm::isSameValue(setter, hvFromValue(property.setter)))
+          return false;
+      } else if (desc.flags.writable != property.flags.writable ||
+                 !vm::isSameValue(value.getHermesValue(),
+                                  hvFromValue(property.value))) {
+        return false;
+      }
+    }
+    return true;
+  };
+}
+
+std::vector<std::pair<jsi::String, jsi::Value>>
+HermesRuntimeImpl::getOwnEnumerableEntries(const jsi::Object &obj) {
+  ExecutionScopeRAII scopeRAII(mutatorScope);
+  vm::GCScope gcScope(runtime_);
+  auto object = handle(obj);
+  auto names_result = vm::getOwnPropertyKeysAsStrings(
+      object,
+      runtime_,
+      vm::OwnKeysFlags().plusIncludeNonSymbols().setIncludeNonEnumerable(
+          object->isProxyObject()));
+  checkStatus(names_result.getStatus());
+  vm::Handle<vm::JSArray> names =
+      runtime_.makeHandle(vm::vmcast<vm::JSArray>(*names_result));
+  const uint32_t length = vm::JSArray::getLength(*names, runtime_);
+  std::vector<std::pair<jsi::String, jsi::Value>> entries;
+  entries.reserve(length);
+  auto marker = gcScope.createMarker();
+  for (uint32_t index = 0; index < length; ++index) {
+    gcScope.flushToMarker(marker);
+    auto name = runtime_.makeHandle(names->at(runtime_, index).getString(runtime_));
+    vm::ComputedPropertyDescriptor descriptor;
+    auto descriptor_result = vm::JSObject::getOwnComputedPrimitiveDescriptor(
+        object, runtime_, name, vm::JSObject::IgnoreProxy::Yes, descriptor);
+    checkStatus(descriptor_result.getStatus());
+
+    jsi::Value value;
+    if (*descriptor_result && descriptor.flags.enumerable) {
+      auto value_result = vm::JSObject::getComputedPropertyValueInternal_RJS(
+          object, runtime_, object, descriptor);
+      checkStatus(value_result.getStatus());
+      value = valueFromHermesValue(value_result->get());
+    } else if (!object->isProxyObject()) {
+      continue;
+    } else {
+      descriptor_result =
+          vm::JSProxy::getOwnProperty(object, runtime_, name, descriptor, nullptr);
+      checkStatus(descriptor_result.getStatus());
+      if (!*descriptor_result || !descriptor.flags.enumerable) {
+        continue;
+      }
+      auto value_result = vm::JSProxy::getComputed(object, runtime_, name, object);
+      checkStatus(value_result.getStatus());
+      value = valueFromHermesValue(value_result->get());
+    }
+    auto key = valueFromHermesValue(name.getHermesValue()).asString(*this);
+    entries.emplace_back(std::move(key), std::move(value));
+  }
+  return entries;
 }
 
 jsi::WeakObject HermesRuntimeImpl::createWeakObject(const jsi::Object &obj) {

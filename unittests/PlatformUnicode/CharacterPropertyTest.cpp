@@ -13,6 +13,7 @@
 #include "gtest/gtest.h"
 
 #include <limits>
+#include <numeric>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -20,6 +21,31 @@
 using namespace hermes;
 
 namespace {
+
+namespace reference {
+#include "../../lib/Platform/Unicode/UnicodeData.inc"
+}
+
+TEST(UnicodeTest, CanonicalizationEveryCodePoint) {
+  for (bool unicode : {false, true}) {
+    std::vector<uint32_t> expected(UNICODE_MAX_VALUE + 1);
+    std::iota(expected.begin(), expected.end(), 0);
+    const auto *begin = unicode ? std::begin(reference::UNICODE_FOLDS)
+                                : std::begin(reference::LEGACY_CANONS);
+    const auto *end = unicode ? std::end(reference::UNICODE_FOLDS)
+                              : std::end(reference::LEGACY_CANONS);
+    for (auto *range = begin; range != end; ++range) {
+      for (uint32_t offset = 0; offset < range->count; offset += range->modulo)
+        expected[range->start + offset] =
+            int32_t(range->start + offset) + range->delta;
+    }
+    for (uint32_t cp = 0; cp <= UNICODE_MAX_VALUE; ++cp)
+      ASSERT_EQ(expected[cp], canonicalize(cp, unicode))
+          << "code point " << cp << ", unicode " << unicode;
+    EXPECT_EQ(UNICODE_MAX_VALUE + 1, canonicalize(UNICODE_MAX_VALUE + 1, unicode));
+    EXPECT_EQ(UINT32_MAX, canonicalize(UINT32_MAX, unicode));
+  }
+}
 
 // This might look like a silly test, but it should be useful if we
 // need to add tricky optimizations to isUnicodeOnlySpace

@@ -13,6 +13,7 @@
 #include "hermes/VM/JSTypedArray.h"
 #include "hermes/VM/Operations.h"
 #include "hermes/VM/PropertyAccessor.h"
+#include "hermes/VM/sh_mirror.h"
 
 namespace hermes {
 namespace vm {
@@ -21,6 +22,14 @@ namespace vm {
 // class ArrayImpl
 
 void ArrayImplBuildMeta(const GCCell *cell, Metadata::Builder &mb) {
+  static_assert(sizeof(ArrayImpl) == sizeof(SHArrayImpl));
+  static_assert(
+      offsetof(ArrayImpl, beginIndex_) == offsetof(SHArrayImpl, beginIndex));
+  static_assert(
+      offsetof(ArrayImpl, elemCount_) == offsetof(SHArrayImpl, elemCount));
+  static_assert(
+      offsetof(ArrayImpl, indexedStorage_) ==
+      offsetof(SHArrayImpl, indexedStorage));
   mb.addJSObjectOverlapSlots(JSObject::numOverlapSlots<ArrayImpl>());
   JSObjectBuildMeta(cell, mb);
   const auto *self = static_cast<const ArrayImpl *>(cell);

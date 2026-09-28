@@ -71,6 +71,11 @@ struct BytecodeGenerationOptions {
   /// unit.
   uint64_t cBundleShardSize = 2 * 1024 * 1024;
 
+  /// Emit the retained function, cache and string layout beside the C bundle. The caller must
+  /// authenticate a previous layout before supplying it to a later build.
+  bool emitCBundleLayout = false;
+  llvh::StringRef cBundleLayoutInput{};
+
   /// Whether to strip the debug info in the bytecode binary.
   bool stripDebugInfoSection = false;
 

@@ -18,6 +18,22 @@
 
 namespace hermes {
 
+/// Proven constraints on a Number value, excluding negative zero. The numeric
+/// IR factories currently erase integer refinements, so conversion lowering
+/// must use the producing operations rather than their Number type alone.
+enum IntegerRange : uint8_t {
+  IntegerRangeUnknown = 0,
+  IntegerRangeInt32 = 1,
+  IntegerRangeUint32 = 2,
+  IntegerRangeInt32OrUint32 = 4,
+};
+
+/// Return the intersection of integer constraints on every input to the value.
+/// Traversal through moves and phis is bounded; an unsupported input makes the
+/// result unknown. Each returned signed/unsigned constraint also includes the
+/// Int32OrUint32 bit.
+uint8_t getKnownIntegerRange(Value *value);
+
 /// If this is a variable that only has stores of a single value then
 /// return the value that initializes the variable.
 ///

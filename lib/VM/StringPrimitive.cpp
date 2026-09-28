@@ -320,6 +320,10 @@ CallResult<HermesValue> StringPrimitive::slice(
   assert(
       start + length <= str->getStringLength() && "Invalid length for slice");
 
+  if (start == 0 && length == str->getStringLength()) {
+    return str.getHermesValue();
+  }
+
   SafeUInt32 safeLen(length);
 
   // Special case for 1-character strings, some of which are cached in the

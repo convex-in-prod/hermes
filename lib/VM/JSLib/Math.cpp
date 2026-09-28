@@ -12,6 +12,7 @@
 #include "JSLibInternal.h"
 
 #include "hermes/Support/Conversions.h"
+#include "hermes/Support/MathFunctions.h"
 #include "hermes/VM/JSLib/JSLibStorage.h"
 #include "hermes/VM/Operations.h"
 #include "hermes/VM/SingleObject.h"
@@ -38,36 +39,6 @@ namespace vm {
 
 //===----------------------------------------------------------------------===//
 /// Math.
-// Implementation of Math.round(), following ES 5.1 15.8.2.15
-// This cannot be a simple call to std::round() because std::round() rounds
-// halfways away from zero, while Math.round must round towards positive
-// infinity.
-// The essential algorithm is floor(x + 0.5). However this has three
-// complications:
-//  1. The range [-.5, -0] must round to -0, not +0
-//  2. The largest value less than 0.5, when added to 0.5, becomes 1.0
-//  (precision loss), causing us to round to 1 and not 0.
-//  3. Above a certain threshold (shown below), x + 0.5 is the same as x + 1.0
-//  (precision loss), causing us to round too high.
-// We handle this by checking explicitly for the problematic ranges.
-static double roundHalfwaysTowardsInfinity(double x) {
-  // The first integer where all larger values are also integral
-  // The -1 is to account for the implicit (hidden) bit in the mantissa
-  static constexpr double integer_threshold = 1LLU << (DBL_MANT_DIG - 1);
-  double absf = std::fabs(x);
-  if (absf >= integer_threshold) {
-    // x is necessarily already integral.
-    return x;
-  } else if (absf < 0.5) {
-    // x may have too much precision to add 0.5. Just round to +/- 0.
-    return std::copysign(0, x);
-  } else {
-    // Here we can apply the normal rounding algorithm, but we need to be
-    // careful about -0.5, which must round to -0.
-    return std::copysign(std::floor(x + 0.5), x);
-  }
-}
-
 /// The Math object has functions like sin, cos, exp, etc. Most take one
 /// argument, a few take two arguments, min() and max() may take any number
 /// of arguments, and random() takes none. Use context as a index to switch to
@@ -153,15 +124,7 @@ CallResult<HermesValue> mathMax(void *, Runtime &runtime) {
     if (LLVM_UNLIKELY(res == ExecutionStatus::EXCEPTION)) {
       return ExecutionStatus::EXCEPTION;
     }
-    double arg = res->getNumber();
-    if (std::isnan(result)) {
-      continue;
-    } else if (std::isnan(arg)) {
-      result = std::numeric_limits<double>::quiet_NaN();
-    } else if (arg > result || std::signbit(arg) < std::signbit(result)) {
-      // signbit(arg) < signbit(result) => arg is at least +0, result at most -0
-      result = arg;
-    }
+    result = hermesMathMax(result, res->getNumber());
   }
   return HermesValue::encodeTrustedNumberValue(result);
 }
@@ -177,15 +140,7 @@ CallResult<HermesValue> mathMin(void *, Runtime &runtime) {
     if (LLVM_UNLIKELY(res == ExecutionStatus::EXCEPTION)) {
       return ExecutionStatus::EXCEPTION;
     }
-    double arg = res->getNumber();
-    if (std::isnan(result)) {
-      continue;
-    } else if (std::isnan(arg)) {
-      result = std::numeric_limits<double>::quiet_NaN();
-    } else if (arg < result || std::signbit(arg) > std::signbit(result)) {
-      // signbit(arg) > signbit(result) => arg is at most -0, result at least +0
-      result = arg;
-    }
+    result = hermesMathMin(result, res->getNumber());
   }
   return HermesValue::encodeTrustedNumberValue(result);
 }

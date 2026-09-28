@@ -7,6 +7,7 @@
 
 #include "VMRuntimeTestHelpers.h"
 
+#include "hermes/VM/PropertyCache.h"
 #include "hermes/VM/StaticHUtils.h"
 #include "hermes/VM/static_h.h"
 
@@ -101,6 +102,55 @@ TEST(StaticHUnitTest, RejectsMismatchedStaticABI) {
   EXPECT_DEATH_IF_SUPPORTED(
       _sh_check_abi(&mismatched, sizeof(mismatched)),
       "Static Hermes ABI mismatch: generated.*runtime archive");
+}
+
+using StaticHCacheTest = RuntimeTestFixture;
+
+TEST_F(StaticHCacheTest, RetainsTwoShapesForNamedAndComputedReads) {
+  auto first = runtime.makeHandle(JSObject::create(runtime));
+  auto second = runtime.makeHandle(JSObject::create(runtime));
+  const auto key = Predefined::getSymbolID(Predefined::value);
+  const auto otherKey = Predefined::getSymbolID(Predefined::length);
+  ASSERT_TRUE(*JSObject::putNamed_RJS(
+      first, runtime, key, runtime.makeHandle(1.0_hd)));
+  ASSERT_TRUE(*JSObject::putNamed_RJS(
+      second, runtime, otherKey, runtime.makeHandle(2.0_hd)));
+  ASSERT_TRUE(*JSObject::putNamed_RJS(
+      second, runtime, key, runtime.makeHandle(3.0_hd)));
+  ASSERT_NE(first->getClass(runtime), second->getClass(runtime));
+
+  SHReadPropertyCacheEntry named[SH_NAMED_READ_CACHE_WAYS]{};
+  SHComputedReadCacheEntry computed[SH_COMPUTED_READ_CACHE_WAYS]{};
+  SHLegacyValue keyValue = HermesValue::encodeStringValue(
+      runtime.getStringPrimFromSymbolID(key));
+  SHLegacyValue sources[]{first.getHermesValue(), second.getHermesValue()};
+  auto *shr = getSHRuntime(runtime);
+  // No allocation or user code is possible for these own data reads. JS tests
+  // separately exercise traced unit caches across collections and invalidation.
+  for (unsigned round = 0; round < 10; ++round) {
+    for (unsigned i = 0; i < 2; ++i) {
+      EXPECT_EQ(
+          1.0 + 2 * i,
+          _sh_ljs_get_by_id_polymorphic_rjs(
+              shr, &sources[i], key.unsafeGetRaw(), named).f64);
+      EXPECT_EQ(
+          1.0 + 2 * i,
+          _sh_ljs_get_by_val_cached_rjs(
+              shr, &sources[i], &keyValue, computed).f64);
+    }
+  }
+  // Warm alternating receivers must not refill the named cache or overwrite
+  // the other receiver's computed entry.
+  EXPECT_EQ(2, named[0].numChanges + named[1].numChanges);
+  auto *computedEntries = reinterpret_cast<ComputedReadCacheEntry *>(computed);
+  unsigned retained = 0;
+  for (unsigned i = 0; i < SH_COMPUTED_READ_CACHE_WAYS; ++i) {
+    if (computedEntries[i].key == key &&
+        (computedEntries[i].clazz == first->getClassGCPtr() ||
+         computedEntries[i].clazz == second->getClassGCPtr()))
+      ++retained;
+  }
+  EXPECT_EQ(2u, retained);
 }
 
 } // namespace
