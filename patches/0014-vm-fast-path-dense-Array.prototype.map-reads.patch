@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Sat, 26 Sep 2026 18:43:05 +0800
-Subject: [PATCH 14/14] vm: fast-path dense Array.prototype.map reads
+Subject: [PATCH 14/15] vm: fast-path dense Array.prototype.map reads
 
 Use the existing array fast-path guard to read ordinary dense elements without generic property descriptor lookup. Recheck against the original length after each callback so array and prototype changes continue through the generic path.
 

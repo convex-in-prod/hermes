@@ -1,0 +1,273 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Mon, 28 Sep 2026 11:25:34 +0800
+Subject: [PATCH 15/15] wasm: add native value-marshalling primitives
+
+Expose a native UTF-8 string writer to Static Hermes extern calls and allow Hermes string values as native arguments. Add an own-enumerable entry snapshot API that preserves Object.entries getter and proxy order while avoiding JavaScript pair-array allocation. The typed value adapter uses both facilities to move values across a host boundary without a JavaScript JSON walk.
+---
+ API/hermes/hermes.cpp                 | 54 +++++++++++++++++++++++++++
+ API/hermes/hermes.h                   |  8 ++++
+ include/hermes/VM/static_h.h          |  8 ++++
+ lib/BCGen/SH/SH.cpp                   |  4 ++
+ lib/Sema/FlowChecker-expr.cpp         |  2 +-
+ lib/VM/StaticH.cpp                    | 32 ++++++++++++++++
+ test/shermes/ffi/string_write_utf8.js | 38 +++++++++++++++++++
+ 7 files changed, 145 insertions(+), 1 deletion(-)
+ create mode 100644 test/shermes/ffi/string_write_utf8.js
+
+diff --git a/API/hermes/hermes.cpp b/API/hermes/hermes.cpp
+index d401e00890343c3659d4107249376b3c6aec26a8..bb8a09f8ec468ba1615c6fd696378942d4d4fc87 100644
+--- a/API/hermes/hermes.cpp
++++ b/API/hermes/hermes.cpp
+@@ -32,8 +32,10 @@
+ #include "hermes/VM/JSArrayBuffer.h"
+ #include "hermes/VM/JSError.h"
+ #include "hermes/VM/JSLib.h"
++#include "../../lib/VM/JSLib/Object.h"
+ #include "hermes/VM/JSLib/JSLibStorage.h"
+ #include "hermes/VM/JSLib/RuntimeJSONParse.h"
++#include "hermes/VM/JSProxy.h"
+ #include "hermes/VM/JSTypedArray.h"
+ #include "hermes/VM/NativeState.h"
+ #include "hermes/VM/Operations.h"
+@@ -881,6 +883,8 @@ class HermesRuntimeImpl final : public HermesRuntime,
+   bool isHostObject(const jsi::Object &) const override;
+   bool isHostFunction(const jsi::Function &) const override;
+   jsi::Array getPropertyNames(const jsi::Object &) override;
++  std::vector<std::pair<jsi::String, jsi::Value>> getOwnEnumerableEntries(
++      const jsi::Object &) override;
+ 
+   void setPrototypeOf(const jsi::Object &object, const jsi::Value &prototype)
+       override;
+@@ -3064,6 +3068,56 @@ jsi::Array HermesRuntimeImpl::getPropertyNames(const jsi::Object &obj) {
+   return ret;
+ }
+ 
++std::vector<std::pair<jsi::String, jsi::Value>>
++HermesRuntimeImpl::getOwnEnumerableEntries(const jsi::Object &obj) {
++  ExecutionScopeRAII scopeRAII(mutatorScope);
++  vm::GCScope gcScope(runtime_);
++  auto object = handle(obj);
++  auto names_result = vm::getOwnPropertyKeysAsStrings(
++      object,
++      runtime_,
++      vm::OwnKeysFlags().plusIncludeNonSymbols().setIncludeNonEnumerable(
++          object->isProxyObject()));
++  checkStatus(names_result.getStatus());
++  vm::Handle<vm::JSArray> names =
++      runtime_.makeHandle(vm::vmcast<vm::JSArray>(*names_result));
++  const uint32_t length = vm::JSArray::getLength(*names, runtime_);
++  std::vector<std::pair<jsi::String, jsi::Value>> entries;
++  entries.reserve(length);
++  auto marker = gcScope.createMarker();
++  for (uint32_t index = 0; index < length; ++index) {
++    gcScope.flushToMarker(marker);
++    auto name = runtime_.makeHandle(names->at(runtime_, index).getString(runtime_));
++    vm::ComputedPropertyDescriptor descriptor;
++    auto descriptor_result = vm::JSObject::getOwnComputedPrimitiveDescriptor(
++        object, runtime_, name, vm::JSObject::IgnoreProxy::Yes, descriptor);
++    checkStatus(descriptor_result.getStatus());
++
++    jsi::Value value;
++    if (*descriptor_result && descriptor.flags.enumerable) {
++      auto value_result = vm::JSObject::getComputedPropertyValueInternal_RJS(
++          object, runtime_, object, descriptor);
++      checkStatus(value_result.getStatus());
++      value = valueFromHermesValue(value_result->get());
++    } else if (!object->isProxyObject()) {
++      continue;
++    } else {
++      descriptor_result =
++          vm::JSProxy::getOwnProperty(object, runtime_, name, descriptor, nullptr);
++      checkStatus(descriptor_result.getStatus());
++      if (!*descriptor_result || !descriptor.flags.enumerable) {
++        continue;
++      }
++      auto value_result = vm::JSProxy::getComputed(object, runtime_, name, object);
++      checkStatus(value_result.getStatus());
++      value = valueFromHermesValue(value_result->get());
++    }
++    auto key = valueFromHermesValue(name.getHermesValue()).asString(*this);
++    entries.emplace_back(std::move(key), std::move(value));
++  }
++  return entries;
++}
++
+ jsi::WeakObject HermesRuntimeImpl::createWeakObject(const jsi::Object &obj) {
+   ExecutionScopeRAII scopeRAII(mutatorScope);
+   return addWeak(
+diff --git a/API/hermes/hermes.h b/API/hermes/hermes.h
+index 1a66be931c50da1e83e283617575b2c3bdcdb0d1..239cddeebbe271cae2376d55a5c0a79ba87fb730 100644
+--- a/API/hermes/hermes.h
++++ b/API/hermes/hermes.h
+@@ -13,6 +13,8 @@
+ #include <memory>
+ #include <ostream>
+ #include <string>
++#include <utility>
++#include <vector>
+ 
+ #include <hermes/Public/HermesExport.h>
+ #include <hermes/Public/RuntimeConfig.h>
+@@ -205,6 +207,12 @@ class HermesRuntime : public jsi::Runtime,
+   ~HermesRuntime() override = default;
+ 
+   using jsi::Runtime::castInterface;
++
++  /// Snapshot own enumerable string properties in Object.entries order without
++  /// allocating an entries array and pair arrays in the JavaScript heap.
++  /// Getters and proxy traps run in the same order as Object.entries.
++  virtual std::vector<std::pair<jsi::String, jsi::Value>>
++  getOwnEnumerableEntries(const jsi::Object &object) = 0;
+ };
+ 
+ /// Returns a pointer to an object that can be cast into IHermesRootAPI, which
+diff --git a/include/hermes/VM/static_h.h b/include/hermes/VM/static_h.h
+index 13246ec2f260f05df9b71a8810ec1049faf179fd..133f6b4eabace2d358e6e7ddf43f2829d58d76ad 100644
+--- a/include/hermes/VM/static_h.h
++++ b/include/hermes/VM/static_h.h
+@@ -1877,6 +1877,14 @@ SHERMES_EXPORT int _sh_errno(void);
+ SHERMES_EXPORT SHLegacyValue
+ _sh_asciiz_to_string(SHRuntime *shr, const char *str, ptrdiff_t len);
+ 
++/// Write a JS string as UTF-8, replacing unpaired surrogates. Return the byte
++/// count, or -1 if the destination is too small.
++SHERMES_EXPORT ptrdiff_t _sh_string_write_utf8(
++    SHRuntime *shr,
++    SHLegacyValue value,
++    char *destination,
++    size_t capacity);
++
+ static inline void _sh_ptr_write_char(char *ptr, int offset, char c) {
+   ptr[offset] = c;
+ }
+diff --git a/lib/BCGen/SH/SH.cpp b/lib/BCGen/SH/SH.cpp
+index e030d709072f96cff72bec9ee8efa3fb820266d6..49fb44511b52f1467f7a59d21ecb23e2252892b5 100644
+--- a/lib/BCGen/SH/SH.cpp
++++ b/lib/BCGen/SH/SH.cpp
+@@ -2703,6 +2703,10 @@ class InstrGen {
+   }
+   /// Convert a JS value to its corresponding native argument type.
+   void convertToNativeArg(NativeCType ctype, Value *arg) {
++    if (ctype == NativeCType::c_hermes_value) {
++      generateValue(*arg);
++      return;
++    }
+     MachineType mt = nativeContext_.md.mapCType(ctype);
+     const MachineDesc::MTD &mtd = nativeContext_.md.getMTD(mt);
+     int parens = 1;
+diff --git a/lib/Sema/FlowChecker-expr.cpp b/lib/Sema/FlowChecker-expr.cpp
+index da432ba756ec3e7a3faa4daf4a564e9bfe951fa6..603f366ef682895b4fb2b8fdc005249c5703c22f 100644
+--- a/lib/Sema/FlowChecker-expr.cpp
++++ b/lib/Sema/FlowChecker-expr.cpp
+@@ -3112,7 +3112,7 @@ class FlowChecker::ExprVisitor {
+       NativeCType natParamType;
+       if (!parseNativeAnnotation(
+               llvh::cast<ESTree::TypeAnnotationNode>(param->_typeAnnotation),
+-              false,
++              allowHVOption,
+               &natParamType))
+         return;
+       natParamTypes.push_back(natParamType);
+diff --git a/lib/VM/StaticH.cpp b/lib/VM/StaticH.cpp
+index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..bef8f5f4f76f3f871317743f0fbb0292b8705189 100644
+--- a/lib/VM/StaticH.cpp
++++ b/lib/VM/StaticH.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include "SHUnitExt.h"
+ #include "hermes/BCGen/SerializedLiteralParser.h"
++#include "hermes/Support/UTF8.h"
+ #include "hermes/VM/ArrayStorage.h"
+ #include "hermes/VM/Callable.h"
+ #include "hermes/VM/FastArray.h"
+@@ -25,10 +26,12 @@
+ #include "hermes/VM/StackFrame-inline.h"
+ #include "hermes/VM/StaticHUtils.h"
+ #include "hermes/VM/StringBuilder.h"
++#include "hermes/VM/StringPrimitive.h"
+ 
+ #include "JSLib/JSLibInternal.h"
+ 
+ #include <cstdarg>
++#include <limits>
+ 
+ using namespace hermes;
+ using namespace hermes::vm;
+@@ -2727,3 +2730,32 @@ _sh_asciiz_to_string(SHRuntime *shr, const char *str, ptrdiff_t len) {
+     _sh_throw_current(shr);
+   return *res;
+ }
++
++LLVM_ATTRIBUTE_NOINLINE
++extern "C" ptrdiff_t _sh_string_write_utf8(
++    SHRuntime *shr,
++    SHLegacyValue value,
++    char *destination,
++    size_t capacity) {
++  if (LLVM_UNLIKELY(!_sh_ljs_is_string(value))) {
++    _sh_throw_type_error_ascii(shr, "Expected a string");
++  }
++  // No allocation occurs while reading the string, so the raw pointer remains
++  // valid through the conversion without a guest-visible property lookup.
++  auto *string = vmcast<StringPrimitive>(*toPHV(&value));
++  const uint32_t length = string->getStringLength();
++  if (string->isASCII()) {
++    if (length > capacity)
++      return -1;
++    memcpy(destination, string->getStringRef<char>().data(), length);
++    return length;
++  }
++  auto [read, written] = convertUTF16ToUTF8BufferWithReplacements(
++      llvh::MutableArrayRef<uint8_t>(
++          reinterpret_cast<uint8_t *>(destination), capacity),
++      string->getStringRef<char16_t>());
++  if (read != length ||
++      written > static_cast<size_t>(std::numeric_limits<ptrdiff_t>::max()))
++    return -1;
++  return written;
++}
+diff --git a/test/shermes/ffi/string_write_utf8.js b/test/shermes/ffi/string_write_utf8.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..a9b0fbf317cd44e6d158d1885f766e235d0adbd6
+--- /dev/null
++++ b/test/shermes/ffi/string_write_utf8.js
+@@ -0,0 +1,38 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++// RUN: %shermes -typed -exec %s | %FileCheck --match-full-lines %s
++
++const malloc = $SHBuiltin.extern_c({include: "stdlib.h"},
++    function malloc(size: c_size_t): c_ptr { throw 0; });
++const free = $SHBuiltin.extern_c({include: "stdlib.h"},
++    function free(pointer: c_ptr): void {});
++const readByte = $SHBuiltin.extern_c({declared: true},
++    function _sh_ptr_read_uchar(pointer: c_ptr, offset: c_int): c_uchar { throw 0; });
++const writeUtf8 = $SHBuiltin.extern_c({declared: true, hv: true},
++    function _sh_string_write_utf8(
++        runtime: c_ptr,
++        value: string,
++        destination: c_ptr,
++        capacity: c_size_t): c_ptrdiff_t { throw 0; });
++
++const pointer = malloc(16);
++const bytes = [65, 195, 169, 240, 159, 152, 128, 239, 191, 189];
++const written = writeUtf8($SHBuiltin.c_native_runtime(), "Aé😀\ud800", pointer, 16);
++if (written !== bytes.length) throw new Error("UTF-8 length differs");
++for (let index = 0; index < bytes.length; index += 1) {
++    if (readByte(pointer, index) !== bytes[index]) throw new Error("UTF-8 byte differs");
++}
++print("encoded");
++// CHECK: encoded
++
++if (writeUtf8($SHBuiltin.c_native_runtime(), "é", pointer, 1) !== -1) {
++    throw new Error("short destination accepted");
++}
++print("bounded");
++// CHECK: bounded
++free(pointer);
