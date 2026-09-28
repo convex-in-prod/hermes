@@ -876,6 +876,15 @@ CreateRegExpInst *IRBuilder::createRegExpInst(
   return res;
 }
 
+LIRTryFastRegExpInst *IRBuilder::createLIRTryFastRegExpInst(
+    LiteralString *pattern, LiteralString *flags, unsigned operation,
+    Value *input, Value *index) {
+  auto *inst = new LIRTryFastRegExpInst(
+      pattern, flags, getLiteralNumber(operation), input, index);
+  insert(inst);
+  return inst;
+}
+
 TypeOfInst *IRBuilder::createTypeOfInst(Value *input) {
   auto *inst = new TypeOfInst(input);
   insert(inst);

@@ -121,6 +121,9 @@ bool operandMustBeLiteral(Instruction *Inst, unsigned opIndex) {
   if (llvh::isa<CreateRegExpInst>(Inst))
     return true;
 
+  if (llvh::isa<LIRTryFastRegExpInst>(Inst))
+    return opIndex <= LIRTryFastRegExpInst::OperationIdx;
+
   if (auto *baseSwitchImm = llvh::dyn_cast<BaseSwitchImmInst>(Inst)) {
     if (opIndex == BaseSwitchImmInst::SizeIdx ||
         opIndex >= baseSwitchImm->getFirstCaseIdx())

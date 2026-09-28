@@ -6347,6 +6347,51 @@ class LIRDeadValueInst : public Instruction {
   }
 };
 
+/// SH-only guarded string/regexp operation. Undefined selects the original
+/// operation; successful results also preserve the legacy RegExp match state.
+class LIRTryFastRegExpInst : public Instruction {
+ public:
+  enum { PatternIdx, FlagsIdx, OperationIdx, InputIdx, IndexIdx };
+
+  explicit LIRTryFastRegExpInst(
+      LiteralString *pattern, LiteralString *flags, LiteralNumber *operation,
+      Value *input, Value *index)
+      : Instruction(ValueKind::LIRTryFastRegExpInstKind) {
+    setType(*getInherentTypeImpl());
+    pushOperand(pattern);
+    pushOperand(flags);
+    pushOperand(operation);
+    pushOperand(input);
+    pushOperand(index);
+  }
+  explicit LIRTryFastRegExpInst(
+      const LIRTryFastRegExpInst *src, llvh::ArrayRef<Value *> operands)
+      : Instruction(src, operands) {}
+  LiteralString *getPattern() const {
+    return cast<LiteralString>(getOperand(PatternIdx));
+  }
+  LiteralString *getFlags() const {
+    return cast<LiteralString>(getOperand(FlagsIdx));
+  }
+  unsigned getOperation() const {
+    return cast<LiteralNumber>(getOperand(OperationIdx))->asUInt32();
+  }
+  Value *getInput() const { return getOperand(InputIdx); }
+  Value *getIndex() const { return getOperand(IndexIdx); }
+  static llvh::Optional<Type> getInherentTypeImpl() {
+    return Type::createAnyType();
+  }
+  static bool hasOutput() { return true; }
+  static bool isTyped() { return false; }
+  SideEffect getSideEffectImpl() const {
+    // Reads mutable builtin descriptors, writes legacy match state and can GC.
+    return SideEffect::createUnknown();
+  }
+  static bool classof(const Value *V) {
+    return V->getKind() == ValueKind::LIRTryFastRegExpInstKind;
+  }
+};
+
 class NativeCallInst : public Instruction {
   NativeCallInst(const NativeCallInst &) = delete;
   void operator=(const NativeCallInst &) = delete;

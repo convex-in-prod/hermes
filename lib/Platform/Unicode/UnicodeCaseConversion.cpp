@@ -316,6 +316,18 @@ void convertCodePoint(
 
 } // namespace
 
+bool isUnchangedLowercaseCodeUnit(char16_t character) {
+  if (character < 128)
+    return character < 'A' || character > 'Z';
+  if (character >= 0xD800 && character <= 0xDFFF)
+    return false;
+  // Final_Sigma is the only contextual root-lowercase rule and its source
+  // already changes in TO_LOWER_DELTAS. Full mappings must not be approximated
+  // by simple case folding (notably U+0130, which expands).
+  return !findFull(FULL_LOWER, character) &&
+      applyDelta(TO_LOWER_DELTAS, character) == character;
+}
+
 void convertCaseUTF16(
     llvh::SmallVectorImpl<char16_t> &buf,
     CaseConversion targetCase,

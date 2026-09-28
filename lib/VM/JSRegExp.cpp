@@ -98,7 +98,10 @@ void JSRegExp::initialize(
     Runtime &runtime,
     Handle<StringPrimitive> pattern,
     Handle<StringPrimitive> flags,
-    llvh::ArrayRef<uint8_t> bytecode) {
+    llvh::ArrayRef<uint8_t> bytecode,
+    BytecodeOwnership ownership,
+    const uint8_t *simpleRegex,
+    HermesRegexAOTMatcher aotMatcher) {
   assert(
       pattern && flags &&
       "Null pattern and/or flags passed to JSRegExp::initialize");
@@ -119,7 +122,14 @@ void JSRegExp::initialize(
       res != ExecutionStatus::EXCEPTION && *res &&
       "defineOwnProperty() failed");
 
-  selfHandle->initializeBytecode(bytecode);
+  assert(
+      (!(simpleRegex || aotMatcher) ||
+       ownership == BytecodeOwnership::BorrowPersistent) &&
+      "Specialized descriptors require persistent storage");
+  assert(!(simpleRegex && aotMatcher) && "Only one matcher tier is selected");
+  selfHandle->initializeBytecode(bytecode, ownership);
+  selfHandle->simpleRegex_ = simpleRegex;
+  selfHandle->aotMatcher_ = aotMatcher;
 }
 
 ExecutionStatus JSRegExp::initialize(
@@ -150,7 +160,8 @@ ExecutionStatus JSRegExp::initialize(
         runtime,
         lv.pattern,
         flags,
-        {otherHandle->bytecode_, otherHandle->bytecodeSize_});
+        {otherHandle->bytecode_, otherHandle->bytecodeSize_},
+        BytecodeOwnership::Copy);
     // The group name mapping depends only on the pattern, and it is never
     // modified after initialization, so share it rather than rebuilding it.
     selfHandle->groupNameMappings_.set(
@@ -194,7 +205,8 @@ ExecutionStatus JSRegExp::initialize(
               regex.getGroupNamesMapping()) == ExecutionStatus::EXCEPTION)) {
     return ExecutionStatus::EXCEPTION;
   }
-  initialize(selfHandle, runtime, pattern, flags, bytecode);
+  initialize(
+      selfHandle, runtime, pattern, flags, bytecode, BytecodeOwnership::Copy);
   return ExecutionStatus::RETURNED;
 }
 
@@ -252,7 +264,10 @@ void JSRegExp::setGroupNameMappings(Runtime &runtime, JSObject *groupObj) {
   groupNameMappings_.set(runtime, groupObj, runtime.getHeap());
 }
 
-void JSRegExp::initializeBytecode(llvh::ArrayRef<uint8_t> bytecode) {
+void JSRegExp::initializeBytecode(
+    llvh::ArrayRef<uint8_t> bytecode,
+    BytecodeOwnership ownership) {
+  assert(!bytecode_ && "RegExp bytecode may only be initialized once");
   size_t sz = bytecode.size();
   assert(
       sz <= std::numeric_limits<uint32_t>::max() &&
@@ -261,8 +276,14 @@ void JSRegExp::initializeBytecode(llvh::ArrayRef<uint8_t> bytecode) {
       reinterpret_cast<const regex::RegexBytecodeHeader *>(bytecode.data());
   syntaxFlags_ = regex::SyntaxFlags::fromByte(header->syntaxFlags);
   bytecodeSize_ = sz;
-  bytecode_ = (uint8_t *)checkedMalloc(sz);
-  memcpy(bytecode_, bytecode.data(), sz);
+  bytecodeOwnership_ = ownership;
+  if (ownership == BytecodeOwnership::BorrowPersistent) {
+    bytecode_ = bytecode.data();
+  } else {
+    auto *owned = static_cast<uint8_t *>(checkedMalloc(sz));
+    memcpy(owned, bytecode.data(), sz);
+    bytecode_ = owned;
+  }
 }
 
 PseudoHandle<StringPrimitive> JSRegExp::getPattern(
@@ -271,42 +292,65 @@ PseudoHandle<StringPrimitive> JSRegExp::getPattern(
   return createPseudoHandle(self->pattern_.get(base));
 }
 
-template <typename CharT, typename Traits>
+template <typename CharT>
 CallResult<RegExpMatch> performSearch(
     Runtime &runtime,
     llvh::ArrayRef<uint8_t> bytecode,
+    const uint8_t *simpleRegex,
+    HermesRegexAOTMatcher aotMatcher,
     const CharT *start,
     uint32_t stringLength,
     uint32_t searchStartOffset,
     regex::constants::MatchFlagType matchFlags) {
-  std::vector<regex::CapturedRange> nativeMatchRanges;
-  auto matchResult = regex::searchWithBytecode(
-      bytecode,
-      start,
-      searchStartOffset,
-      stringLength,
-      &nativeMatchRanges,
-      matchFlags,
-      runtime.getOverflowGuardForRegex());
+  RegExpMatch match;
+  // This sink only grows native storage. It must not allocate GC cells or call
+  // JS while the executor holds raw pointers into the subject string.
+  auto writeMatch = [&match](
+                        regex::CapturedRange full,
+                        llvh::ArrayRef<regex::CapturedRange> captures) {
+    match.reserve(captures.size() + 1);
+    match.push_back(RegExpMatchRange{full.start, full.end - full.start});
+    for (const auto &capture : captures) {
+      if (capture.matched()) {
+        match.push_back(
+            RegExpMatchRange{capture.start, capture.end - capture.start});
+      } else {
+        match.push_back(llvh::None);
+      }
+    }
+  };
+  const auto guard = runtime.getOverflowGuardForRegex();
+  const auto matchResult = aotMatcher
+      ? regex::searchWithAOTRegex(
+            aotMatcher,
+            bytecode,
+            start,
+            searchStartOffset,
+            stringLength,
+            writeMatch,
+            matchFlags,
+            guard)
+      : simpleRegex
+      ? regex::searchWithSimpleRegex(
+            simpleRegex,
+            start,
+            searchStartOffset,
+            stringLength,
+            writeMatch,
+            matchFlags,
+            guard)
+      : regex::searchWithBytecode(
+            bytecode,
+            start,
+            searchStartOffset,
+            stringLength,
+            writeMatch,
+            matchFlags,
+            guard);
   if (matchResult == regex::MatchRuntimeResult::StackOverflow) {
     return runtime.raiseRangeError("Maximum regex stack depth reached");
   } else if (matchResult == regex::MatchRuntimeResult::NoMatch) {
-    return RegExpMatch{}; // not found.
-  }
-  size_t matchRangeCount = nativeMatchRanges.size();
-  assert(matchRangeCount > 0);
-  RegExpMatch match;
-  match.reserve(matchRangeCount);
-  for (size_t i = 0; i < matchRangeCount; i++) {
-    const auto &submatch = nativeMatchRanges[i];
-    if (!submatch.matched()) {
-      assert(i > 0 && "match_result[0] should always match");
-      match.push_back(llvh::None);
-    } else {
-      uint32_t pos = submatch.start;
-      uint32_t length = submatch.end - submatch.start;
-      match.push_back(RegExpMatchRange{pos, length});
-    }
+    return RegExpMatch{};
   }
   assert(!match.empty() && "Unexpected empty match");
   return match;
@@ -337,17 +381,21 @@ CallResult<RegExpMatch> JSRegExp::search(
   CallResult<RegExpMatch> matchResult = RegExpMatch{};
   if (input.isASCII()) {
     matchFlags |= regex::constants::matchInputAllAscii;
-    matchResult = performSearch<char, regex::ASCIIRegexTraits>(
+    matchResult = performSearch<char>(
         runtime,
         llvh::makeArrayRef(selfHandle->bytecode_, selfHandle->bytecodeSize_),
+        selfHandle->simpleRegex_,
+        selfHandle->aotMatcher_,
         input.castToCharPtr(),
         input.length(),
         searchStartOffset,
         matchFlags);
   } else {
-    matchResult = performSearch<char16_t, regex::UTF16RegexTraits>(
+    matchResult = performSearch<char16_t>(
         runtime,
         llvh::makeArrayRef(selfHandle->bytecode_, selfHandle->bytecodeSize_),
+        selfHandle->simpleRegex_,
+        selfHandle->aotMatcher_,
         input.castToChar16Ptr(),
         input.length(),
         searchStartOffset,
@@ -359,19 +407,21 @@ CallResult<RegExpMatch> JSRegExp::search(
     return ExecutionStatus::EXCEPTION;
   } else if (!matchResult->empty()) {
     runtime.regExpLastInput = strHandle;
-    runtime.regExpLastRegExp = selfHandle;
+    runtime.regExpLastInputChar = HermesValue::encodeUndefinedValue();
     runtime.regExpLastMatch = *matchResult;
   }
   return matchResult;
 }
 
 JSRegExp::~JSRegExp() {
-  free(bytecode_);
+  if (bytecodeOwnership_ == BytecodeOwnership::Copy)
+    free(const_cast<uint8_t *>(bytecode_));
 }
 
 void JSRegExp::_finalizeImpl(GCCell *cell, GC &gc) {
   JSRegExp *self = vmcast<JSRegExp>(cell);
-  if (self->bytecode_) {
+  if (self->bytecode_ &&
+      self->bytecodeOwnership_ == BytecodeOwnership::Copy) {
     gc.getIDTracker().untrackNative(self->bytecode_);
   }
   self->~JSRegExp();
@@ -379,7 +429,9 @@ void JSRegExp::_finalizeImpl(GCCell *cell, GC &gc) {
 
 size_t JSRegExp::_mallocSizeImpl(GCCell *cell) {
   auto *self = vmcast<JSRegExp>(cell);
-  return self->bytecodeSize_;
+  return self->bytecodeOwnership_ == BytecodeOwnership::Copy
+      ? self->bytecodeSize_
+      : 0;
 }
 
 #ifdef HERMES_MEMORY_INSTRUMENTATION
@@ -392,7 +444,8 @@ void JSRegExp::_snapshotAddEdgesImpl(GCCell *cell, GC &gc, HeapSnapshot &snap) {
   auto *const self = vmcast<JSRegExp>(cell);
   // Call the super type to add any other custom edges.
   JSObject::_snapshotAddEdgesImpl(self, gc, snap);
-  if (self->bytecode_) {
+  if (self->bytecode_ &&
+      self->bytecodeOwnership_ == BytecodeOwnership::Copy) {
     snap.addNamedEdge(
         HeapSnapshot::EdgeType::Internal,
         "bytecode",
@@ -402,7 +455,8 @@ void JSRegExp::_snapshotAddEdgesImpl(GCCell *cell, GC &gc, HeapSnapshot &snap) {
 
 void JSRegExp::_snapshotAddNodesImpl(GCCell *cell, GC &gc, HeapSnapshot &snap) {
   auto *const self = vmcast<JSRegExp>(cell);
-  if (self->bytecode_) {
+  if (self->bytecode_ &&
+      self->bytecodeOwnership_ == BytecodeOwnership::Copy) {
     // Add a native node for regex bytecode, to account for native size
     // directly owned by the regex.
     snap.beginNode();

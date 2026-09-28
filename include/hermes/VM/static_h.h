@@ -8,6 +8,7 @@
 #ifndef HERMES_STATIC_H_H
 #define HERMES_STATIC_H_H
 
+#include "hermes/Regex/RegexAOT.h"
 #include "hermes/Support/MathFunctions.h"
 #include "hermes/Support/sh_tryfast_fp_cvt.h"
 #include "hermes/VM/sh_legacy_value.h"
@@ -1405,6 +1406,33 @@ _sh_ljs_get_string(SHRuntime *shr, SHSymbolID symID);
 
 SHERMES_EXPORT SHLegacyValue
 _sh_ljs_create_regexp(SHRuntime *shr, SHSymbolID pattern, SHSymbolID flags);
+
+/// The bytecode must be immutable and remain alive until runtime destruction,
+/// as required of SHUnit data. The runtime borrows it without copying.
+SHERMES_EXPORT SHLegacyValue _sh_ljs_create_regexp_precompiled(
+    SHRuntime *shr,
+    SHSymbolID pattern,
+    SHSymbolID flags,
+    const uint8_t *bytecode,
+    uint32_t bytecode_size);
+
+/// Data and generated code must satisfy the persistent SHUnit lifetime.
+/// Exactly one specialization is non-null and must match the bytecode semantics.
+SHERMES_EXPORT SHLegacyValue _sh_ljs_create_regexp_specialized(
+    SHRuntime *shr,
+    SHSymbolID pattern,
+    SHSymbolID flags,
+    const uint8_t *bytecode,
+    uint32_t bytecode_size,
+    const uint8_t *simple_regex,
+    HermesRegexAOTMatcher aot_matcher);
+
+/// The descriptor has exactly one unanchored, non-Unicode code-unit term.
+/// Undefined declines without observable effects; all operands are rooted by
+/// the caller. The successful path cannot invoke user JavaScript.
+SHERMES_EXPORT SHLegacyValue _sh_ljs_try_fast_regexp(
+    SHRuntime *shr, const uint8_t *descriptor, uint32_t operation,
+    const SHLegacyValue *input, const SHLegacyValue *index);
 
 /// \param value the string of the BigInt.
 /// \param size  the size of the string \c value.

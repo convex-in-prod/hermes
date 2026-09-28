@@ -9,6 +9,7 @@
 #define HERMES_VM_JSREGEXP_H
 
 #include "hermes/Regex/Regex.h"
+#include "hermes/Regex/RegexAOT.h"
 #include "hermes/Regex/RegexTypes.h"
 #include "hermes/VM/JSObject.h"
 #include "hermes/VM/RegExpMatch.h"
@@ -50,15 +51,27 @@ class JSRegExp final : public JSObject {
       Runtime &runtime,
       Handle<HiddenClass> arrayClass);
 
+  enum class BytecodeOwnership : uint8_t {
+    Copy,
+    // The caller retains immutable storage until the runtime is destroyed.
+    BorrowPersistent,
+  };
+
   /// Initializes RegExp with existing bytecode. Populates fields for the
   /// pattern and flags, but performs no validation on them. It is assumed that
   /// the bytecode is correct and corresponds to the given pattern/flags.
+  /// A non-null simpleRegex is an equivalent immutable descriptor with the
+  /// same persistent lifetime; only BorrowPersistent may provide one.
+  /// aotMatcher is an alternative generated matcher with that same lifetime.
   static void initialize(
       Handle<JSRegExp> selfHandle,
       Runtime &runtime,
       Handle<StringPrimitive> pattern,
       Handle<StringPrimitive> flags,
-      llvh::ArrayRef<uint8_t> bytecode);
+      llvh::ArrayRef<uint8_t> bytecode,
+      BytecodeOwnership ownership,
+      const uint8_t *simpleRegex = nullptr,
+      HermesRegexAOTMatcher aotMatcher = nullptr);
 
   /// Initialize a RegExp based on another RegExp \p otherHandle. If \p flags
   /// matches the internal flags of the other RegExp, this lets us avoid
@@ -136,8 +149,9 @@ class JSRegExp final : public JSObject {
  private:
   ~JSRegExp();
 
-  /// Store a copy of the \p bytecode array.
-  void initializeBytecode(llvh::ArrayRef<uint8_t> bytecode);
+  void initializeBytecode(
+      llvh::ArrayRef<uint8_t> bytecode,
+      BytecodeOwnership ownership);
 
   static ExecutionStatus initializeGroupNameMappingObj(
       Runtime &runtime,
@@ -151,8 +165,13 @@ class JSRegExp final : public JSObject {
   /// that the native pointer is always 8 byte aligned without extra padding.
   GCPointer<StringPrimitive> pattern_;
 
-  uint8_t *bytecode_{};
+  const uint8_t *bytecode_{};
+  // Optional bounded descriptor in the same persistent SH unit as the bytecode.
+  const uint8_t *simpleRegex_{};
+  // Generated code has the same persistent SHUnit lifetime as borrowed data.
+  HermesRegexAOTMatcher aotMatcher_{};
   uint32_t bytecodeSize_{0};
+  BytecodeOwnership bytecodeOwnership_{BytecodeOwnership::Copy};
 
   regex::SyntaxFlags syntaxFlags_ = {};
 

@@ -70,6 +70,16 @@ class CompiledRegExp {
   /// \return regexp-specific bytecode for the receiver.
   llvh::ArrayRef<uint8_t> getBytecode() const;
 
+  /// Compile bounded fixed-width literal/class matching data from validated
+  /// bytecode. Unsupported flags, syntax or size return None for interpreter
+  /// fallback. No source syntax is reparsed or approximated.
+  llvh::Optional<std::vector<uint8_t>> compileSimpleRegex() const;
+
+  /// Emit a bounded C matcher from validated bytecode. Unsupported control flow
+  /// or exceeded budgets select the interpreter. The caller supplies a valid C
+  /// identifier and retains the emitted function for the lifetime of its SHUnit.
+  llvh::Optional<std::string> compileAOTRegex(llvh::StringRef name) const;
+
  private:
   std::vector<uint8_t> bytecode_;
   std::string pattern_;

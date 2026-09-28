@@ -17,8 +17,6 @@
 #include "hermes/Platform/Unicode/PlatformUnicode.h"
 #include "hermes/Regex/RegexBytecode.h"
 #include "hermes/Regex/RegexTypes.h"
-#include "llvh/ADT/DenseMap.h"
-#include "llvh/ADT/Optional.h"
 
 namespace hermes {
 namespace regex {
@@ -45,9 +43,6 @@ struct UTF16RegexTraits {
   using CodeUnit = char16_t;
 
  private:
-  using CanonicalizeCache = llvh::SmallDenseMap<CodePoint, CodePoint, 16>;
-  mutable CanonicalizeCache toUpperCache_;
-
   /// ES9 11.2
   static bool isWhiteSpaceChar(CodePoint c) {
     return c == u'\u0009' || c == u'\u000B' || c == u'\u000C' ||
@@ -63,7 +58,7 @@ struct UTF16RegexTraits {
 
  public:
   /// \return whether the character \p c has the character type \p type.
-  bool characterHasType(CodePoint c, regex::CharacterClass::Type type) const {
+  static bool characterHasType(CodePoint c, regex::CharacterClass::Type type) {
     switch (type) {
       case regex::CharacterClass::Digits:
         return u'0' <= c && c <= u'9';
@@ -98,10 +93,9 @@ struct UTF16RegexTraits {
     return hermes::canonicalize(c, unicode);
   }
 
-  /// \return whether the character c is contained within the range [first,
-  /// last]. If ICase is set, perform a canonicalizing membership test as
-  /// specified in "CharacterSetMatcher" ES5.1 15.10.2.8.
-  bool rangesContain(llvh::ArrayRef<BracketRange32> ranges, CodePoint c) const {
+  /// \return whether any range contains c. Case equivalence is expanded into
+  /// the ranges by the compiler, rather than canonicalized during membership.
+  static bool rangesContain(llvh::ArrayRef<BracketRange32> ranges, CodePoint c) {
     return anyRangeContainsChar(ranges, c);
   }
 };
@@ -112,7 +106,7 @@ struct ASCIIRegexTraits {
   using CodePoint = uint8_t;
   using CodeUnit = char;
 
-  bool characterHasType(CodePoint c, regex::CharacterClass::Type type) const {
+  static bool characterHasType(CodePoint c, regex::CharacterClass::Type type) {
     switch (type) {
       case regex::CharacterClass::Digits:
         return '0' <= c && c <= '9';
@@ -148,7 +142,7 @@ struct ASCIIRegexTraits {
 
   /// \return whether any of a list of ranges contains \p c.
   /// Note that our ranges contain uint32_t, but we test chars for membership.
-  bool rangesContain(llvh::ArrayRef<BracketRange32> ranges, char16_t c) const {
+  static bool rangesContain(llvh::ArrayRef<BracketRange32> ranges, char16_t c) {
     return anyRangeContainsChar(ranges, c);
   }
 };

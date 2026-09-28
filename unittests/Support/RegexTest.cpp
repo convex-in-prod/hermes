@@ -7,9 +7,11 @@
 
 #include "hermes/Regex/Regex.h"
 #include "hermes/Regex/Executor.h"
+#include "hermes/Regex/RegexSerialization.h"
 #include "hermes/Regex/RegexTraits.h"
 
 #include <string>
+#include <utility>
 #include "gtest/gtest.h"
 
 using namespace hermes::regex;
@@ -78,6 +80,355 @@ TEST(Regex, Short) {
   const std::u16string text2 = u"a1234b";
   EXPECT_TRUE(search(text2, matchRanges, reg, constants::matchDefault));
   EXPECT_EQ("(0-6) (1-5)", flatten(matchRanges));
+}
+
+TEST(Regex, AOTEligibility) {
+  for (const auto &pattern : {
+           "", "(a*)", "(a*?)(a{2,4})", "^([a-z]+)$", "(?m:^a+$)",
+           "\\b([a-z]+)\\s*[:=]\\s*(\\d+)\\b", "(?i:a+)(?-i:B)",
+           "(?<name>[^,]+),", "[\\d\\S]+", "\\u0100+(\\ud800*)",
+           "(?:a|ab)c", "(?:ab|a)b", "(?:|ab)c", "(?:ab|)c",
+           "(?:a*|ab)c", "(?:a*?|ab)c",
+           "(?i:\\u00e9(?:cho|clair)\\s*.*?END)"}) {
+    auto compiled = hermes::CompiledRegExp::tryCompile(pattern, "");
+    ASSERT_TRUE(compiled);
+    EXPECT_TRUE(compiled->compileAOTRegex("matcher")) << pattern;
+  }
+  for (const auto &pattern : {
+           "(ab|cd)", "(?=a)a", "(?<=a)b", "(a)\\1", "(a)+",
+           "(a)?", "(a)(?:b|c)", "(?:a|b)+", "(?:a|ab)*?c", "(?:ab|cd)+",
+           "(a)(b)(c)(d)(e)(f)(g)(h)(i)"}) {
+    auto compiled = hermes::CompiledRegExp::tryCompile(pattern, "");
+    ASSERT_TRUE(compiled);
+    EXPECT_FALSE(compiled->compileAOTRegex("matcher")) << pattern;
+  }
+  auto unicode = hermes::CompiledRegExp::tryCompile("a+", "u");
+  ASSERT_TRUE(unicode);
+  EXPECT_FALSE(unicode->compileAOTRegex("matcher"));
+  auto large = hermes::CompiledRegExp::tryCompile(std::string(2048, 'a'), "");
+  ASSERT_TRUE(large);
+  EXPECT_FALSE(large->compileAOTRegex("matcher"));
+  for (size_t count : {63u, 64u, 65u}) {
+    auto compiled =
+        hermes::CompiledRegExp::tryCompile(std::string(count, 'a'), "");
+    ASSERT_TRUE(compiled);
+    EXPECT_EQ(count <= 64, compiled->compileAOTRegex("matcher").hasValue())
+        << count;
+  }
+  for (size_t count : {8u, 9u}) {
+    std::string pattern;
+    for (size_t i = 0; i < count; ++i)
+      pattern += "(?:ab|a)";
+    auto compiled = hermes::CompiledRegExp::tryCompile(pattern, "");
+    ASSERT_TRUE(compiled);
+    EXPECT_EQ(count == 8, compiled->compileAOTRegex("matcher").hasValue());
+  }
+}
+
+TEST(Regex, AOTBranchTargets) {
+  // Literal runs require at least three characters; a two-character branch
+  // emits separate instructions, so its second character is a legal target.
+  for (const auto &pattern : {"abc|def", "a*|b*"}) {
+    auto compiled = hermes::CompiledRegExp::tryCompile(pattern, "");
+    ASSERT_TRUE(compiled);
+    ASSERT_TRUE(compiled->compileAOTRegex("matcher"));
+    // Corrupt only targets in an otherwise producer-validated program. AOT
+    // must not turn instruction payloads or loop bodies into entry points.
+    auto bytes = compiled->getBytecode();
+    auto *code = const_cast<uint8_t *>(bytes.data()) +
+        sizeof(RegexBytecodeHeader);
+    auto *alt = reinterpret_cast<AlternationInsn *>(code);
+    ASSERT_EQ(Opcode::Alternation, alt->opcode);
+    const uint32_t secondary = alt->secondaryBranch;
+    auto *jump = reinterpret_cast<Jump32Insn *>(
+        code + secondary - sizeof(Jump32Insn));
+    ASSERT_EQ(Opcode::Jump32, jump->opcode);
+    const uint32_t continuation = jump->target;
+    const uint32_t prefix = pattern[1] == '*' ? sizeof(Width1LoopInsn)
+                                            : sizeof(MatchNChar8Insn);
+    const uint32_t primaryPayload = sizeof(AlternationInsn) + prefix;
+    const uint32_t secondaryPayload = secondary + prefix;
+    const uint32_t pastGoal = bytes.size() - sizeof(RegexBytecodeHeader);
+    // The secondary payload is ahead of Jump32, so its rejection also checks
+    // operation boundaries rather than just the backward-branch guard.
+    for (uint32_t target :
+         {0u, 1u, primaryPayload, secondaryPayload, pastGoal, UINT32_MAX}) {
+      alt->secondaryBranch = target;
+      EXPECT_FALSE(compiled->compileAOTRegex("matcher")) << target;
+      alt->secondaryBranch = secondary;
+      jump->target = target;
+      EXPECT_FALSE(compiled->compileAOTRegex("matcher")) << target;
+      jump->target = continuation;
+    }
+    EXPECT_TRUE(compiled->compileAOTRegex("matcher"));
+  }
+}
+
+TEST(Regex, AOTFallbackRetainsCaptures) {
+  auto compiled = hermes::CompiledRegExp::tryCompile("(a*)(a+)b", "");
+  ASSERT_TRUE(compiled);
+  auto decline = +[](const void *, uint32_t, uint32_t, uint32_t, uint32_t *ranges)
+      -> int32_t {
+    // A budget decline can follow partial capture writes. None may escape.
+    ranges[0] = ranges[1] = ranges[2] = ranges[3] = kNotMatched;
+    return HermesRegexAOTFallback;
+  };
+  const std::string text = "xaaab";
+  cmatch actual;
+  auto sink = [&](CapturedRange full, llvh::ArrayRef<CapturedRange> captures) {
+    actual.push_back(full);
+    actual.insert(actual.end(), captures.begin(), captures.end());
+  };
+  auto guard =
+#ifdef HERMES_CHECK_NATIVE_STACK
+      hermes::StackOverflowGuard::nativeStackGuard(512 * 1024);
+#else
+      hermes::StackOverflowGuard::depthCounterGuard(1);
+#endif
+  EXPECT_EQ(
+      MatchRuntimeResult::Match,
+      searchWithAOTRegex(
+          decline,
+          compiled->getBytecode(),
+          text.data(),
+          2,
+          text.size(),
+          sink,
+          constants::matchInputAllAscii | constants::matchOnlyAtStart,
+          guard));
+  EXPECT_EQ("(2-5) (2-3) (3-4)", flatten(actual));
+}
+
+TEST(Regex, AOTInputRepresentation) {
+  auto compiled = hermes::CompiledRegExp::tryCompile("ab", "");
+  ASSERT_TRUE(compiled);
+  auto asciiMatcher = +[](const void *, uint32_t, uint32_t, uint32_t flags,
+                          uint32_t *) -> int32_t {
+    EXPECT_NE(0u, flags & constants::matchInputAllAscii);
+    EXPECT_NE(0u, flags & constants::matchOnlyAtStart);
+    return HermesRegexAOTNoMatch;
+  };
+  auto utf16Matcher = +[](const void *, uint32_t, uint32_t, uint32_t flags,
+                          uint32_t *) -> int32_t {
+    EXPECT_EQ(0u, flags & constants::matchInputAllAscii);
+    EXPECT_NE(0u, flags & constants::matchOnlyAtStart);
+    return HermesRegexAOTNoMatch;
+  };
+  auto guard =
+#ifdef HERMES_CHECK_NATIVE_STACK
+      hermes::StackOverflowGuard::nativeStackGuard(512 * 1024);
+#else
+      hermes::StackOverflowGuard::depthCounterGuard(1);
+#endif
+  // The hint is optional for ASCII storage and valid for ASCII text stored
+  // as UTF-16. Neither form may change the generated matcher's pointer width.
+  EXPECT_EQ(
+      MatchRuntimeResult::NoMatch,
+      searchWithAOTRegex(
+          asciiMatcher,
+          compiled->getBytecode(),
+          "ab",
+          0,
+          2,
+          {},
+          constants::matchOnlyAtStart,
+          guard));
+  EXPECT_EQ(
+      MatchRuntimeResult::NoMatch,
+      searchWithAOTRegex(
+          utf16Matcher,
+          compiled->getBytecode(),
+          u"ab",
+          0,
+          2,
+          {},
+          constants::matchInputAllAscii | constants::matchOnlyAtStart,
+          guard));
+}
+
+TEST(Regex, SimpleDescriptorMatchesInterpreter) {
+  const std::pair<const char *, const char *> patterns[] = {
+      {"abc", ""},
+      {"^a[0-9]", "gdy"},
+      {"[a-z]$", ""},
+      {"^a.$", ""},
+      {"[\\d\\S][^\\w]", ""},
+      {"[\\D\\s]", ""},
+      {"[^]", ""},
+      {"[]", ""},
+      {".", ""},
+      {".", "s"},
+      {"\\u00e9", ""},
+      {"[\\u0100-\\uffff]", ""},
+      {"\\ud800", ""},
+      {"(?s:.)", ""},
+      {"(?-s:.)", "s"},
+      {"(?-m:^a$)", "m"}};
+  const std::string ascii = "abc xa1\n\t!";
+  std::u16string utf16 = u"abc xa1\n\t!\u00e9\u2028\uFEFF";
+  utf16.push_back(0xd800);
+  utf16.push_back(0xdc00);
+  utf16.push_back(0xd800);
+  for (auto pattern : patterns) {
+    SCOPED_TRACE(pattern.first);
+    auto compiled =
+        hermes::CompiledRegExp::tryCompile(pattern.first, pattern.second);
+    ASSERT_TRUE(compiled);
+    auto descriptor = compiled->compileSimpleRegex();
+    ASSERT_TRUE(descriptor);
+    auto compare = [&](const auto &text, constants::MatchFlagType inputFlags) {
+      for (uint32_t start = 0; start <= text.size(); ++start) {
+        for (auto flags : {constants::matchDefault,
+                           constants::matchOnlyAtStart,
+                           constants::matchNotEndOfLine,
+                           constants::matchNotBeginningOfLine}) {
+          cmatch expected, actual;
+          auto sink = [&](
+                          CapturedRange full,
+                          llvh::ArrayRef<CapturedRange> captures) {
+            EXPECT_TRUE(captures.empty());
+            actual.push_back(full);
+          };
+          auto result = searchWithBytecode(
+              compiled->getBytecode(),
+              text.data(),
+              start,
+              text.size(),
+              &expected,
+              inputFlags | flags);
+          auto guard =
+#ifdef HERMES_CHECK_NATIVE_STACK
+              hermes::StackOverflowGuard::nativeStackGuard(512 * 1024);
+#else
+              hermes::StackOverflowGuard::depthCounterGuard(128);
+#endif
+          EXPECT_EQ(
+              result,
+              searchWithSimpleRegex(
+                  descriptor->data(),
+                  text.data(),
+                  start,
+                  text.size(),
+                  sink,
+                  inputFlags | flags,
+                  guard));
+          EXPECT_EQ(flatten(expected), flatten(actual));
+        }
+      }
+    };
+    compare(ascii, constants::matchInputAllAscii);
+    compare(utf16, constants::matchDefault);
+  }
+}
+
+TEST(Regex, SimpleDescriptorEligibility) {
+  for (const char *pattern : {"",
+                             "(a)",
+                             "(?=a)a",
+                             "a|b",
+                             "a*",
+                             "a{2}",
+                             "(?i:a)",
+                             "(?m:^a)",
+                             "abcdefghijklmnopq"}) {
+    auto compiled = hermes::CompiledRegExp::tryCompile(pattern, "");
+    ASSERT_TRUE(compiled);
+    EXPECT_FALSE(compiled->compileSimpleRegex()) << pattern;
+  }
+  for (const char *flags : {"i", "u"}) {
+    auto compiled = hermes::CompiledRegExp::tryCompile("a", flags);
+    ASSERT_TRUE(compiled);
+    EXPECT_FALSE(compiled->compileSimpleRegex());
+  }
+  auto maxTerms = hermes::CompiledRegExp::tryCompile("abcdefghijklmnop", "");
+  ASSERT_TRUE(maxTerms);
+  EXPECT_TRUE(maxTerms->compileSimpleRegex());
+  std::string ranges = "[";
+  for (unsigned i = 0; i < 33; ++i) {
+    // Separated singleton ranges cannot coalesce during bytecode generation.
+    ranges += "\\u01";
+    ranges += "01234"[i / 8];
+    ranges += "02468ace"[i % 8];
+    if (i == 31 || i == 32) {
+      auto compiled = hermes::CompiledRegExp::tryCompile(ranges + "]", "");
+      ASSERT_TRUE(compiled);
+      EXPECT_EQ(i == 31, compiled->compileSimpleRegex().hasValue());
+    }
+  }
+  auto large = hermes::CompiledRegExp::tryCompile(std::string(1024, 'a'), "");
+  ASSERT_TRUE(large);
+  EXPECT_FALSE(large->compileSimpleRegex());
+}
+
+#ifndef HERMES_CHECK_NATIVE_STACK
+TEST(Regex, SimpleDescriptorStackGuardOrdering) {
+  for (const char *pattern : {"a", "a$", "^a", "\\u0100"}) {
+    auto compiled = hermes::CompiledRegExp::tryCompile(pattern, "");
+    ASSERT_TRUE(compiled);
+    auto descriptor = compiled->compileSimpleRegex();
+    ASSERT_TRUE(descriptor);
+    for (std::string text : {"", "ab"}) {
+      for (uint32_t start = 0; start <= text.size(); ++start) {
+        auto guard = hermes::StackOverflowGuard::depthCounterGuard(0);
+        auto flags =
+            constants::matchInputAllAscii | constants::matchNotEndOfLine;
+        EXPECT_EQ(
+            searchWithBytecode(
+                compiled->getBytecode(),
+                text.data(),
+                start,
+                text.size(),
+                nullptr,
+                flags,
+                guard),
+            searchWithSimpleRegex(
+                descriptor->data(),
+                text.data(),
+                start,
+                text.size(),
+                {},
+                flags,
+                guard));
+      }
+    }
+  }
+}
+#endif
+
+TEST(Regex, CaptureSinkAndVectorFailure) {
+  auto bytecode = cregex(u"(?=(a))(a)(b)?").compile();
+  cmatch output;
+  unsigned calls = 0;
+  auto sink = [&](CapturedRange full, llvh::ArrayRef<CapturedRange> captures) {
+    ++calls;
+    output.push_back(full);
+    output.insert(output.end(), captures.begin(), captures.end());
+  };
+  auto guard =
+#ifdef HERMES_CHECK_NATIVE_STACK
+      hermes::StackOverflowGuard::nativeStackGuard(512 * 1024);
+#else
+      hermes::StackOverflowGuard::depthCounterGuard(128);
+#endif
+  EXPECT_EQ(
+      MatchRuntimeResult::Match,
+      searchWithBytecode(
+          bytecode, u"a", 0, 1, sink, constants::matchDefault, guard));
+  EXPECT_EQ("(0-1) (0-1) (0-1) nm", flatten(output));
+  EXPECT_EQ(
+      MatchRuntimeResult::NoMatch,
+      searchWithBytecode(
+          bytecode, u"x", 0, 1, sink, constants::matchDefault, guard));
+  EXPECT_EQ(1u, calls);
+  EXPECT_EQ(
+      MatchRuntimeResult::NoMatch,
+      searchWithBytecode(
+          bytecode, u"x", 0, 1, &output, constants::matchDefault, guard));
+  EXPECT_EQ("(0-1) (0-1) (0-1) nm", flatten(output));
+  EXPECT_EQ(
+      MatchRuntimeResult::Match,
+      searchWithBytecode(
+          bytecode, u"a", 0, 1, nullptr, constants::matchDefault, guard));
 }
 
 MatchRuntimeResult searchResult(

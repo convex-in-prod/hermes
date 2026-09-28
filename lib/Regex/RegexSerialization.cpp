@@ -14,6 +14,7 @@
 #include "llvh/Support/raw_ostream.h"
 
 #include <cctype>
+#include <cstring>
 
 using llvh::StringRef;
 using namespace hermes;
@@ -421,6 +422,121 @@ llvh::Optional<CompiledRegExp> CompiledRegExp::tryCompile(
 
 llvh::ArrayRef<uint8_t> CompiledRegExp::getBytecode() const {
   return bytecode_;
+}
+
+llvh::Optional<std::vector<uint8_t>> CompiledRegExp::compileSimpleRegex() const {
+  using namespace regex;
+  auto bytes = getBytecode();
+  const auto *header =
+      reinterpret_cast<const RegexBytecodeHeader *>(bytes.data());
+  const auto flags = SyntaxFlags::fromByte(header->syntaxFlags);
+  // Keep Unicode decoding, folded literals, captures and repetition in the
+  // interpreter. Non-Unicode BracketICase already contains expanded ranges.
+  // The bounded input also limits work spent rejecting large literal sites.
+  if (flags.unicode || header->markedCount ||
+      header->loopCount || bytes.size() > 1024)
+    return llvh::None;
+
+  SimpleRegexHeader simple{};
+  simple.constraints = header->constraints;
+  std::vector<uint8_t> result(sizeof(simple));
+  uint32_t rangeCount = 0;
+  auto append = [&](const void *data, size_t size) {
+    const auto *first = static_cast<const uint8_t *>(data);
+    result.insert(result.end(), first, first + size);
+  };
+  auto appendTerm = [&](BracketInsn term,
+                        llvh::ArrayRef<BracketRange32> ranges) {
+    if (simple.anchoredAtEnd || simple.termCount == kSimpleRegexMaxTerms ||
+        ranges.size() > kSimpleRegexMaxRanges - rangeCount)
+      return false;
+    term.opcode = Opcode::Bracket;
+    term.rangeCount = ranges.size();
+    append(&term, sizeof(term));
+    if (!ranges.empty())
+      append(ranges.data(), ranges.size() * sizeof(BracketRange32));
+    ++simple.termCount;
+    rangeCount += ranges.size();
+    return true;
+  };
+  auto appendChar = [&](uint32_t ch) {
+    BracketRange32 range{ch, ch};
+    return appendTerm(BracketInsn{}, llvh::makeArrayRef(&range, 1));
+  };
+
+  size_t offset = sizeof(*header);
+  while (offset < bytes.size()) {
+    const auto *base = reinterpret_cast<const Insn *>(bytes.data() + offset);
+    switch (base->opcode) {
+      case Opcode::Goal:
+        if (!simple.termCount || offset + sizeof(GoalInsn) != bytes.size())
+          return llvh::None;
+        memcpy(result.data(), &simple, sizeof(simple));
+        return result;
+      case Opcode::LeftAnchor:
+        if (simple.termCount || simple.anchoredAtStart)
+          return llvh::None;
+        simple.anchoredAtStart = true;
+        offset += sizeof(LeftAnchorInsn);
+        break;
+      case Opcode::RightAnchor:
+        if (!simple.termCount || simple.anchoredAtEnd)
+          return llvh::None;
+        simple.anchoredAtEnd = true;
+        offset += sizeof(RightAnchorInsn);
+        break;
+      case Opcode::MatchChar8: {
+        const auto *insn = llvh::cast<MatchChar8Insn>(base);
+        if (!appendChar(static_cast<unsigned char>(insn->c)))
+          return llvh::None;
+        offset += sizeof(*insn);
+        break;
+      }
+      case Opcode::MatchChar16: {
+        const auto *insn = llvh::cast<MatchChar16Insn>(base);
+        if (!appendChar(insn->c))
+          return llvh::None;
+        offset += sizeof(*insn);
+        break;
+      }
+      case Opcode::MatchNChar8: {
+        const auto *insn = llvh::cast<MatchNChar8Insn>(base);
+        const auto *chars = reinterpret_cast<const uint8_t *>(insn + 1);
+        for (uint32_t i = 0; i < insn->charCount; ++i)
+          if (!appendChar(chars[i]))
+            return llvh::None;
+        offset += insn->totalWidth();
+        break;
+      }
+      case Opcode::Bracket:
+      case Opcode::BracketICase: {
+        const BracketInsn *insn = base->opcode == Opcode::Bracket
+            ? llvh::cast<BracketInsn>(base)
+            : llvh::cast<BracketICaseInsn>(base);
+        const auto *ranges = reinterpret_cast<const BracketRange32 *>(insn + 1);
+        if (!appendTerm(*insn, llvh::makeArrayRef(ranges, insn->rangeCount)))
+          return llvh::None;
+        offset += insn->totalWidth();
+        break;
+      }
+      case Opcode::MatchAny:
+      case Opcode::MatchAnyButNewline: {
+        BracketInsn term{};
+        term.negate = true;
+        const BracketRange32 newlines[] = {{10, 10}, {13, 13}, {0x2028, 0x2029}};
+        const auto ranges = base->opcode == Opcode::MatchAny
+            ? llvh::ArrayRef<BracketRange32>{}
+            : llvh::makeArrayRef(newlines);
+        if (!appendTerm(term, ranges))
+          return llvh::None;
+        offset += sizeof(MatchAnyInsn);
+        break;
+      }
+      default:
+        return llvh::None;
+    }
+  }
+  llvm_unreachable("Validated regex bytecode must end in Goal");
 }
 
 void UniquingRegExpTable::disassemble(llvh::raw_ostream &OS) const {

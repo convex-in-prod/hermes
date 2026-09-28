@@ -2530,6 +2530,11 @@ void HBCISel::generateEvalCompilationDataInst(
   // Nothing to do, this is metadata.
 }
 
+void HBCISel::generateLIRTryFastRegExpInst(
+    LIRTryFastRegExpInst *, BasicBlock *) {
+  llvm_unreachable("RegExp operation lowering is SH-only");
+}
+
 void HBCISel::generateBB(BasicBlock *BB, BasicBlock *next) {
   // Register the address of the current basic block.
   auto begin_loc = BCFGen_->getCurrentLocation();

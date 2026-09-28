@@ -569,6 +569,10 @@ class IRBuilder {
 
   CreateRegExpInst *createRegExpInst(Identifier pattern, Identifier flags);
 
+  LIRTryFastRegExpInst *createLIRTryFastRegExpInst(
+      LiteralString *pattern, LiteralString *flags, unsigned operation,
+      Value *input, Value *index);
+
   TypeOfInst *createTypeOfInst(Value *input);
   TypeOfIsInst *createTypeOfIsInst(Value *input, LiteralTypeOfIsTypes *types);
 

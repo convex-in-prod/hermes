@@ -8,6 +8,7 @@
 #include "SHUnitExt.h"
 #include "hermes/BCGen/SerializedLiteralParser.h"
 #include "hermes/Platform/Unicode/PlatformUnicode.h"
+#include "hermes/Regex/Executor.h"
 #include "hermes/Support/UTF8.h"
 #include "hermes/VM/ArrayStorage.h"
 #include "hermes/VM/Callable.h"
@@ -2666,6 +2667,196 @@ _sh_ljs_create_regexp(SHRuntime *shr, SHSymbolID pattern, SHSymbolID flags) {
     _sh_throw_current(shr);
 
   return *cr;
+}
+
+static SHLegacyValue createRegExpPrecompiled(
+    SHRuntime *shr,
+    SHSymbolID pattern,
+    SHSymbolID flags,
+    const uint8_t *bytecode,
+    uint32_t bytecodeSize,
+    const uint8_t *simpleRegex,
+    HermesRegexAOTMatcher aotMatcher) {
+  Runtime &runtime = getRuntime(shr);
+  GCScopeMarkerRAII marker{runtime};
+  Handle<JSRegExp> re = runtime.makeHandle(JSRegExp::create(runtime));
+  auto patternHandle = runtime.makeHandle(
+      runtime.getStringPrimFromSymbolID(SymbolID::unsafeCreate(pattern)));
+  auto flagsHandle = runtime.makeHandle(
+      runtime.getStringPrimFromSymbolID(SymbolID::unsafeCreate(flags)));
+  JSRegExp::initialize(
+      re,
+      runtime,
+      patternHandle,
+      flagsHandle,
+      {bytecode, bytecodeSize},
+      JSRegExp::BytecodeOwnership::BorrowPersistent,
+      simpleRegex,
+      aotMatcher);
+  return re.getHermesValue();
+}
+
+LLVM_ATTRIBUTE_NOINLINE
+extern "C" SHLegacyValue _sh_ljs_create_regexp_precompiled(
+    SHRuntime *shr,
+    SHSymbolID pattern,
+    SHSymbolID flags,
+    const uint8_t *bytecode,
+    uint32_t bytecodeSize) {
+  return createRegExpPrecompiled(
+      shr, pattern, flags, bytecode, bytecodeSize, nullptr, nullptr);
+}
+
+LLVM_ATTRIBUTE_NOINLINE
+extern "C" SHLegacyValue _sh_ljs_create_regexp_specialized(
+    SHRuntime *shr,
+    SHSymbolID pattern,
+    SHSymbolID flags,
+    const uint8_t *bytecode,
+    uint32_t bytecodeSize,
+    const uint8_t *simpleRegex,
+    HermesRegexAOTMatcher aotMatcher) {
+  return createRegExpPrecompiled(
+      shr, pattern, flags, bytecode, bytecodeSize, simpleRegex, aotMatcher);
+}
+
+static bool hasRegExpFlagGetter(
+    Runtime &runtime, Predefined::Str key, char flag) {
+  NamedPropertyDescriptor descriptor;
+  if (!JSObject::getOwnNamedDescriptor(
+          runtime.regExpPrototype, runtime, Predefined::getSymbolID(key),
+          descriptor) || !descriptor.flags.accessor)
+    return false;
+  auto value = JSObject::getNamedSlotValueUnsafe(
+      *runtime.regExpPrototype, runtime, descriptor).unboxToHV(runtime);
+  auto *accessor = vmcast<PropertyAccessor>(value);
+  auto *getter = dyn_vmcast<NativeFunction>(accessor->getter.get(runtime));
+  return getter && getter->getFunctionPtr() == regExpFlagPropertyGetter &&
+      getter->getContext() == reinterpret_cast<void *>(uintptr_t(flag));
+}
+
+static CallResult<HermesValue> tryFastRegExp(
+    Runtime &runtime, const uint8_t *descriptor, uint32_t operation,
+    Handle<> input, Handle<> index) {
+  auto string = Handle<StringPrimitive>::dyn_vmcast(input);
+  if (!string)
+    return HermesValue::encodeUndefinedValue();
+  const bool test = operation == HermesRegexTest ||
+      operation == HermesRegexTestIndexed;
+  const bool lower = operation == HermesRegexLowerReplaceEmpty ||
+      operation == HermesRegexLowerReplaceEmptyEqual;
+  const bool equal = operation == HermesRegexReplaceEmptyEqual ||
+      operation == HermesRegexLowerReplaceEmptyEqual;
+  uint32_t charIndex = 0;
+  if (operation == HermesRegexTestIndexed) {
+    if (!index->isNumber())
+      return HermesValue::encodeUndefinedValue();
+    double number = index->getNumber();
+    if (!(number >= 0 && number < string->getStringLength()) ||
+        std::floor(number) != number)
+      return HermesValue::encodeUndefinedValue();
+    charIndex = static_cast<uint32_t>(number);
+  }
+  // Own data methods/accessors on the intrinsic prototypes prove the entire
+  // lookup chain for a fresh literal and a primitive string. No user code can
+  // run between these checks and use; the compiler keeps argument effects on
+  // the original path. Do not replace these checks with a slot-only heuristic.
+  if (!hasOwnNativeMethod(runtime, runtime.regExpPrototype,
+                          Predefined::exec, regExpPrototypeExec))
+    return HermesValue::encodeUndefinedValue();
+  if (test) {
+    if (!hasOwnNativeMethod(runtime, runtime.regExpPrototype,
+                            Predefined::test, regExpPrototypeTest))
+      return HermesValue::encodeUndefinedValue();
+  } else {
+    if (!hasOwnNativeMethod(runtime, runtime.stringPrototype,
+                            Predefined::replace, stringPrototypeReplace) ||
+        !hasOwnNativeMethod(runtime, runtime.regExpPrototype,
+                            Predefined::SymbolReplace,
+                            regExpPrototypeSymbolReplace) ||
+        !hasRegExpFlagGetter(runtime, Predefined::global, 'g') ||
+        !hasRegExpFlagGetter(runtime, Predefined::unicode, 'u') ||
+        (lower && !hasOwnNativeMethod(runtime, runtime.stringPrototype,
+                                     Predefined::toLowerCase,
+                                     stringPrototypeToLowerCase)))
+      return HermesValue::encodeUndefinedValue();
+  }
+
+  auto guard = runtime.getOverflowGuardForRegex();
+#ifndef HERMES_CHECK_NATIVE_STACK
+  StackOverflowGuard::CallFrameRAII frame{guard};
+#endif
+  if (guard.isOverflowing())
+    return HermesValue::encodeUndefinedValue();
+
+  auto view = StringPrimitive::createStringView(runtime, string);
+  uint32_t lastMatch = UINT32_MAX;
+  SmallU16String<32> output;
+  const uint32_t length = operation == HermesRegexTestIndexed ? 1 : view.length();
+  for (uint32_t i = 0; i < length; ++i) {
+    const char16_t character = view[charIndex + i];
+    if (lower) {
+      bool unchanged;
+#if HERMES_PLATFORM_UNICODE == HERMES_PLATFORM_UNICODE_LITE || \
+    HERMES_PLATFORM_UNICODE == HERMES_PLATFORM_UNICODE_HERMES || \
+    HERMES_PLATFORM_UNICODE == HERMES_PLATFORM_UNICODE_EMSCRIPTEN
+      unchanged = unicode::isUnchangedLowercaseCodeUnit(character);
+#else
+      // Platform casing tables can differ from the compiler's tables. ASCII
+      // has identical root semantics; other characters use the platform path.
+      unchanged = character < 128 && (character < 'A' || character > 'Z');
+#endif
+      if (!unchanged)
+        return HermesValue::encodeUndefinedValue();
+    }
+    if (regex::matchSimpleRegexCharacter(descriptor, character)) {
+      if (!test && !equal && lastMatch == UINT32_MAX)
+        view.slice(0, i).appendUTF16String(output);
+      lastMatch = i;
+      if (test)
+        break;
+    } else if (!test && !equal && lastMatch != UINT32_MAX) {
+      output.push_back(character);
+    }
+  }
+
+  if (lastMatch != UINT32_MAX) {
+    // A failed test leaves previous state intact. Global replacement publishes
+    // the LAST successful match, even when the consumer needs only equality.
+    // No capture groups exist in this descriptor shape.
+    if (operation == HermesRegexTestIndexed) {
+      runtime.regExpLastInput = nullptr;
+      runtime.regExpLastInputChar =
+          HermesValue::encodeTrustedNumberValue(view[charIndex]);
+    } else {
+      runtime.regExpLastInput = string;
+      runtime.regExpLastInputChar = HermesValue::encodeUndefinedValue();
+    }
+    runtime.regExpLastMatch.resize(1);
+    runtime.regExpLastMatch[0] = RegExpMatchRange{lastMatch, 1};
+  }
+  if (test)
+    return HermesValue::encodeBoolValue(lastMatch != UINT32_MAX);
+  if (equal)
+    return HermesValue::encodeBoolValue(lastMatch == UINT32_MAX);
+  if (lastMatch == UINT32_MAX)
+    return string.getHermesValue();
+  return StringPrimitive::createEfficient(runtime, output);
+}
+
+extern "C" SHLegacyValue _sh_ljs_try_fast_regexp(
+    SHRuntime *shr, const uint8_t *descriptor, uint32_t operation,
+    const SHLegacyValue *input, const SHLegacyValue *index) {
+  auto &runtime = getRuntime(shr);
+  CallResult<HermesValue> result{ExecutionStatus::EXCEPTION};
+  {
+    GCScopeMarkerRAII marker{runtime};
+    result = tryFastRegExp(runtime, descriptor, operation,
+                          Handle<>(toPHV(input)), Handle<>(toPHV(index)));
+  }
+  if (LLVM_UNLIKELY(result == ExecutionStatus::EXCEPTION))
+    _sh_throw_current(shr);
+  return *result;
 }
 
 LLVM_ATTRIBUTE_NOINLINE

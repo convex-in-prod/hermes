@@ -721,12 +721,11 @@ bool matchBackRef(
 /// in \p insn.
 template <class Traits>
 bool bracketMatchesChar(
-    const Context<Traits> &ctx,
+    bool unicode,
     const BracketInsn *insn,
     const BracketRange32 *ranges,
     typename Traits::CodePoint ch,
     bool icase) {
-  const auto &traits = ctx.traits_;
   // Note that if the bracket is negated /[^abc]/, we want to return true if we
   // do not match, false if we do. Implement this by xor with the negate flag.
 
@@ -736,23 +735,22 @@ bool bracketMatchesChar(
   // /iu must match any character whose canonical form is a word character
   // (e.g. U+212A KELVIN SIGN canonicalizes to 'k').
   if (insn->positiveCharClasses || insn->negativeCharClasses) {
-    auto testCh =
-        icase && ctx.syntaxFlags_.unicode ? Traits::canonicalize(ch, true) : ch;
+    auto testCh = icase && unicode ? Traits::canonicalize(ch, true) : ch;
     for (auto charClass :
          {CharacterClass::Digits,
           CharacterClass::Spaces,
           CharacterClass::Words}) {
       if ((insn->positiveCharClasses & charClass) &&
-          traits.characterHasType(testCh, charClass))
+          Traits::characterHasType(testCh, charClass))
         return true ^ insn->negate;
       if ((insn->negativeCharClasses & charClass) &&
-          !traits.characterHasType(testCh, charClass))
+          !Traits::characterHasType(testCh, charClass))
         return true ^ insn->negate;
     }
   }
 
   bool contained =
-      traits.rangesContain(llvh::makeArrayRef(ranges, insn->rangeCount), ch);
+      Traits::rangesContain(llvh::makeArrayRef(ranges, insn->rangeCount), ch);
   return contained ^ insn->negate;
 }
 
@@ -917,7 +915,8 @@ bool Context<Traits>::matchWidth1(const Insn *base, CodeUnit c) const {
       const BracketInsn *insn = llvh::cast<BracketInsn>(base);
       const BracketRange32 *ranges =
           reinterpret_cast<const BracketRange32 *>(insn + 1);
-      return bracketMatchesChar<Traits>(*this, insn, ranges, c, false);
+      return bracketMatchesChar<Traits>(
+          syntaxFlags_.unicode, insn, ranges, c, false);
     }
 
     case Width1Opcode::BracketICase: {
@@ -927,7 +926,8 @@ bool Context<Traits>::matchWidth1(const Insn *base, CodeUnit c) const {
       const BracketICaseInsn *insn = llvh::cast<BracketICaseInsn>(base);
       const BracketRange32 *ranges =
           reinterpret_cast<const BracketRange32 *>(insn + 1);
-      return bracketMatchesChar<Traits>(*this, insn, ranges, c, true);
+      return bracketMatchesChar<Traits>(
+          syntaxFlags_.unicode, insn, ranges, c, true);
     }
   }
   llvm_unreachable("Invalid width 1 opcode");
@@ -1302,7 +1302,11 @@ auto Context<Traits>::match(State<Traits> *s, bool onlyAtStart)
               reinterpret_cast<const BracketRange32 *>(insn + 1);
           if (c.atEnd() ||
               !bracketMatchesChar<Traits>(
-                  *this, insn, ranges, c.consumeUTF16(), false))
+                  syntaxFlags_.unicode,
+                  insn,
+                  ranges,
+                  c.consumeUTF16(),
+                  false))
             BACKTRACK();
           s->ip_ += insn->totalWidth();
           break;
@@ -1314,7 +1318,11 @@ auto Context<Traits>::match(State<Traits> *s, bool onlyAtStart)
               reinterpret_cast<const BracketRange32 *>(insn + 1);
           if (c.atEnd() ||
               !bracketMatchesChar<Traits>(
-                  *this, insn, ranges, c.consumeUTF16(), true))
+                  syntaxFlags_.unicode,
+                  insn,
+                  ranges,
+                  c.consumeUTF16(),
+                  true))
             BACKTRACK();
           s->ip_ += insn->totalWidth();
           break;
@@ -1623,6 +1631,178 @@ auto Context<Traits>::match(State<Traits> *s, bool onlyAtStart)
   return nullptr;
 }
 
+template <typename CharT, class Traits>
+static MatchRuntimeResult searchWithAOTRegexImpl(
+    HermesRegexAOTMatcher matcher,
+    llvh::ArrayRef<uint8_t> bytecode,
+    const CharT *first,
+    uint32_t start,
+    uint32_t length,
+    CaptureRangeSink captures,
+    constants::MatchFlagType matchFlags,
+    StackOverflowGuard guard) {
+  const auto *header =
+      reinterpret_cast<const RegexBytecodeHeader *>(bytecode.data());
+  assert(start <= length && "Search start exceeds input length");
+  assert(header->markedCount <= HERMES_REGEX_AOT_MAX_CAPTURES);
+  Cursor<Traits> cursor{first, first + start, first + length, true};
+  if (!cursor.satisfiesConstraints(matchFlags, header->constraints))
+    return MatchRuntimeResult::NoMatch;
+  {
+#ifndef HERMES_CHECK_NATIVE_STACK
+    StackOverflowGuard::CallFrameRAII frame{guard};
+#endif
+    if (guard.isOverflowing())
+      return MatchRuntimeResult::StackOverflow;
+    uint32_t ranges[2 * (HERMES_REGEX_AOT_MAX_CAPTURES + 1)];
+    // The public flag is a content hint, including for UTF-16 input. The C
+    // matcher uses it to select storage width, which only this overload knows.
+    // Preserve the caller's flags for constraints and an interpreter restart.
+    const auto matcherFlags = sizeof(CharT) == 1
+        ? matchFlags | constants::matchInputAllAscii
+        : matchFlags & ~constants::matchInputAllAscii;
+    const int32_t result = matcher(first, length, start, matcherFlags, ranges);
+    if (result == HermesRegexAOTMatch) {
+      CapturedRange groups[HERMES_REGEX_AOT_MAX_CAPTURES];
+      for (uint32_t i = 0; i < header->markedCount; ++i)
+        groups[i] = {ranges[2 * (i + 1)], ranges[2 * (i + 1) + 1]};
+      if (captures)
+        captures({ranges[0], ranges[1]}, {groups, header->markedCount});
+      return MatchRuntimeResult::Match;
+    }
+    if (result == HermesRegexAOTNoMatch)
+      return MatchRuntimeResult::NoMatch;
+    if (result != HermesRegexAOTFallback)
+      llvm_unreachable("Invalid generated matcher result");
+  }
+  // No VM state has been published. Leave the AOT stack frame before restarting
+  // so the original interpreter retains its stack and backtrack error behavior.
+  return searchWithBytecode(
+      bytecode, first, start, length, captures, matchFlags, guard);
+}
+
+MatchRuntimeResult searchWithAOTRegex(
+    HermesRegexAOTMatcher matcher,
+    llvh::ArrayRef<uint8_t> bytecode,
+    const char *first,
+    uint32_t start,
+    uint32_t length,
+    CaptureRangeSink captures,
+    constants::MatchFlagType matchFlags,
+    StackOverflowGuard guard) {
+  return searchWithAOTRegexImpl<char, ASCIIRegexTraits>(
+      matcher, bytecode, first, start, length, captures, matchFlags, guard);
+}
+
+MatchRuntimeResult searchWithAOTRegex(
+    HermesRegexAOTMatcher matcher,
+    llvh::ArrayRef<uint8_t> bytecode,
+    const char16_t *first,
+    uint32_t start,
+    uint32_t length,
+    CaptureRangeSink captures,
+    constants::MatchFlagType matchFlags,
+    StackOverflowGuard guard) {
+  return searchWithAOTRegexImpl<char16_t, UTF16RegexTraits>(
+      matcher, bytecode, first, start, length, captures, matchFlags, guard);
+}
+
+bool matchSimpleRegexCharacter(const uint8_t *descriptor, char16_t character) {
+  const auto *header = reinterpret_cast<const SimpleRegexHeader *>(descriptor);
+  assert(header->termCount == 1 && !header->anchoredAtStart &&
+         !header->anchoredAtEnd);
+  const auto *term = reinterpret_cast<const BracketInsn *>(header + 1);
+  return bracketMatchesChar<UTF16RegexTraits>(
+      false, term, reinterpret_cast<const BracketRange32 *>(term + 1),
+      character, false);
+}
+
+template <typename CharT, class Traits>
+static MatchRuntimeResult searchWithSimpleRegexImpl(
+    const uint8_t *descriptor,
+    const CharT *first,
+    uint32_t start,
+    uint32_t length,
+    CaptureRangeSink captures,
+    constants::MatchFlagType matchFlags,
+    StackOverflowGuard guard) {
+  const auto *header = reinterpret_cast<const SimpleRegexHeader *>(descriptor);
+  assert(header->termCount && header->termCount <= kSimpleRegexMaxTerms);
+  assert(start <= length && "Search start exceeds input length");
+  // Match the interpreter's ordering: constraints can reject before entering
+  // the matcher, but failed match attempts must still report stack overflow.
+  if (((header->constraints & MatchConstraintNonASCII) &&
+       (matchFlags & constants::matchInputAllAscii)) ||
+      (header->anchoredAtStart && start != 0))
+    return MatchRuntimeResult::NoMatch;
+#ifndef HERMES_CHECK_NATIVE_STACK
+  StackOverflowGuard::CallFrameRAII frame{guard};
+#endif
+  if (guard.isOverflowing())
+    return MatchRuntimeResult::StackOverflow;
+  if (header->termCount > length - start)
+    return MatchRuntimeResult::NoMatch;
+
+  const bool sticky = matchFlags & constants::matchOnlyAtStart;
+  const uint32_t last = length - header->termCount;
+  if (header->anchoredAtEnd) {
+    if ((matchFlags & constants::matchNotEndOfLine) ||
+        ((sticky || header->anchoredAtStart) && start != last))
+      return MatchRuntimeResult::NoMatch;
+    start = last;
+  }
+  const bool onlyAtStart =
+      sticky || header->anchoredAtStart || header->anchoredAtEnd;
+
+  // All terms consume exactly one code unit. The length bound makes every
+  // input read valid, and ascending candidates preserve leftmost-first matches.
+  // Class membership shares the interpreter's tables, including JS whitespace.
+  for (uint32_t pos = start; pos <= last; ++pos) {
+    const uint8_t *termData = descriptor + sizeof(*header);
+    uint32_t termIndex = 0;
+    for (; termIndex < header->termCount; ++termIndex) {
+      const auto *term = reinterpret_cast<const BracketInsn *>(termData);
+      const auto *ranges = reinterpret_cast<const BracketRange32 *>(term + 1);
+      if (!bracketMatchesChar<Traits>(
+              false, term, ranges, first[pos + termIndex], false))
+        break;
+      termData += term->totalWidth();
+    }
+    if (termIndex == header->termCount) {
+      if (captures)
+        captures(CapturedRange{pos, pos + header->termCount}, {});
+      return MatchRuntimeResult::Match;
+    }
+    if (onlyAtStart)
+      break;
+  }
+  return MatchRuntimeResult::NoMatch;
+}
+
+MatchRuntimeResult searchWithSimpleRegex(
+    const uint8_t *descriptor,
+    const char16_t *first,
+    uint32_t start,
+    uint32_t length,
+    CaptureRangeSink captures,
+    constants::MatchFlagType matchFlags,
+    StackOverflowGuard guard) {
+  return searchWithSimpleRegexImpl<char16_t, UTF16RegexTraits>(
+      descriptor, first, start, length, captures, matchFlags, guard);
+}
+
+MatchRuntimeResult searchWithSimpleRegex(
+    const uint8_t *descriptor,
+    const char *first,
+    uint32_t start,
+    uint32_t length,
+    CaptureRangeSink captures,
+    constants::MatchFlagType matchFlags,
+    StackOverflowGuard guard) {
+  return searchWithSimpleRegexImpl<char, ASCIIRegexTraits>(
+      descriptor, first, start, length, captures, matchFlags, guard);
+}
+
 /// Entry point for searching a string via regex compiled bytecode.
 /// Given the bytecode \p bytecode, search the range starting at \p first up to
 /// (not including) \p last with the flags \p matchFlags. If the search
@@ -1635,7 +1815,7 @@ MatchRuntimeResult searchWithBytecodeImpl(
     const CharT *first,
     uint32_t start,
     uint32_t length,
-    std::vector<CapturedRange> *m,
+    CaptureRangeSink captures,
     constants::MatchFlagType matchFlags,
     StackOverflowGuard guard) {
   assert(
@@ -1675,14 +1855,13 @@ MatchRuntimeResult searchWithBytecodeImpl(
   if (const CharT *matchStartLoc = res.getValue()) {
     // Match succeeded. Return captured ranges. The first range is the total
     // match, followed by any capture groups.
-    if (m != nullptr) {
+    if (captures) {
       uint32_t totalStart = static_cast<uint32_t>(matchStartLoc - first);
       uint32_t totalEnd =
           static_cast<uint32_t>(state.cursor_.currentPointer() - first);
-      m->clear();
-      m->push_back(CapturedRange{totalStart, totalEnd});
-      std::copy_n(
-          state.capturedRanges_.begin(), markedCount, std::back_inserter(*m));
+      captures(
+          CapturedRange{totalStart, totalEnd},
+          llvh::makeArrayRef(state.capturedRanges_.data(), markedCount));
     }
     return MatchRuntimeResult::Match;
   }
@@ -1694,11 +1873,11 @@ MatchRuntimeResult searchWithBytecode(
     const char16_t *first,
     uint32_t start,
     uint32_t length,
-    std::vector<CapturedRange> *m,
+    CaptureRangeSink captures,
     constants::MatchFlagType matchFlags,
     StackOverflowGuard guard) {
   return searchWithBytecodeImpl<char16_t, UTF16RegexTraits>(
-      bytecode, first, start, length, m, matchFlags, guard);
+      bytecode, first, start, length, captures, matchFlags, guard);
 }
 
 MatchRuntimeResult searchWithBytecode(
@@ -1706,11 +1885,63 @@ MatchRuntimeResult searchWithBytecode(
     const char *first,
     uint32_t start,
     uint32_t length,
-    std::vector<CapturedRange> *m,
+    CaptureRangeSink captures,
     constants::MatchFlagType matchFlags,
     StackOverflowGuard guard) {
   return searchWithBytecodeImpl<char, ASCIIRegexTraits>(
-      bytecode, first, start, length, m, matchFlags, guard);
+      bytecode, first, start, length, captures, matchFlags, guard);
+}
+
+// Keep the vector interface for compiler and embedding callers. The VM writes
+// directly into its own range representation through the sink overload.
+template <typename CharT>
+static MatchRuntimeResult searchWithVectorOutput(
+    llvh::ArrayRef<uint8_t> bytecode,
+    const CharT *first,
+    uint32_t start,
+    uint32_t length,
+    std::vector<CapturedRange> *output,
+    constants::MatchFlagType matchFlags,
+    StackOverflowGuard guard) {
+  auto write = [output](
+                   CapturedRange full, llvh::ArrayRef<CapturedRange> captures) {
+    output->clear();
+    output->reserve(captures.size() + 1);
+    output->push_back(full);
+    output->insert(output->end(), captures.begin(), captures.end());
+  };
+  return searchWithBytecode(
+      bytecode,
+      first,
+      start,
+      length,
+      output ? CaptureRangeSink{write} : CaptureRangeSink{},
+      matchFlags,
+      guard);
+}
+
+MatchRuntimeResult searchWithBytecode(
+    llvh::ArrayRef<uint8_t> bytecode,
+    const char16_t *first,
+    uint32_t start,
+    uint32_t length,
+    std::vector<CapturedRange> *output,
+    constants::MatchFlagType matchFlags,
+    StackOverflowGuard guard) {
+  return searchWithVectorOutput(
+      bytecode, first, start, length, output, matchFlags, guard);
+}
+
+MatchRuntimeResult searchWithBytecode(
+    llvh::ArrayRef<uint8_t> bytecode,
+    const char *first,
+    uint32_t start,
+    uint32_t length,
+    std::vector<CapturedRange> *output,
+    constants::MatchFlagType matchFlags,
+    StackOverflowGuard guard) {
+  return searchWithVectorOutput(
+      bytecode, first, start, length, output, matchFlags, guard);
 }
 
 } // namespace regex

@@ -6,6 +6,7 @@
 set(source_files
   RegexParser.cpp
   RegexSerialization.cpp
+  RegexAOT.cpp
   Executor.cpp
 )
 

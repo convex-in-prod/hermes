@@ -300,6 +300,8 @@ DEF_VALUE(GetNativeRuntimeInst, Instruction)
 DEF_VALUE(LazyCompilationDataInst, Instruction)
 DEF_VALUE(EvalCompilationDataInst, Instruction)
 
+DEF_VALUE(LIRTryFastRegExpInst, Instruction)
+
 // Don't undef these if this file is being included in ValueKinds.def, since
 // these macros are still used after the #include.
 #ifndef INCLUDED_FROM_VALUEKINDS

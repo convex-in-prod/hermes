@@ -131,7 +131,8 @@ struct BracketInsn : public Insn {
 };
 
 /// BracketICaseInsn is a variant of BracketInsn used when the ignoreCase flag
-/// is set. Character class tests (\w, \d, \s) canonicalize before matching.
+/// is set. Explicit ranges already contain their case equivalents. Character
+/// class tests (\w, \d, \s) canonicalize only in the Unicode variant.
 struct BracketICaseInsn : public BracketInsn {};
 
 /// U16BracketInsn is a variant of BracketInsn used in Unicode regular
@@ -180,8 +181,8 @@ struct WordBoundaryICaseInsn : public Insn {
 };
 
 /// Begin/EndMarkedSubexpression stores the index of the marked subexpression.
-/// Note that the first marked subexpression has index 1 (0 is reserved for
-/// the entire match).
+/// Capture indexes are zero-based. The executor publishes the entire match
+/// separately, before these captures in the external result.
 struct BeginMarkedSubexpressionInsn : public Insn {
   uint16_t mexp;
 };
@@ -296,7 +297,20 @@ struct RegexBytecodeHeader {
   MatchConstraintSet constraints;
 };
 
+/// Immutable fixed-width matcher data. Each term is a BracketInsn and its
+/// ranges; the opcode is always Bracket and needs no runtime dispatch. This is
+/// auxiliary compiler/runtime data, not part of the HBC bytecode format.
+struct SimpleRegexHeader {
+  uint8_t termCount;
+  uint8_t anchoredAtStart;
+  uint8_t anchoredAtEnd;
+  MatchConstraintSet constraints;
+};
+
 LLVM_PACKED_END;
+
+constexpr uint32_t kSimpleRegexMaxTerms = 16;
+constexpr uint32_t kSimpleRegexMaxRanges = 32;
 
 /// OpcodeFor<Instruction>::value is the opcode for the Instruction.
 template <typename Instruction>

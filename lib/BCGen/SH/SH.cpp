@@ -511,6 +511,13 @@ class SHNativeJSFunctionTable {
 struct ModuleGen {
   uint32_t nextComputedReadCacheIdx{0};
   uint32_t nextComputedWriteCacheIdx{0};
+  /// Bound auxiliary regex data even for modules with many literal sites.
+  static constexpr size_t kSimpleRegexModuleBudget = 64 * 1024;
+  size_t simpleRegexBytes{0};
+  /// Each compiled regexp is analyzed once, including rejected patterns. The
+  /// generation limits are shared by ordinary output and all bundle shards.
+  llvh::DenseMap<CompiledRegExp *, std::string> aotRegexNames;
+  std::string aotRegexSource;
   /// Table containing uniqued strings for the current module.
   SHStringTable stringTable{};
 
@@ -1928,36 +1935,106 @@ class InstrGen {
   void generateDebuggerInst(DebuggerInst &inst) {
     hermes_fatal("DebuggerInst should have been deleted.");
   }
-  void generateCreateRegExpInst(CreateRegExpInst &inst) {
-    os_.indent(2);
+  void generateLIRTryFastRegExpInst(LIRTryFastRegExpInst &inst) {
+    auto &regexp = F_.getContext().getCompiledRegExp(
+        inst.getPattern()->getValue().getUnderlyingPointer(),
+        inst.getFlags()->getValue().getUnderlyingPointer());
+    auto descriptor = regexp.compileSimpleRegex();
+    assert(descriptor && "Lowering must prove the descriptor shape");
+    if (descriptor->size() >
+        ModuleGen::kSimpleRegexModuleBudget - moduleGen_.simpleRegexBytes) {
+      // Keep the existing module data bound, including outlined fragments.
+      // Undefined selects the original expression already retained in the IR.
+      os_ << "  ";
+      generateValue(inst);
+      os_ << " = _sh_ljs_undefined();\n";
+      return;
+    }
+    moduleGen_.simpleRegexBytes += descriptor->size();
+    os_ << "  {\n    static const uint8_t regexp_term[] = {";
+    for (uint8_t byte : *descriptor)
+      os_ << (unsigned)byte << ',';
+    os_ << "};\n    ";
+    generateValue(inst);
+    os_ << " = _sh_ljs_try_fast_regexp(shr, regexp_term, "
+        << inst.getOperation() << ", ";
+    generateRegisterPtr(*inst.getInput());
+    os_ << ", ";
+    generateRegisterPtr(*inst.getIndex());
+    os_ << ");\n  }\n";
+  }
 
+  void generateCreateRegExpInst(CreateRegExpInst &inst) {
     uint32_t patternStrID =
         moduleGen_.stringTable.add(inst.getPattern()->getValue().str());
     uint32_t flagsStrID =
         moduleGen_.stringTable.add(inst.getFlags()->getValue().str());
+    auto &regexp = F_.getContext().getCompiledRegExp(
+        inst.getPattern()->getValue().getUnderlyingPointer(),
+        inst.getFlags()->getValue().getUnderlyingPointer());
 
-    // Compile the regexp. We expect this to succeed because the AST went
-    // through the SemanticValidator. This is a bit of a hack: what we would
-    // really like to do is have the Parser emit a CompiledRegExp that can be
-    // threaded through the AST and then through the IR to this instruction
-    // selection, but that is too awkward, so we compile again here.
-    // uint32_t reBytecodeID = UINT32_MAX;
-    // if (auto regexp = CompiledRegExp::tryCompile(
-    //         inst.getPattern()->getValue().str(),
-    //         inst.getFlags()->getValue().str())) {
-    //   reBytecodeID = moduleGen_.regexpTable.addRegExp(std::move(*regexp));
-    // }
-
-    // TODO(T132343328): Compile the regexp bytecode ahead of time.
+    // Keep literal data with the instruction so ordinary C output, bundles and
+    // outlined fragments share the same path. IRGen separately initializes named
+    // capture groups. Runtime evaluation must still allocate a fresh RegExp.
+    os_ << "  {\n    static const uint8_t regexp_bytecode[] = {";
+    for (uint8_t byte : regexp.getBytecode())
+      os_ << (unsigned)byte << ',';
+    os_ << "};\n";
+    constexpr size_t kAOTRegexModuleBudget = 512 * 1024;
+    constexpr size_t kAOTRegexAnalysisLimit = 256;
+    auto aot = moduleGen_.aotRegexNames.find(&regexp);
+    if (aot == moduleGen_.aotRegexNames.end() &&
+        moduleGen_.aotRegexNames.size() < kAOTRegexAnalysisLimit &&
+        moduleGen_.aotRegexSource.size() < kAOTRegexModuleBudget) {
+      std::string name =
+          ("sh_regex_" + options_.unitName + "_" +
+           std::to_string(moduleGen_.aotRegexNames.size())).str();
+      auto source = regexp.compileAOTRegex(name);
+      if (source &&
+          source->size() <=
+              kAOTRegexModuleBudget - moduleGen_.aotRegexSource.size()) {
+        moduleGen_.aotRegexSource += *source;
+      } else {
+        name.clear();
+      }
+      aot = moduleGen_.aotRegexNames.insert({&regexp, std::move(name)}).first;
+    }
+    const bool hasAOT =
+        aot != moduleGen_.aotRegexNames.end() && !aot->second.empty();
+    auto simpleRegex = hasAOT ? llvh::None : regexp.compileSimpleRegex();
+    if (simpleRegex &&
+        simpleRegex->size() >
+            ModuleGen::kSimpleRegexModuleBudget - moduleGen_.simpleRegexBytes)
+      simpleRegex = llvh::None;
+    if (simpleRegex) {
+      moduleGen_.simpleRegexBytes += simpleRegex->size();
+      os_ << "    static const uint8_t regexp_simple[] = {";
+      for (uint8_t byte : *simpleRegex)
+        os_ << (unsigned)byte << ',';
+      os_ << "};\n";
+    }
+    if (hasAOT) {
+      // Block declarations work in outlined instruction fragments too. Bodies
+      // are emitted once in unit data, linked into the same native/Wasm module.
+      os_ << "    extern HERMES_REGEX_AOT_HIDDEN int32_t " << aot->second
+          << "(const void *, uint32_t, uint32_t, uint32_t, uint32_t *);\n";
+    }
+    os_ << "    ";
     generateValue(inst);
-    os_ << " = ";
-    os_ << "_sh_ljs_create_regexp(shr, ";
+    os_ << " = " << ((simpleRegex || hasAOT)
+                        ? "_sh_ljs_create_regexp_specialized(shr, "
+                        : "_sh_ljs_create_regexp_precompiled(shr, ");
     os_ << (options_.emitCBundle ? "shUnit->symbols[" : "get_symbols(shUnit)[")
         << patternStrID << ']';
     os_ << ", ";
     os_ << (options_.emitCBundle ? "shUnit->symbols[" : "get_symbols(shUnit)[")
         << flagsStrID << ']';
-    os_ << ");\n";
+    os_ << ", regexp_bytecode, sizeof(regexp_bytecode)";
+    if (simpleRegex)
+      os_ << ", regexp_simple, NULL";
+    else if (hasAOT)
+      os_ << ", NULL, " << aot->second;
+    os_ << ");\n  }\n";
   }
   void generateTryEndInst(TryEndInst &inst) {
     // Restore the tryState to the state of the Try enclosing the catch.
@@ -2809,6 +2886,8 @@ bool lowerModuleIR(Module *M, bool optimize) {
   // needs to run before LowerBuiltinCalls because it introduces calls to
   // HermesInternal.
   PM.addPass(sh::createPeepholeLowering(optimize));
+  if (optimize)
+    PM.addPass(sh::createRegExpLowering());
   // LowerBuiltinCalls needs to run before the rest of the lowering.
   PM.addPass(createLowerBuiltinCalls());
   PM.addPass(new LowerNumericProperties());
@@ -3237,6 +3316,7 @@ void generateUnitData(
     uint32_t nextReadCacheIdx,
     uint32_t nextPrivateNameCacheIdx,
     const BytecodeGenerationOptions &options) {
+  OS << moduleGen.aotRegexSource;
   if (options.emitCBundle) {
     OS << "SH_BUNDLE_HIDDEN uint32_t ";
     moduleGen.nativeFunctionTable.generateUnitIndexLabel(OS);

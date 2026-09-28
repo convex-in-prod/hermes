@@ -23,6 +23,10 @@ enum class CaseConversion { ToUpper, ToLower };
 /// rules exactly, so it has no separate enumerator.
 enum class CaseLocale { Root, Turkish, Lithuanian };
 
+/// Whether this BMP code unit is unchanged by root lowercasing in every
+/// context. Surrogates decline: a pair may denote a cased supplementary letter.
+bool isUnchangedLowercaseCodeUnit(char16_t character);
+
 /// Convert \p buf to \p targetCase in place, applying the full Unicode case
 /// mappings and the conditional rules for \p locale.
 ///

@@ -1806,6 +1806,14 @@ bool Verifier::visitLIRDeadValueInst(const LIRDeadValueInst &Inst) {
   return true;
 }
 
+bool Verifier::visitLIRTryFastRegExpInst(const LIRTryFastRegExpInst &Inst) {
+  Assert(Inst.getNumOperands() == 5, "Invalid regexp operation operands");
+  Assert(llvh::isa<LiteralString>(Inst.getOperand(0)), "Expected pattern");
+  Assert(llvh::isa<LiteralString>(Inst.getOperand(1)), "Expected flags");
+  Assert(llvh::isa<LiteralNumber>(Inst.getOperand(2)), "Expected operation");
+  return true;
+}
+
 bool Verifier::visitNativeCallInst(const hermes::NativeCallInst &Inst) {
   // FIXM: this should be added when types are propagated.
   //  Assert(

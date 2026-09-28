@@ -35,6 +35,7 @@ enum MatchFlagType {
   matchDefault = 0,
 
   /// ^ anchors should not treat the input start as a line start.
+  /// Currently ignored by the bytecode executor and both specialization tiers.
   matchNotBeginningOfLine = 1 << 0,
 
   /// $ anchors should not treat the input end as a line end.

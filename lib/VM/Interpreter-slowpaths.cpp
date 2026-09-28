@@ -623,7 +623,13 @@ PseudoHandle<JSRegExp> Interpreter::createRegExp(
   lv.pattern = runtime.getStringPrimFromSymbolID(patternID);
   lv.flags = runtime.getStringPrimFromSymbolID(flagsID);
   auto bytecode = runtimeModule->getRegExpBytecodeFromRegExpID(regexpID);
-  JSRegExp::initialize(lv.re, runtime, lv.pattern, lv.flags, bytecode);
+  JSRegExp::initialize(
+      lv.re,
+      runtime,
+      lv.pattern,
+      lv.flags,
+      bytecode,
+      JSRegExp::BytecodeOwnership::Copy);
 
   return createPseudoHandle(*lv.re);
 }
