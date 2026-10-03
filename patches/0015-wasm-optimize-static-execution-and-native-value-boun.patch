@@ -1,0 +1,898 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Mon, 28 Sep 2026 11:25:34 +0800
+Subject: [PATCH 15/15] wasm: optimize static execution and native value
+ boundaries
+
+Expose a native UTF-8 string writer to Static Hermes extern calls and
+allow Hermes string values as native arguments. Snapshot own enumerable
+entries without JavaScript pair-array allocation, preserving getter and
+proxy order.
+
+Construct decoded objects using bounded runtime-local shape templates and
+dense arrays through native slots. Keep templates rooted and independent
+of document values; use general own-property definitions for indexed or
+duplicate keys and mutable dictionary shapes. Add native descriptor
+snapshots that compare data, accessors, symbols, prototypes and flags
+without constructing descriptor objects or invoking accessors.
+
+Emit compiled regex literal bytecode in Static Hermes C output while
+creating fresh RegExp objects and retaining named-group initialization.
+Add selective static recognition of original Math methods, excluding
+random, and lower numeric imul to unsigned modulo-32-bit multiplication.
+Other operands retain JavaScript coercion through the builtin call.
+
+Validate object isolation and GC roots, descriptor mutations and SameValue
+semantics, regex identity and state, numeric conversions, preserved host
+replacements, and emitted native helper calls.
+---
+ API/hermes/hermes.cpp                      | 267 +++++++++++++++++++++
+ API/hermes/hermes.h                        |  26 ++
+ include/hermes/AST/Context.h               |   3 +
+ include/hermes/VM/static_h.h               |  25 ++
+ lib/BCGen/SH/SH.cpp                        |  51 ++--
+ lib/CompilerDriver/CompilerDriver.cpp      |   7 +
+ lib/Optimizer/Scalar/LowerBuiltinCalls.cpp |  10 +-
+ lib/Sema/FlowChecker-expr.cpp              |   2 +-
+ lib/VM/StaticH.cpp                         |  51 ++++
+ test/shermes/ffi/string_write_utf8.js      |  38 +++
+ test/shermes/native-literal-builtins.js    |  43 ++++
+ tools/shermes/shermes.cpp                  |   7 +
+ unittests/API/APITest.cpp                  |  77 ++++++
+ 13 files changed, 585 insertions(+), 22 deletions(-)
+ create mode 100644 test/shermes/ffi/string_write_utf8.js
+ create mode 100644 test/shermes/native-literal-builtins.js
+
+diff --git a/API/hermes/hermes.cpp b/API/hermes/hermes.cpp
+index d401e00890343c3659d4107249376b3c6aec26a8..ada61ab20957b7049fe852a3a7cd3301522e4613 100644
+--- a/API/hermes/hermes.cpp
++++ b/API/hermes/hermes.cpp
+@@ -32,11 +32,14 @@
+ #include "hermes/VM/JSArrayBuffer.h"
+ #include "hermes/VM/JSError.h"
+ #include "hermes/VM/JSLib.h"
++#include "../../lib/VM/JSLib/Object.h"
+ #include "hermes/VM/JSLib/JSLibStorage.h"
+ #include "hermes/VM/JSLib/RuntimeJSONParse.h"
++#include "hermes/VM/JSProxy.h"
+ #include "hermes/VM/JSTypedArray.h"
+ #include "hermes/VM/NativeState.h"
+ #include "hermes/VM/Operations.h"
++#include "hermes/VM/PropertyAccessor.h"
+ #include "hermes/VM/Profiler/CodeCoverageProfiler.h"
+ #include "hermes/VM/Profiler/SamplingProfiler.h"
+ #include "hermes/VM/Runtime.h"
+@@ -392,6 +395,7 @@ class HermesRuntimeImpl final : public HermesRuntime,
+ 
+  public:
+   ~HermesRuntimeImpl() override {
++    objectShapeCache_.clear();
+ #ifdef HERMES_ENABLE_DEBUGGER
+     // Deallocate the debugger so it frees any HermesPointerValues it may hold.
+     // This must be done before we check hermesValues_ below.
+@@ -881,6 +885,14 @@ class HermesRuntimeImpl final : public HermesRuntime,
+   bool isHostObject(const jsi::Object &) const override;
+   bool isHostFunction(const jsi::Function &) const override;
+   jsi::Array getPropertyNames(const jsi::Object &) override;
++  std::vector<std::pair<jsi::String, jsi::Value>> getOwnEnumerableEntries(
++      const jsi::Object &) override;
++
++  jsi::Object createObjectWithProperties(
++      const std::vector<std::pair<std::string, jsi::Value>> &) override;
++  jsi::Array createArrayWithValues(const std::vector<jsi::Value> &) override;
++  std::function<bool()> createOwnPropertyValidator(
++      const jsi::Object &, const jsi::Array &, bool) override;
+ 
+   void setPrototypeOf(const jsi::Object &object, const jsi::Value &prototype)
+       override;
+@@ -1388,6 +1400,9 @@ class HermesRuntimeImpl final : public HermesRuntime,
+   void *getVMRuntimeUnsafe() const override;
+   size_t rootsListLengthForTests() const override;
+ 
++  // Templates hold no document values and are never exposed to JavaScript.
++  // JSI roots keep their classes and property identifiers alive through GC.
++  std::unordered_map<std::string, jsi::Object> objectShapeCache_;
+   ManagedValues<vm::PinnedHermesValue> hermesValues_;
+   ManagedValues<vm::WeakRoot<vm::JSObject>> weakHermesValues_;
+   std::shared_ptr<::hermes::vm::Runtime> rt_;
+@@ -3064,6 +3079,258 @@ jsi::Array HermesRuntimeImpl::getPropertyNames(const jsi::Object &obj) {
+   return ret;
+ }
+ 
++jsi::Object HermesRuntimeImpl::createObjectWithProperties(
++    const std::vector<std::pair<std::string, jsi::Value>> &properties) {
++  ExecutionScopeRAII scopeRAII(mutatorScope);
++  vm::GCScope gcScope(runtime_);
++  // Bound retained key bytes and slots independently of application schemas.
++  bool cacheable = properties.size() <= 128;
++  std::string shapeKey;
++  for (const auto &property : properties) {
++    const auto &key = property.first;
++    if (shapeKey.size() + key.size() + 12 > 8192 ||
++        (!key.empty() && key[0] >= '0' && key[0] <= '9')) {
++      cacheable = false;
++      break;
++    }
++    shapeKey += std::to_string(key.size());
++    shapeKey += ':';
++    shapeKey += key;
++  }
++  auto cached = cacheable ? objectShapeCache_.find(shapeKey)
++                          : objectShapeCache_.end();
++  if (cached != objectShapeCache_.end()) {
++    auto clazz = runtime_.makeHandle(handle(cached->second)->getClassGCPtr());
++    auto result = runtime_.makeHandle(vm::JSObject::create(
++        runtime_, vm::Handle<vm::JSObject>::vmcast(&runtime_.objectPrototype),
++        clazz));
++    for (size_t i = 0; i < properties.size(); ++i) {
++      auto value = vm::SmallHermesValue::encodeHermesValue(
++          hvFromValue(properties[i].second), runtime_);
++      vm::JSObject::setNamedSlotValueUnsafe(*result, runtime_, i, value);
++    }
++    return add<jsi::Object>(result.getHermesValue());
++  }
++
++  auto result = runtime_.makeHandle(vm::JSObject::create(runtime_));
++  auto marker = gcScope.createMarker();
++  for (const auto &property : properties) {
++    gcScope.flushToMarker(marker);
++    auto key = createStringFromUtf8(
++        reinterpret_cast<const uint8_t *>(property.first.data()),
++        property.first.size());
++    vm::DefinePropertyFlags flags{};
++    flags.setValue = flags.setWritable = flags.setEnumerable =
++        flags.setConfigurable = true;
++    flags.writable = flags.enumerable = flags.configurable = true;
++    auto status = vm::JSObject::defineOwnComputedPrimitive(
++        result, runtime_, stringHandle(key), flags,
++        runtime_.makeHandle(hvFromValue(property.second)),
++        vm::PropOpFlags().plusThrowOnError());
++    checkStatus(status.getStatus());
++  }
++  auto clazz = runtime_.makeHandle(result->getClassGCPtr());
++  // Indexed keys, duplicates and mutable dictionary classes use the normal
++  // definition path. Sharing a dictionary class would corrupt other objects.
++  if (cacheable && !clazz->isDictionary() &&
++      clazz->getNumProperties() == properties.size()) {
++    auto shape = runtime_.makeHandle(vm::JSObject::create(
++        runtime_, vm::Handle<vm::JSObject>::vmcast(&runtime_.objectPrototype),
++        clazz));
++    for (size_t i = 0; i < properties.size(); ++i)
++      vm::JSObject::setNamedSlotValueUnsafe(
++          *shape, runtime_, i, vm::SmallHermesValue::encodeUndefinedValue());
++    if (objectShapeCache_.size() == 64)
++      objectShapeCache_.clear();
++    objectShapeCache_.emplace(std::move(shapeKey),
++                             add<jsi::Object>(shape.getHermesValue()));
++  }
++  return add<jsi::Object>(result.getHermesValue());
++}
++
++jsi::Array HermesRuntimeImpl::createArrayWithValues(
++    const std::vector<jsi::Value> &values) {
++  ExecutionScopeRAII scopeRAII(mutatorScope);
++  vm::GCScope gcScope(runtime_);
++  auto created = vm::JSArray::create(runtime_, values.size(), values.size());
++  checkStatus(created.getStatus());
++  auto result = runtime_.makeHandle(std::move(*created));
++  for (size_t i = 0; i < values.size(); ++i) {
++    auto value = vm::SmallHermesValue::encodeHermesValue(
++        hvFromValue(values[i]), runtime_);
++    vm::JSArray::unsafeSetExistingElementAt(*result, runtime_, i, value);
++  }
++  return add<jsi::Array>(result.getHermesValue());
++}
++
++std::function<bool()> HermesRuntimeImpl::createOwnPropertyValidator(
++    const jsi::Object &object,
++    const jsi::Array &keys,
++    bool allowAdditionalProperties) {
++  ExecutionScopeRAII scopeRAII(mutatorScope);
++  vm::GCScope gcScope(runtime_);
++  auto target = handle(object);
++  if (target->isProxyObject() || target->isHostObject())
++    throw jsi::JSINativeException("Descriptor snapshots require ordinary objects");
++
++  struct Property {
++    jsi::Value key;
++    vm::PropertyFlags flags;
++    jsi::Value value;
++    jsi::Value setter;
++  };
++  struct Snapshot {
++    jsi::Object object;
++    jsi::Value prototype;
++    bool extensible;
++    std::vector<Property> properties;
++  };
++  auto snapshot = std::make_shared<Snapshot>(Snapshot{
++      jsi::Value(*this, object).asObject(*this), getPrototypeOf(object),
++      target->isExtensible(), {}});
++  const size_t count = keys.size(*this);
++  snapshot->properties.reserve(count);
++  auto marker = gcScope.createMarker();
++  for (size_t i = 0; i < count; ++i) {
++    gcScope.flushToMarker(marker);
++    auto key = keys.getValueAtIndex(*this, i);
++    if (!key.isString() && !key.isSymbol())
++      throw jsi::JSINativeException("Descriptor key must be a string or symbol");
++    vm::ComputedPropertyDescriptor desc;
++    auto value = runtime_.makeMutableHandle(vm::HermesValue::encodeUndefinedValue());
++    auto status = vm::JSObject::getOwnComputedDescriptor(
++        target, runtime_, runtime_.makeHandle(hvFromValue(key)), desc, value);
++    checkStatus(status.getStatus());
++    if (!*status)
++      throw jsi::JSINativeException("Descriptor snapshot property is missing");
++    jsi::Value savedValue;
++    jsi::Value savedSetter;
++    if (desc.flags.accessor) {
++      auto accessor = runtime_.makeHandle(
++          vm::vmcast<vm::PropertyAccessor>(value.getHermesValue()));
++      savedValue = accessor->getter
++          ? valueFromHermesValue(vm::HermesValue::encodeObjectValue(
++                accessor->getter.get(runtime_))) : jsi::Value::undefined();
++      savedSetter = accessor->setter
++          ? valueFromHermesValue(vm::HermesValue::encodeObjectValue(
++                accessor->setter.get(runtime_))) : jsi::Value::undefined();
++    } else {
++      savedValue = valueFromHermesValue(value.getHermesValue());
++    }
++    snapshot->properties.push_back(Property{
++        std::move(key), desc.flags, std::move(savedValue), std::move(savedSetter)});
++  }
++  return [this, snapshot, allowAdditionalProperties]() {
++    ExecutionScopeRAII scopeRAII(mutatorScope);
++    vm::GCScope gcScope(runtime_);
++    auto target = handle(snapshot->object);
++    if (target->isExtensible() != snapshot->extensible ||
++        !vm::isSameValue(hvFromValue(getPrototypeOf(snapshot->object)),
++                         hvFromValue(snapshot->prototype)))
++      return false;
++    if (!allowAdditionalProperties) {
++      size_t count = 0;
++      vm::JSObject::forEachOwnPropertyWhile(
++          target, runtime_,
++          [&count](vm::Runtime &, uint32_t,
++                   const vm::ComputedPropertyDescriptor &) {
++            ++count;
++            return true;
++          },
++          [&count](vm::Runtime &, vm::SymbolID id,
++                   const vm::NamedPropertyDescriptor &desc) {
++            if (!desc.flags.privateName &&
++                (vm::isPropertyNamePrimitive(id) || vm::isSymbolPrimitive(id)))
++              ++count;
++            return true;
++          });
++      if (count != snapshot->properties.size())
++        return false;
++    }
++    auto marker = gcScope.createMarker();
++    for (const auto &property : snapshot->properties) {
++      gcScope.flushToMarker(marker);
++      vm::ComputedPropertyDescriptor desc;
++      auto value = runtime_.makeMutableHandle(vm::HermesValue::encodeUndefinedValue());
++      auto status = vm::JSObject::getOwnComputedDescriptor(
++          target, runtime_, runtime_.makeHandle(hvFromValue(property.key)),
++          desc, value);
++      checkStatus(status.getStatus());
++      if (!*status || desc.flags.enumerable != property.flags.enumerable ||
++          desc.flags.configurable != property.flags.configurable ||
++          desc.flags.accessor != property.flags.accessor)
++        return false;
++      if (desc.flags.accessor) {
++        auto accessor = vm::vmcast<vm::PropertyAccessor>(value.getHermesValue());
++        auto getter = accessor->getter
++            ? vm::HermesValue::encodeObjectValue(accessor->getter.get(runtime_))
++            : vm::HermesValue::encodeUndefinedValue();
++        auto setter = accessor->setter
++            ? vm::HermesValue::encodeObjectValue(accessor->setter.get(runtime_))
++            : vm::HermesValue::encodeUndefinedValue();
++        if (!vm::isSameValue(getter, hvFromValue(property.value)) ||
++            !vm::isSameValue(setter, hvFromValue(property.setter)))
++          return false;
++      } else if (desc.flags.writable != property.flags.writable ||
++                 !vm::isSameValue(value.getHermesValue(),
++                                  hvFromValue(property.value))) {
++        return false;
++      }
++    }
++    return true;
++  };
++}
++
++std::vector<std::pair<jsi::String, jsi::Value>>
++HermesRuntimeImpl::getOwnEnumerableEntries(const jsi::Object &obj) {
++  ExecutionScopeRAII scopeRAII(mutatorScope);
++  vm::GCScope gcScope(runtime_);
++  auto object = handle(obj);
++  auto names_result = vm::getOwnPropertyKeysAsStrings(
++      object,
++      runtime_,
++      vm::OwnKeysFlags().plusIncludeNonSymbols().setIncludeNonEnumerable(
++          object->isProxyObject()));
++  checkStatus(names_result.getStatus());
++  vm::Handle<vm::JSArray> names =
++      runtime_.makeHandle(vm::vmcast<vm::JSArray>(*names_result));
++  const uint32_t length = vm::JSArray::getLength(*names, runtime_);
++  std::vector<std::pair<jsi::String, jsi::Value>> entries;
++  entries.reserve(length);
++  auto marker = gcScope.createMarker();
++  for (uint32_t index = 0; index < length; ++index) {
++    gcScope.flushToMarker(marker);
++    auto name = runtime_.makeHandle(names->at(runtime_, index).getString(runtime_));
++    vm::ComputedPropertyDescriptor descriptor;
++    auto descriptor_result = vm::JSObject::getOwnComputedPrimitiveDescriptor(
++        object, runtime_, name, vm::JSObject::IgnoreProxy::Yes, descriptor);
++    checkStatus(descriptor_result.getStatus());
++
++    jsi::Value value;
++    if (*descriptor_result && descriptor.flags.enumerable) {
++      auto value_result = vm::JSObject::getComputedPropertyValueInternal_RJS(
++          object, runtime_, object, descriptor);
++      checkStatus(value_result.getStatus());
++      value = valueFromHermesValue(value_result->get());
++    } else if (!object->isProxyObject()) {
++      continue;
++    } else {
++      descriptor_result =
++          vm::JSProxy::getOwnProperty(object, runtime_, name, descriptor, nullptr);
++      checkStatus(descriptor_result.getStatus());
++      if (!*descriptor_result || !descriptor.flags.enumerable) {
++        continue;
++      }
++      auto value_result = vm::JSProxy::getComputed(object, runtime_, name, object);
++      checkStatus(value_result.getStatus());
++      value = valueFromHermesValue(value_result->get());
++    }
++    auto key = valueFromHermesValue(name.getHermesValue()).asString(*this);
++    entries.emplace_back(std::move(key), std::move(value));
++  }
++  return entries;
++}
++
+ jsi::WeakObject HermesRuntimeImpl::createWeakObject(const jsi::Object &obj) {
+   ExecutionScopeRAII scopeRAII(mutatorScope);
+   return addWeak(
+diff --git a/API/hermes/hermes.h b/API/hermes/hermes.h
+index 1a66be931c50da1e83e283617575b2c3bdcdb0d1..f013dfa3e3b83f3dc5c9747b374d416fb0b438c7 100644
+--- a/API/hermes/hermes.h
++++ b/API/hermes/hermes.h
+@@ -13,6 +13,8 @@
+ #include <memory>
+ #include <ostream>
+ #include <string>
++#include <utility>
++#include <vector>
+ 
+ #include <hermes/Public/HermesExport.h>
+ #include <hermes/Public/RuntimeConfig.h>
+@@ -205,6 +207,30 @@ class HermesRuntime : public jsi::Runtime,
+   ~HermesRuntime() override = default;
+ 
+   using jsi::Runtime::castInterface;
++
++  /// Snapshot own enumerable string properties in Object.entries order without
++  /// allocating an entries array and pair arrays in the JavaScript heap.
++  /// Getters and proxy traps run in the same order as Object.entries.
++  virtual std::vector<std::pair<jsi::String, jsi::Value>>
++  getOwnEnumerableEntries(const jsi::Object &object) = 0;
++
++  /// Construct ordinary own data properties, bypassing inherited setters.
++  /// Repeated small non-indexed shapes reuse runtime-local keys and slots.
++  virtual jsi::Object createObjectWithProperties(
++      const std::vector<std::pair<std::string, jsi::Value>> &properties) = 0;
++
++  /// Construct dense own array elements without property setters.
++  virtual jsi::Array createArrayWithValues(
++      const std::vector<jsi::Value> &values) = 0;
++
++  /// Capture descriptors without invoking accessors. The returned check must
++  /// not outlive this runtime. Extra keys are allowed only when requested.
++  /// Rejects proxies and host objects; intended for intrinsic state checks.
++  virtual std::function<bool()> createOwnPropertyValidator(
++      const jsi::Object &object,
++      const jsi::Array &keys,
++      bool allowAdditionalProperties) = 0;
++
+ };
+ 
+ /// Returns a pointer to an object that can be cast into IHermesRootAPI, which
+diff --git a/include/hermes/AST/Context.h b/include/hermes/AST/Context.h
+index 2d4f58dc62642a932d19c974f12d2cd9a0c76719..02d299887099cc5fba39e8b0668d848e2177d42e 100644
+--- a/include/hermes/AST/Context.h
++++ b/include/hermes/AST/Context.h
+@@ -72,6 +72,9 @@ struct OptimizationSettings {
+   /// into builtin calls.
+   bool staticBuiltins{false};
+ 
++  /// Assume Math methods other than random retain their original definitions.
++  bool staticMathBuiltins{false};
++
+   /// Attempt to resolve CommonJS require() calls at compile time.
+   bool staticRequire{false};
+ 
+diff --git a/include/hermes/VM/static_h.h b/include/hermes/VM/static_h.h
+index 13246ec2f260f05df9b71a8810ec1049faf179fd..5f4ab9197147724b1c8e730fa1efda5ffa2ae328 100644
+--- a/include/hermes/VM/static_h.h
++++ b/include/hermes/VM/static_h.h
+@@ -980,6 +980,13 @@ _sh_ljs_get_string(SHRuntime *shr, SHSymbolID symID);
+ SHERMES_EXPORT SHLegacyValue
+ _sh_ljs_create_regexp(SHRuntime *shr, SHSymbolID pattern, SHSymbolID flags);
+ 
++SHERMES_EXPORT SHLegacyValue _sh_ljs_create_regexp_precompiled(
++    SHRuntime *shr,
++    SHSymbolID pattern,
++    SHSymbolID flags,
++    const uint8_t *bytecode,
++    uint32_t bytecode_size);
++
+ /// \param value the string of the BigInt.
+ /// \param size  the size of the string \c value.
+ SHERMES_EXPORT SHLegacyValue
+@@ -1616,6 +1623,16 @@ static inline uint32_t _sh_to_uint32_double(double d) {
+   return (uint32_t)_sh_to_int32_double_slow_path(d);
+ }
+ 
++/// Math.imul for operands already known to be numbers.
++static inline SHLegacyValue _sh_ljs_imul_number(
++    SHLegacyValue a,
++    SHLegacyValue b) {
++  uint32_t product = _sh_to_uint32_double(_sh_ljs_get_double(a)) *
++      _sh_to_uint32_double(_sh_ljs_get_double(b));
++  return _sh_ljs_double(product <= INT32_MAX
++      ? (double)product : (double)product - 4294967296.0);
++}
++
+ /// Store a property into direct storage.
+ SHERMES_EXPORT void _sh_prstore_direct(
+     SHRuntime *shr,
+@@ -1877,6 +1894,14 @@ SHERMES_EXPORT int _sh_errno(void);
+ SHERMES_EXPORT SHLegacyValue
+ _sh_asciiz_to_string(SHRuntime *shr, const char *str, ptrdiff_t len);
+ 
++/// Write a JS string as UTF-8, replacing unpaired surrogates. Return the byte
++/// count, or -1 if the destination is too small.
++SHERMES_EXPORT ptrdiff_t _sh_string_write_utf8(
++    SHRuntime *shr,
++    SHLegacyValue value,
++    char *destination,
++    size_t capacity);
++
+ static inline void _sh_ptr_write_char(char *ptr, int offset, char c) {
+   ptr[offset] = c;
+ }
+diff --git a/lib/BCGen/SH/SH.cpp b/lib/BCGen/SH/SH.cpp
+index e030d709072f96cff72bec9ee8efa3fb820266d6..09569dc403c0d7982a3e71fab587db492c89c6fe 100644
+--- a/lib/BCGen/SH/SH.cpp
++++ b/lib/BCGen/SH/SH.cpp
+@@ -1881,35 +1881,30 @@ class InstrGen {
+     hermes_fatal("DebuggerInst should have been deleted.");
+   }
+   void generateCreateRegExpInst(CreateRegExpInst &inst) {
+-    os_.indent(2);
+-
+     uint32_t patternStrID =
+         moduleGen_.stringTable.add(inst.getPattern()->getValue().str());
+     uint32_t flagsStrID =
+         moduleGen_.stringTable.add(inst.getFlags()->getValue().str());
+-
+-    // Compile the regexp. We expect this to succeed because the AST went
+-    // through the SemanticValidator. This is a bit of a hack: what we would
+-    // really like to do is have the Parser emit a CompiledRegExp that can be
+-    // threaded through the AST and then through the IR to this instruction
+-    // selection, but that is too awkward, so we compile again here.
+-    // uint32_t reBytecodeID = UINT32_MAX;
+-    // if (auto regexp = CompiledRegExp::tryCompile(
+-    //         inst.getPattern()->getValue().str(),
+-    //         inst.getFlags()->getValue().str())) {
+-    //   reBytecodeID = moduleGen_.regexpTable.addRegExp(std::move(*regexp));
+-    // }
+-
+-    // TODO(T132343328): Compile the regexp bytecode ahead of time.
++    auto &regexp = F_.getContext().getCompiledRegExp(
++        inst.getPattern()->getValue().getUnderlyingPointer(),
++        inst.getFlags()->getValue().getUnderlyingPointer());
++
++    // Keep literal data with the instruction so ordinary C output, bundles and
++    // outlined fragments share the same path. IRGen separately initializes named
++    // capture groups. Runtime evaluation must still allocate a fresh RegExp.
++    os_ << "  {\n    static const uint8_t regexp_bytecode[] = {";
++    for (uint8_t byte : regexp.getBytecode())
++      os_ << (unsigned)byte << ',';
++    os_ << "};\n    ";
+     generateValue(inst);
+     os_ << " = ";
+-    os_ << "_sh_ljs_create_regexp(shr, ";
++    os_ << "_sh_ljs_create_regexp_precompiled(shr, ";
+     os_ << (options_.emitCBundle ? "shUnit->symbols[" : "get_symbols(shUnit)[")
+         << patternStrID << ']';
+     os_ << ", ";
+     os_ << (options_.emitCBundle ? "shUnit->symbols[" : "get_symbols(shUnit)[")
+         << flagsStrID << ']';
+-    os_ << ");\n";
++    os_ << ", regexp_bytecode, sizeof(regexp_bytecode));\n  }\n";
+   }
+   void generateTryEndInst(TryEndInst &inst) {
+     // Restore the tryState to the state of the Try enclosing the catch.
+@@ -2217,6 +2212,22 @@ class InstrGen {
+         << (uint32_t)inst.getBuiltinIndex() << ");\n";
+   }
+   void generateCallBuiltinInst(CallBuiltinInst &inst) {
++    if (inst.getBuiltinIndex() == BuiltinMethod::Math_imul &&
++        inst.getNumArguments() == 3 &&
++        inst.getArgument(1)->getType().isNumberType() &&
++        inst.getArgument(2)->getType().isNumberType()) {
++      os_.indent(2);
++      generateRegister(inst);
++      // Unsigned multiplication provides the specified modulo-2^32 result
++      // without C signed overflow. Convert the high half without an
++      // implementation-defined unsigned-to-signed cast.
++      os_ << " = _sh_ljs_imul_number(";
++      generateValue(*inst.getArgument(1));
++      os_ << ", ";
++      generateValue(*inst.getArgument(2));
++      os_ << ");\n";
++      return;
++    }
+     if (inst.getBuiltinIndex() == BuiltinMethod::Math_sqrt) {
+       if (inst.getNumArguments() == 2 &&
+           inst.getArgument(1)->getType().isNumberType()) {
+@@ -2703,6 +2714,10 @@ class InstrGen {
+   }
+   /// Convert a JS value to its corresponding native argument type.
+   void convertToNativeArg(NativeCType ctype, Value *arg) {
++    if (ctype == NativeCType::c_hermes_value) {
++      generateValue(*arg);
++      return;
++    }
+     MachineType mt = nativeContext_.md.mapCType(ctype);
+     const MachineDesc::MTD &mtd = nativeContext_.md.getMTD(mt);
+     int parens = 1;
+diff --git a/lib/CompilerDriver/CompilerDriver.cpp b/lib/CompilerDriver/CompilerDriver.cpp
+index 7cf6e64252b09ce93924136bff7db7add3597dd6..8b080a8b4ab0bfc9f45b05fe7b2a731b6f1c3541 100644
+--- a/lib/CompilerDriver/CompilerDriver.cpp
++++ b/lib/CompilerDriver/CompilerDriver.cpp
+@@ -193,6 +193,12 @@ cl::opt<StaticBuiltinSetting> StaticBuiltins(
+             "Automatically detect 'use static builtin' directive from the source.")),
+     cl::cat(CompilerCategory));
+ 
++cl::opt<bool> StaticMathBuiltins(
++    "fstatic-math-builtins",
++    cl::desc("Recognize original Math methods except random statically"),
++    cl::init(false),
++    cl::cat(CompilerCategory));
++
+ static list<std::string> CustomOptimize(
+     "Xcustom-opt",
+     desc("Custom optimzations"),
+@@ -1217,6 +1223,7 @@ std::shared_ptr<Context> createContext(
+   // parsing.
+   optimizationOpts.staticBuiltins =
+       cl::StaticBuiltins == cl::StaticBuiltinSetting::ForceOn;
++  optimizationOpts.staticMathBuiltins = cl::StaticMathBuiltins;
+   optimizationOpts.staticRequire = cl::StaticRequire;
+ 
+   optimizationOpts.useLegacyMem2Reg = cl::LegacyMem2Reg;
+diff --git a/lib/Optimizer/Scalar/LowerBuiltinCalls.cpp b/lib/Optimizer/Scalar/LowerBuiltinCalls.cpp
+index 065e083154ac7b278a2d9fb7879112312d57db45..e9e44477baaf466f12c143d4fae54ae4c7ecaa3f 100644
+--- a/lib/Optimizer/Scalar/LowerBuiltinCalls.cpp
++++ b/lib/Optimizer/Scalar/LowerBuiltinCalls.cpp
+@@ -158,10 +158,14 @@ static bool tryLowerStaticBuiltin(
+       llvh::dbgs() << "Found builtin [" << (int)*builtinIndex << "] "
+                    << getBuiltinMethodName(*builtinIndex) << "()\n");
+ 
+-  // Always lower HermesInternal.xxx() calls, but only lower the rest if
+-  // -fstatic-builtins is enabled.
++  // Embedders may replace random without replacing the deterministic Math
++  // methods. Keep that narrower contract separate from all-static builtins.
++  const auto &settings = F->getContext().getOptimizationSettings();
++  const bool staticMath = settings.staticMathBuiltins &&
++      objLit->getValue().str() == "Math" &&
++      propLit->getValue().str() != "random";
+   if (objLit->getValue() != builtins.hermesInternalID &&
+-      !F->getContext().getOptimizationSettings().staticBuiltins) {
++      !settings.staticBuiltins && !staticMath) {
+     return false;
+   }
+ 
+diff --git a/lib/Sema/FlowChecker-expr.cpp b/lib/Sema/FlowChecker-expr.cpp
+index da432ba756ec3e7a3faa4daf4a564e9bfe951fa6..603f366ef682895b4fb2b8fdc005249c5703c22f 100644
+--- a/lib/Sema/FlowChecker-expr.cpp
++++ b/lib/Sema/FlowChecker-expr.cpp
+@@ -3112,7 +3112,7 @@ class FlowChecker::ExprVisitor {
+       NativeCType natParamType;
+       if (!parseNativeAnnotation(
+               llvh::cast<ESTree::TypeAnnotationNode>(param->_typeAnnotation),
+-              false,
++              allowHVOption,
+               &natParamType))
+         return;
+       natParamTypes.push_back(natParamType);
+diff --git a/lib/VM/StaticH.cpp b/lib/VM/StaticH.cpp
+index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..fd69d540eda66b08b6708fa72ba1f3c6a863234f 100644
+--- a/lib/VM/StaticH.cpp
++++ b/lib/VM/StaticH.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include "SHUnitExt.h"
+ #include "hermes/BCGen/SerializedLiteralParser.h"
++#include "hermes/Support/UTF8.h"
+ #include "hermes/VM/ArrayStorage.h"
+ #include "hermes/VM/Callable.h"
+ #include "hermes/VM/FastArray.h"
+@@ -25,10 +26,12 @@
+ #include "hermes/VM/StackFrame-inline.h"
+ #include "hermes/VM/StaticHUtils.h"
+ #include "hermes/VM/StringBuilder.h"
++#include "hermes/VM/StringPrimitive.h"
+ 
+ #include "JSLib/JSLibInternal.h"
+ 
+ #include <cstdarg>
++#include <limits>
+ 
+ using namespace hermes;
+ using namespace hermes::vm;
+@@ -1792,6 +1795,25 @@ _sh_ljs_create_regexp(SHRuntime *shr, SHSymbolID pattern, SHSymbolID flags) {
+   return *cr;
+ }
+ 
++LLVM_ATTRIBUTE_NOINLINE
++extern "C" SHLegacyValue _sh_ljs_create_regexp_precompiled(
++    SHRuntime *shr,
++    SHSymbolID pattern,
++    SHSymbolID flags,
++    const uint8_t *bytecode,
++    uint32_t bytecodeSize) {
++  Runtime &runtime = getRuntime(shr);
++  GCScopeMarkerRAII marker{runtime};
++  Handle<JSRegExp> re = runtime.makeHandle(JSRegExp::create(runtime));
++  auto patternHandle = runtime.makeHandle(
++      runtime.getStringPrimFromSymbolID(SymbolID::unsafeCreate(pattern)));
++  auto flagsHandle = runtime.makeHandle(
++      runtime.getStringPrimFromSymbolID(SymbolID::unsafeCreate(flags)));
++  JSRegExp::initialize(
++      re, runtime, patternHandle, flagsHandle, {bytecode, bytecodeSize});
++  return re.getHermesValue();
++}
++
+ LLVM_ATTRIBUTE_NOINLINE
+ extern "C" SHLegacyValue
+ _sh_ljs_create_bigint(SHRuntime *shr, const uint8_t *value, uint32_t size) {
+@@ -2727,3 +2749,32 @@ _sh_asciiz_to_string(SHRuntime *shr, const char *str, ptrdiff_t len) {
+     _sh_throw_current(shr);
+   return *res;
+ }
++
++LLVM_ATTRIBUTE_NOINLINE
++extern "C" ptrdiff_t _sh_string_write_utf8(
++    SHRuntime *shr,
++    SHLegacyValue value,
++    char *destination,
++    size_t capacity) {
++  if (LLVM_UNLIKELY(!_sh_ljs_is_string(value))) {
++    _sh_throw_type_error_ascii(shr, "Expected a string");
++  }
++  // No allocation occurs while reading the string, so the raw pointer remains
++  // valid through the conversion without a guest-visible property lookup.
++  auto *string = vmcast<StringPrimitive>(*toPHV(&value));
++  const uint32_t length = string->getStringLength();
++  if (string->isASCII()) {
++    if (length > capacity)
++      return -1;
++    memcpy(destination, string->getStringRef<char>().data(), length);
++    return length;
++  }
++  auto [read, written] = convertUTF16ToUTF8BufferWithReplacements(
++      llvh::MutableArrayRef<uint8_t>(
++          reinterpret_cast<uint8_t *>(destination), capacity),
++      string->getStringRef<char16_t>());
++  if (read != length ||
++      written > static_cast<size_t>(std::numeric_limits<ptrdiff_t>::max()))
++    return -1;
++  return written;
++}
+diff --git a/test/shermes/ffi/string_write_utf8.js b/test/shermes/ffi/string_write_utf8.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..a9b0fbf317cd44e6d158d1885f766e235d0adbd6
+--- /dev/null
++++ b/test/shermes/ffi/string_write_utf8.js
+@@ -0,0 +1,38 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++// RUN: %shermes -typed -exec %s | %FileCheck --match-full-lines %s
++
++const malloc = $SHBuiltin.extern_c({include: "stdlib.h"},
++    function malloc(size: c_size_t): c_ptr { throw 0; });
++const free = $SHBuiltin.extern_c({include: "stdlib.h"},
++    function free(pointer: c_ptr): void {});
++const readByte = $SHBuiltin.extern_c({declared: true},
++    function _sh_ptr_read_uchar(pointer: c_ptr, offset: c_int): c_uchar { throw 0; });
++const writeUtf8 = $SHBuiltin.extern_c({declared: true, hv: true},
++    function _sh_string_write_utf8(
++        runtime: c_ptr,
++        value: string,
++        destination: c_ptr,
++        capacity: c_size_t): c_ptrdiff_t { throw 0; });
++
++const pointer = malloc(16);
++const bytes = [65, 195, 169, 240, 159, 152, 128, 239, 191, 189];
++const written = writeUtf8($SHBuiltin.c_native_runtime(), "Aé😀\ud800", pointer, 16);
++if (written !== bytes.length) throw new Error("UTF-8 length differs");
++for (let index = 0; index < bytes.length; index += 1) {
++    if (readByte(pointer, index) !== bytes[index]) throw new Error("UTF-8 byte differs");
++}
++print("encoded");
++// CHECK: encoded
++
++if (writeUtf8($SHBuiltin.c_native_runtime(), "é", pointer, 1) !== -1) {
++    throw new Error("short destination accepted");
++}
++print("bounded");
++// CHECK: bounded
++free(pointer);
+diff --git a/test/shermes/native-literal-builtins.js b/test/shermes/native-literal-builtins.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..52f3e73c2678a0fd83a60eb5c200e8de6fd9d473
+--- /dev/null
++++ b/test/shermes/native-literal-builtins.js
+@@ -0,0 +1,43 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++// RUN: %shermes -O -fstatic-math-builtins -exec %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -fstatic-math-builtins -emit-c -o %t.c %s
++// RUN: %FileCheck --check-prefix=C --input-file=%t.c %s
++
++function literal() {
++  "noinline";
++  return /(?<word>a+)\k<word>/gy;
++}
++var first = literal(), second = literal();
++print(first !== second, first.exec('aaaa').groups.word, first.lastIndex, second.lastIndex);
++// CHECK: true aa 4 0
++print(second.test('baaaa'), second.lastIndex);
++// CHECK-NEXT: false 0
++print(/\u{1F600}/u.test('\uD83D\uDE00'), /a/gi.flags);
++// CHECK-NEXT: true gi
++function numeric(a, b) {
++  "noinline";
++  return Math.imul(+a, +b);
++}
++print(numeric(-1, 5), numeric(0x80000000, -1), numeric(0xffffffff, 0xffffffff));
++// CHECK-NEXT: -5 -2147483648 1
++print(numeric(Infinity, 3), numeric(NaN, 4), numeric(-3.9, 2.8), numeric(4294967297, 3));
++// CHECK-NEXT: 0 0 -6 3
++var order = '';
++function generic(a, b) {
++  "noinline";
++  return Math.imul(a, b);
++}
++print(generic({valueOf() { order += 'a'; return 3; }}, {valueOf() {order += 'b'; return 4;}}), order);
++// CHECK-NEXT: 12 ab
++Math.random = () => 0.25;
++Date.now = () => 123;
++print(Math.random(), Date.now());
++// CHECK-NEXT: 0.25 123
++// C: _sh_ljs_create_regexp_precompiled
++// C: _sh_ljs_imul_number
+diff --git a/tools/shermes/shermes.cpp b/tools/shermes/shermes.cpp
+index 5db8804e8cddc6ec859f6260263f71956042f8ca..d2482518514f25a9c63b29fb31c297cd6055e103 100644
+--- a/tools/shermes/shermes.cpp
++++ b/tools/shermes/shermes.cpp
+@@ -218,6 +218,12 @@ cl::opt<bool> KeepTemp(
+     cl::desc("Keep temporary files made along the way (for debugging)"),
+     cl::cat(CompilerCategory));
+ 
++cl::opt<bool> StaticMathBuiltins(
++    "fstatic-math-builtins",
++    cl::desc("Recognize original Math methods except random statically"),
++    cl::init(false),
++    cl::cat(CompilerCategory));
++
+ cl::opt<StaticBuiltinSetting> StaticBuiltins(
+     cl::desc(
+         "recognizing of calls to global functions like Object.keys() statically"),
+@@ -643,6 +649,7 @@ std::shared_ptr<Context> createContext() {
+   // parsing.
+   optimizationOpts.staticBuiltins =
+       cli::StaticBuiltins == StaticBuiltinSetting::ForceOn;
++  optimizationOpts.staticMathBuiltins = cli::StaticMathBuiltins;
+ 
+   optimizationOpts.metroRequireOpt = cli::MetroRequireOpt;
+ 
+diff --git a/unittests/API/APITest.cpp b/unittests/API/APITest.cpp
+index aae9e34229d4d5e4f039d2505f24a718e47687c0..73d42e85625cde4ef44226173cc0d94b8ca9ed40 100644
+--- a/unittests/API/APITest.cpp
++++ b/unittests/API/APITest.cpp
+@@ -3694,3 +3694,80 @@ INSTANTIATE_TEST_CASE_P(
+     HermesRuntimeTest,
+     ::testing::ValuesIn(runtimeGenerators()));
+ } // namespace
++
++TEST(HermesNativeValuesTest, ObjectShapesAndOwnProperties) {
++  auto rt = makeHermesRuntime();
++  std::vector<std::pair<std::string, Value>> fields;
++  fields.emplace_back("name", String::createFromUtf8(*rt, "first"));
++  fields.emplace_back("__proto__", 42);
++  fields.emplace_back("nested", Object(*rt));
++  auto first = rt->createObjectWithProperties(fields);
++  rt->global().setProperty(*rt, "first", first);
++  rt->evaluateJavaScript(std::make_shared<StringBuffer>(
++      "delete first.name; first.extra = 9;"), "test");
++  rt->instrumentation().collectGarbage("shape reuse");
++  auto second = rt->createObjectWithProperties(fields);
++  rt->global().setProperty(*rt, "second", second);
++  auto result = rt->evaluateJavaScript(std::make_shared<StringBuffer>(
++      "Object.getPrototypeOf(second) === Object.prototype && "
++      "Object.keys(second).join(',') === 'name,__proto__,nested' && "
++      "second.name === 'first' && second.__proto__ === 42 && "
++      "Object.getOwnPropertyDescriptor(second, '__proto__').writable"), "test");
++  EXPECT_TRUE(result.getBool());
++  std::vector<std::pair<std::string, Value>> indexed;
++  indexed.emplace_back("2", 20);
++  indexed.emplace_back("1", 10);
++  indexed.emplace_back("2", 21);
++  indexed.emplace_back("01", 30);
++  auto object = rt->createObjectWithProperties(indexed);
++  rt->global().setProperty(*rt, "indexed", object);
++  EXPECT_TRUE(rt->evaluateJavaScript(std::make_shared<StringBuffer>(
++      "Object.keys(indexed).join(',') === '1,2,01' && indexed[2] === 21"),
++      "test").getBool());
++  std::vector<Value> elements;
++  elements.emplace_back(*rt, second);
++  elements.emplace_back(3);
++  auto dense = rt->createArrayWithValues(elements);
++  EXPECT_EQ(dense.size(*rt), 2);
++  EXPECT_TRUE(Value::strictEquals(*rt, dense.getValueAtIndex(*rt, 0), Value(*rt, second)));
++  EXPECT_EQ(dense.getValueAtIndex(*rt, 1).getNumber(), 3);
++  // Cache eviction must release only templates, never returned documents.
++  for (int i = 0; i < 80; ++i) {
++    std::vector<std::pair<std::string, Value>> varying;
++    varying.emplace_back("field" + std::to_string(i), i);
++    varying.emplace_back("unique" + std::to_string(i), i);
++    rt->createObjectWithProperties(varying);
++  }
++  EXPECT_EQ(second.getProperty(*rt, "name").asString(*rt).utf8(*rt), "first");
++}
++
++TEST(HermesNativeValuesTest, DescriptorSnapshots) {
++  auto rt = makeHermesRuntime();
++  auto eval = [&](const char *source) {
++    return rt->evaluateJavaScript(std::make_shared<StringBuffer>(source), "test");
++  };
++  auto object = eval(
++      "globalThis.key = Symbol('key'); globalThis.calls = 0;"
++      "globalThis.subject = { n: NaN, z: 0, [key]: 3, "
++      "get x() { ++calls; return 1; } }; subject").asObject(*rt);
++  auto keys = eval("Reflect.ownKeys(subject)").asObject(*rt).asArray(*rt);
++  auto matches = rt->createOwnPropertyValidator(object, keys, false);
++  rt->instrumentation().collectGarbage("snapshot roots");
++  EXPECT_TRUE(matches());
++  EXPECT_EQ(eval("calls").getNumber(), 0);
++  eval("subject.z = -0");
++  EXPECT_FALSE(matches());
++  eval("subject.z = 0; subject[key] = 4");
++  EXPECT_FALSE(matches());
++  eval("subject[key] = 3; Object.defineProperty(subject, 'x', {get() {return 1}})");
++  EXPECT_FALSE(matches());
++  auto current = rt->createOwnPropertyValidator(object, keys, false);
++  auto subset = rt->createOwnPropertyValidator(object, keys, true);
++  eval("subject.newField = 5");
++  EXPECT_FALSE(current());
++  EXPECT_TRUE(subset());
++  eval("delete subject.n");
++  EXPECT_FALSE(subset());
++  auto proxy = eval("new Proxy({}, {})").asObject(*rt);
++  EXPECT_THROW(rt->createOwnPropertyValidator(proxy, keys, false), JSINativeException);
++}
