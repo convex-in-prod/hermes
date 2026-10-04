@@ -25,26 +25,42 @@ Other operands retain JavaScript coercion through the builtin call.
 Validate object isolation and GC roots, descriptor mutations and SameValue
 semantics, regex identity and state, numeric conversions, preserved host
 replacements, and emitted native helper calls.
+
+Resolve native object layouts from borrowed key bytes, compare collisions by
+key content, and evict individual least-recently-used layouts. Build immutable
+classes directly and decode values through callbacks into initialized, rooted
+object and array storage. Retain explicit fallbacks for wide, indexed and
+duplicate-key objects and expose construction counters without allocation.
+
+Return the original primitive for full-range string slices and scan unchanged
+ASCII case conversions before allocating temporary UTF-16 storage. Cache string
+prototype data-property slots in Static Hermes while preserving replacements,
+accessor receivers and prototype mutations.
 ---
- API/hermes/hermes.cpp                      | 267 +++++++++++++++++++++
- API/hermes/hermes.h                        |  26 ++
- include/hermes/AST/Context.h               |   3 +
- include/hermes/VM/static_h.h               |  25 ++
- lib/BCGen/SH/SH.cpp                        |  51 ++--
- lib/CompilerDriver/CompilerDriver.cpp      |   7 +
- lib/Optimizer/Scalar/LowerBuiltinCalls.cpp |  10 +-
- lib/Sema/FlowChecker-expr.cpp              |   2 +-
- lib/VM/StaticH.cpp                         |  51 ++++
- test/shermes/ffi/string_write_utf8.js      |  38 +++
- test/shermes/native-literal-builtins.js    |  43 ++++
- tools/shermes/shermes.cpp                  |   7 +
- unittests/API/APITest.cpp                  |  77 ++++++
- 13 files changed, 585 insertions(+), 22 deletions(-)
+ API/hermes/hermes.cpp                       | 379 ++++++++++++++++++++
+ API/hermes/hermes.h                         |  50 +++
+ include/hermes/AST/Context.h                |   3 +
+ include/hermes/VM/static_h.h                |  25 ++
+ lib/BCGen/SH/SH.cpp                         |  51 ++-
+ lib/CompilerDriver/CompilerDriver.cpp       |   7 +
+ lib/Optimizer/Scalar/LowerBuiltinCalls.cpp  |  10 +-
+ lib/Sema/FlowChecker-expr.cpp               |   2 +-
+ lib/VM/JSLib/String.cpp                     |  15 +-
+ lib/VM/StaticH.cpp                          |  72 +++-
+ lib/VM/StringPrimitive.cpp                  |   4 +
+ test/shermes/ffi/string_write_utf8.js       |  38 ++
+ test/shermes/native-literal-builtins.js     |  43 +++
+ test/shermes/string-method-cache.js         |  36 ++
+ tools/shermes/shermes.cpp                   |   7 +
+ unittests/API/APITest.cpp                   | 127 +++++++
+ unittests/VMRuntime/StringPrimitiveTest.cpp |  15 +
+ 17 files changed, 852 insertions(+), 32 deletions(-)
  create mode 100644 test/shermes/ffi/string_write_utf8.js
  create mode 100644 test/shermes/native-literal-builtins.js
+ create mode 100644 test/shermes/string-method-cache.js
 
 diff --git a/API/hermes/hermes.cpp b/API/hermes/hermes.cpp
-index d401e00890343c3659d4107249376b3c6aec26a8..ada61ab20957b7049fe852a3a7cd3301522e4613 100644
+index d401e00890343c3659d4107249376b3c6aec26a8..94a65d44877ccdace6f00e86be3b822970ee1478 100644
 --- a/API/hermes/hermes.cpp
 +++ b/API/hermes/hermes.cpp
 @@ -32,11 +32,14 @@
@@ -70,7 +86,19 @@ index d401e00890343c3659d4107249376b3c6aec26a8..ada61ab20957b7049fe852a3a7cd3301
  #ifdef HERMES_ENABLE_DEBUGGER
      // Deallocate the debugger so it frees any HermesPointerValues it may hold.
      // This must be done before we check hermesValues_ below.
-@@ -881,6 +885,14 @@ class HermesRuntimeImpl final : public HermesRuntime,
+@@ -475,6 +479,11 @@ class HermesRuntimeImpl final : public HermesRuntime,
+ 
+ #undef BRIDGE_INFO
+ 
++    jsInfo["hermes_objectLayoutHits"] = objectLayoutHits_;
++    jsInfo["hermes_objectLayoutMisses"] = objectLayoutMisses_;
++    jsInfo["hermes_objectLayoutEvictions"] = objectLayoutEvictions_;
++    jsInfo["hermes_objectLayoutFallbacks"] = objectLayoutFallbacks_;
++
+     jsInfo["hermes_peakAllocatedBytes"] =
+         runtime_.getHeap().getPeakAllocatedBytes();
+     jsInfo["hermes_peakLiveAfterGC"] = runtime_.getHeap().getPeakLiveAfterGC();
+@@ -881,6 +890,23 @@ class HermesRuntimeImpl final : public HermesRuntime,
    bool isHostObject(const jsi::Object &) const override;
    bool isHostFunction(const jsi::Function &) const override;
    jsi::Array getPropertyNames(const jsi::Object &) override;
@@ -79,105 +107,212 @@ index d401e00890343c3659d4107249376b3c6aec26a8..ada61ab20957b7049fe852a3a7cd3301
 +
 +  jsi::Object createObjectWithProperties(
 +      const std::vector<std::pair<std::string, jsi::Value>> &) override;
++  ObjectLayoutStatistics getObjectLayoutStatistics() const override {
++    return {objectLayoutHits_, objectLayoutMisses_, objectLayoutEvictions_, objectLayoutFallbacks_};
++  }
++  jsi::Object createObjectFromEntries(
++      size_t,
++      const std::function<std::string_view(size_t)> &,
++      const std::function<jsi::Value(size_t)> &) override;
 +  jsi::Array createArrayWithValues(const std::vector<jsi::Value> &) override;
++  jsi::Array createArrayFromValues(
++      size_t, const std::function<jsi::Value(size_t)> &) override;
 +  std::function<bool()> createOwnPropertyValidator(
 +      const jsi::Object &, const jsi::Array &, bool) override;
  
    void setPrototypeOf(const jsi::Object &object, const jsi::Value &prototype)
        override;
-@@ -1388,6 +1400,9 @@ class HermesRuntimeImpl final : public HermesRuntime,
+@@ -1388,6 +1414,19 @@ class HermesRuntimeImpl final : public HermesRuntime,
    void *getVMRuntimeUnsafe() const override;
    size_t rootsListLengthForTests() const override;
  
 +  // Templates hold no document values and are never exposed to JavaScript.
 +  // JSI roots keep their classes and property identifiers alive through GC.
-+  std::unordered_map<std::string, jsi::Object> objectShapeCache_;
++  struct ObjectLayout {
++    std::vector<std::string> keys;
++    jsi::Object shape;
++    uint64_t lastUse;
++  };
++  std::unordered_multimap<size_t, ObjectLayout> objectShapeCache_;
++  uint64_t objectLayoutClock_{0};
++  uint64_t objectLayoutHits_{0};
++  uint64_t objectLayoutMisses_{0};
++  uint64_t objectLayoutEvictions_{0};
++  uint64_t objectLayoutFallbacks_{0};
    ManagedValues<vm::PinnedHermesValue> hermesValues_;
    ManagedValues<vm::WeakRoot<vm::JSObject>> weakHermesValues_;
    std::shared_ptr<::hermes::vm::Runtime> rt_;
-@@ -3064,6 +3079,258 @@ jsi::Array HermesRuntimeImpl::getPropertyNames(const jsi::Object &obj) {
+@@ -3064,6 +3103,346 @@ jsi::Array HermesRuntimeImpl::getPropertyNames(const jsi::Object &obj) {
    return ret;
  }
  
 +jsi::Object HermesRuntimeImpl::createObjectWithProperties(
 +    const std::vector<std::pair<std::string, jsi::Value>> &properties) {
++  return createObjectFromEntries(
++      properties.size(),
++      [&properties](size_t i) { return std::string_view(properties[i].first); },
++      [this, &properties](size_t i) {
++        return jsi::Value(*this, properties[i].second);
++      });
++}
++
++jsi::Object HermesRuntimeImpl::createObjectFromEntries(
++    size_t count,
++    const std::function<std::string_view(size_t)> &keyAt,
++    const std::function<jsi::Value(size_t)> &valueAt) {
 +  ExecutionScopeRAII scopeRAII(mutatorScope);
 +  vm::GCScope gcScope(runtime_);
-+  // Bound retained key bytes and slots independently of application schemas.
-+  bool cacheable = properties.size() <= 128;
-+  std::string shapeKey;
-+  for (const auto &property : properties) {
-+    const auto &key = property.first;
-+    if (shapeKey.size() + key.size() + 12 > 8192 ||
-+        (!key.empty() && key[0] >= '0' && key[0] <= '9')) {
-+      cacheable = false;
-+      break;
++  if (count > vm::HiddenClass::maxNumProperties())
++    throw jsi::JSINativeException("Object field count exceeds the limit");
++
++  // Only immutable classes may be shared. Wide and index-like objects retain
++  // the ordinary definition path, with final storage reserved in advance.
++  bool cacheable = count <= vm::HiddenClass::kDictionaryThreshold;
++  size_t keyBytes = 0;
++  size_t hash = count;
++  if (cacheable) {
++    for (size_t i = 0; i < count; ++i) {
++      auto key = keyAt(i);
++      if (key.size() > 8192 - keyBytes ||
++          (!key.empty() && key[0] >= '0' && key[0] <= '9')) {
++        cacheable = false;
++        break;
++      }
++      keyBytes += key.size();
++      hash ^= std::hash<std::string_view>{}(key) + size_t(0x9e3779b9) +
++          (hash << 6) + (hash >> 2);
 +    }
-+    shapeKey += std::to_string(key.size());
-+    shapeKey += ':';
-+    shapeKey += key;
 +  }
-+  auto cached = cacheable ? objectShapeCache_.find(shapeKey)
-+                          : objectShapeCache_.end();
-+  if (cached != objectShapeCache_.end()) {
-+    auto clazz = runtime_.makeHandle(handle(cached->second)->getClassGCPtr());
++
++  auto clazz = runtime_.makeMutableHandle<vm::HiddenClass>(nullptr);
++  if (cacheable) {
++    auto candidates = objectShapeCache_.equal_range(hash);
++    for (auto it = candidates.first; it != candidates.second; ++it) {
++      auto &layout = it->second;
++      if (layout.keys.size() != count)
++        continue;
++      size_t i = 0;
++      while (i < count && keyAt(i) == layout.keys[i])
++        ++i;
++      if (i == count) {
++        clazz = handle(layout.shape)->getClass(runtime_);
++        layout.lastUse = ++objectLayoutClock_;
++        ++objectLayoutHits_;
++        break;
++      }
++    }
++    if (!clazz) {
++      ++objectLayoutMisses_;
++      std::vector<std::string> keys;
++      std::vector<jsi::PropNameID> identifiers;
++      keys.reserve(count);
++      identifiers.reserve(count);
++      clazz = *runtime_.getHiddenClassForPrototype(
++          *vm::Handle<vm::JSObject>::vmcast(&runtime_.objectPrototype),
++          vm::JSObject::numOverlapSlots<vm::JSObject>());
++      auto marker = gcScope.createMarker();
++      for (size_t i = 0; i < count; ++i) {
++        gcScope.flushToMarker(marker);
++        auto key = keyAt(i);
++        identifiers.push_back(createPropNameIDFromUtf8(
++            reinterpret_cast<const uint8_t *>(key.data()), key.size()));
++        auto id = phv(identifiers.back()).getSymbol();
++        // Different UTF-8 spellings can resolve to the same property name.
++        // Duplicate fields must overwrite the original slot, not add a slot.
++        if (vm::HiddenClass::findPropertyNoAlloc(*clazz, runtime_, id)) {
++          cacheable = false;
++          break;
++        }
++        vm::PropertyFlags flags{};
++        flags.writable = flags.enumerable = flags.configurable = true;
++        auto added = vm::HiddenClass::addProperty(clazz, runtime_, id, flags);
++        checkStatus(added.getStatus());
++        clazz = *added->first;
++        assert(added->second == i && "New layout must have sequential slots");
++        keys.emplace_back(key);
++      }
++      if (cacheable) {
++        assert(!clazz->isDictionary() && "Cached layout must be immutable");
++        auto shape = runtime_.makeHandle(vm::JSObject::create(
++            runtime_, vm::Handle<vm::JSObject>::vmcast(&runtime_.objectPrototype),
++            clazz));
++        for (size_t i = 0; i < count; ++i)
++          vm::JSObject::setNamedSlotValueUnsafe(
++              *shape, runtime_, i, vm::SmallHermesValue::encodeUndefinedValue());
++        if (objectShapeCache_.size() == 64) {
++          auto oldest = std::min_element(
++              objectShapeCache_.begin(), objectShapeCache_.end(),
++              [](const auto &a, const auto &b) {
++                return a.second.lastUse < b.second.lastUse;
++              });
++          objectShapeCache_.erase(oldest);
++          ++objectLayoutEvictions_;
++        }
++        objectShapeCache_.emplace(hash, ObjectLayout{
++            std::move(keys), add<jsi::Object>(shape.getHermesValue()),
++            ++objectLayoutClock_});
++      }
++    }
++  }
++
++  if (cacheable) {
 +    auto result = runtime_.makeHandle(vm::JSObject::create(
 +        runtime_, vm::Handle<vm::JSObject>::vmcast(&runtime_.objectPrototype),
 +        clazz));
-+    for (size_t i = 0; i < properties.size(); ++i) {
++    // Recursive value decoding may collect or evict this layout. Root the
++    // object and initialize every slot before calling the first decoder.
++    for (size_t i = 0; i < count; ++i)
++      vm::JSObject::setNamedSlotValueUnsafe(
++          *result, runtime_, i, vm::SmallHermesValue::encodeUndefinedValue());
++    for (size_t i = 0; i < count; ++i) {
++      auto decoded = valueAt(i);
 +      auto value = vm::SmallHermesValue::encodeHermesValue(
-+          hvFromValue(properties[i].second), runtime_);
++          hvFromValue(decoded), runtime_);
 +      vm::JSObject::setNamedSlotValueUnsafe(*result, runtime_, i, value);
 +    }
 +    return add<jsi::Object>(result.getHermesValue());
 +  }
 +
-+  auto result = runtime_.makeHandle(vm::JSObject::create(runtime_));
++  ++objectLayoutFallbacks_;
++  auto result = runtime_.makeHandle(vm::JSObject::create(runtime_, count));
 +  auto marker = gcScope.createMarker();
-+  for (const auto &property : properties) {
++  for (size_t i = 0; i < count; ++i) {
 +    gcScope.flushToMarker(marker);
-+    auto key = createStringFromUtf8(
-+        reinterpret_cast<const uint8_t *>(property.first.data()),
-+        property.first.size());
-+    vm::DefinePropertyFlags flags{};
-+    flags.setValue = flags.setWritable = flags.setEnumerable =
-+        flags.setConfigurable = true;
-+    flags.writable = flags.enumerable = flags.configurable = true;
++    auto key = keyAt(i);
++    auto name = createStringFromUtf8(
++        reinterpret_cast<const uint8_t *>(key.data()), key.size());
++    auto decoded = valueAt(i);
 +    auto status = vm::JSObject::defineOwnComputedPrimitive(
-+        result, runtime_, stringHandle(key), flags,
-+        runtime_.makeHandle(hvFromValue(property.second)),
++        result, runtime_, stringHandle(name),
++        vm::DefinePropertyFlags::getDefaultNewPropertyFlags(),
++        runtime_.makeHandle(hvFromValue(decoded)),
 +        vm::PropOpFlags().plusThrowOnError());
 +    checkStatus(status.getStatus());
-+  }
-+  auto clazz = runtime_.makeHandle(result->getClassGCPtr());
-+  // Indexed keys, duplicates and mutable dictionary classes use the normal
-+  // definition path. Sharing a dictionary class would corrupt other objects.
-+  if (cacheable && !clazz->isDictionary() &&
-+      clazz->getNumProperties() == properties.size()) {
-+    auto shape = runtime_.makeHandle(vm::JSObject::create(
-+        runtime_, vm::Handle<vm::JSObject>::vmcast(&runtime_.objectPrototype),
-+        clazz));
-+    for (size_t i = 0; i < properties.size(); ++i)
-+      vm::JSObject::setNamedSlotValueUnsafe(
-+          *shape, runtime_, i, vm::SmallHermesValue::encodeUndefinedValue());
-+    if (objectShapeCache_.size() == 64)
-+      objectShapeCache_.clear();
-+    objectShapeCache_.emplace(std::move(shapeKey),
-+                             add<jsi::Object>(shape.getHermesValue()));
 +  }
 +  return add<jsi::Object>(result.getHermesValue());
 +}
 +
 +jsi::Array HermesRuntimeImpl::createArrayWithValues(
 +    const std::vector<jsi::Value> &values) {
++  return createArrayFromValues(values.size(), [this, &values](size_t i) {
++    return jsi::Value(*this, values[i]);
++  });
++}
++
++jsi::Array HermesRuntimeImpl::createArrayFromValues(
++    size_t count,
++    const std::function<jsi::Value(size_t)> &valueAt) {
 +  ExecutionScopeRAII scopeRAII(mutatorScope);
 +  vm::GCScope gcScope(runtime_);
-+  auto created = vm::JSArray::create(runtime_, values.size(), values.size());
++  if (count > UINT32_MAX)
++    throw jsi::JSINativeException("Array element count exceeds the limit");
++  auto created = vm::JSArray::create(runtime_, count, count);
 +  checkStatus(created.getStatus());
 +  auto result = runtime_.makeHandle(std::move(*created));
-+  for (size_t i = 0; i < values.size(); ++i) {
++  for (size_t i = 0; i < count; ++i) {
++    auto decoded = valueAt(i);
 +    auto value = vm::SmallHermesValue::encodeHermesValue(
-+        hvFromValue(values[i]), runtime_);
++        hvFromValue(decoded), runtime_);
 +    vm::JSArray::unsafeSetExistingElementAt(*result, runtime_, i, value);
 +  }
 +  return add<jsi::Array>(result.getHermesValue());
@@ -355,19 +490,20 @@ index d401e00890343c3659d4107249376b3c6aec26a8..ada61ab20957b7049fe852a3a7cd3301
    ExecutionScopeRAII scopeRAII(mutatorScope);
    return addWeak(
 diff --git a/API/hermes/hermes.h b/API/hermes/hermes.h
-index 1a66be931c50da1e83e283617575b2c3bdcdb0d1..f013dfa3e3b83f3dc5c9747b374d416fb0b438c7 100644
+index 1a66be931c50da1e83e283617575b2c3bdcdb0d1..d31a89289f9c089e09299bb9d0bbaa59619d5801 100644
 --- a/API/hermes/hermes.h
 +++ b/API/hermes/hermes.h
-@@ -13,6 +13,8 @@
+@@ -13,6 +13,9 @@
  #include <memory>
  #include <ostream>
  #include <string>
++#include <string_view>
 +#include <utility>
 +#include <vector>
  
  #include <hermes/Public/HermesExport.h>
  #include <hermes/Public/RuntimeConfig.h>
-@@ -205,6 +207,30 @@ class HermesRuntime : public jsi::Runtime,
+@@ -205,6 +208,53 @@ class HermesRuntime : public jsi::Runtime,
    ~HermesRuntime() override = default;
  
    using jsi::Runtime::castInterface;
@@ -378,14 +514,37 @@ index 1a66be931c50da1e83e283617575b2c3bdcdb0d1..f013dfa3e3b83f3dc5c9747b374d416f
 +  virtual std::vector<std::pair<jsi::String, jsi::Value>>
 +  getOwnEnumerableEntries(const jsi::Object &object) = 0;
 +
++  struct ObjectLayoutStatistics {
++    uint64_t hits;
++    uint64_t misses;
++    uint64_t evictions;
++    uint64_t fallbacks;
++  };
++
++  /// Read cumulative construction counters without allocating or collecting.
++  virtual ObjectLayoutStatistics getObjectLayoutStatistics() const = 0;
++
 +  /// Construct ordinary own data properties, bypassing inherited setters.
 +  /// Repeated small non-indexed shapes reuse runtime-local keys and slots.
 +  virtual jsi::Object createObjectWithProperties(
 +      const std::vector<std::pair<std::string, jsi::Value>> &properties) = 0;
 +
++  /// Decode into final rooted storage. Keys must remain valid for the call and
++  /// may be read repeatedly; values are read once each, in index order. Neither
++  /// callback may change the keys. No callback receives the unfinished object.
++  virtual jsi::Object createObjectFromEntries(
++      size_t count,
++      const std::function<std::string_view(size_t)> &keyAt,
++      const std::function<jsi::Value(size_t)> &valueAt) = 0;
++
 +  /// Construct dense own array elements without property setters.
 +  virtual jsi::Array createArrayWithValues(
 +      const std::vector<jsi::Value> &values) = 0;
++
++  /// Read each element once, in order, into final rooted array storage.
++  virtual jsi::Array createArrayFromValues(
++      size_t count,
++      const std::function<jsi::Value(size_t)> &valueAt) = 0;
 +
 +  /// Capture descriptors without invoking accessors. The returned check must
 +  /// not outlive this runtime. Extra keys are allowed only when requested.
@@ -609,8 +768,49 @@ index da432ba756ec3e7a3faa4daf4a564e9bfe951fa6..603f366ef682895b4fb2b8fdc005249c
                &natParamType))
          return;
        natParamTypes.push_back(natParamType);
+diff --git a/lib/VM/JSLib/String.cpp b/lib/VM/JSLib/String.cpp
+index f355962871aefc82e2ff4352e170453ea1153699..f612a30ec5d1ba8a345a530621daa4f39960ea1a 100644
+--- a/lib/VM/JSLib/String.cpp
++++ b/lib/VM/JSLib/String.cpp
+@@ -937,14 +937,10 @@ static CallResult<HermesValue> convertCase(
+     Handle<StringPrimitive> S,
+     const bool upperCase,
+     const bool useCurrentLocale) {
+-  // Copying is unavoidable in this function, do it early on.
+-  SmallU16String<32> buff;
+-  // Must copy instead of just getting the reference, because later operations
+-  // may trigger GC and hence invalid pointers inside S.
+-  S->appendUTF16String(buff);
+-  UTF16Ref str = buff.arrayRef();
+-
+   if (!useCurrentLocale) {
++    // Keep the source rooted across output allocation, without first copying
++    // unchanged ASCII strings into a temporary UTF-16 buffer.
++    auto str = StringPrimitive::createStringView(runtime, S);
+     // Try a fast path for ASCII strings.
+     // First, bitwise-or all the characters to see if any one isn't ASCII.
+     char16_t mask = 0;
+@@ -969,7 +965,7 @@ static CallResult<HermesValue> convertCase(
+         return S.getHermesValue();
+       }
+ 
+-      if (str.size() == 1) {
++      if (str.length() == 1) {
+         // Use the Runtime stored representations of single-character strings.
+         char16_t c = str[0];
+         if (upperCase) {
+@@ -1007,6 +1003,9 @@ static CallResult<HermesValue> convertCase(
+       return HermesValue::encodeStringValue(*builder->getStringPrimitive());
+     }
+   }
++  // Unicode/locale conversion can resize the buffer and invoke platform code.
++  SmallU16String<32> buff;
++  S->appendUTF16String(buff);
+   platform_unicode::convertToCase(
+       buff,
+       upperCase ? platform_unicode::CaseConversion::ToUpper
 diff --git a/lib/VM/StaticH.cpp b/lib/VM/StaticH.cpp
-index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..fd69d540eda66b08b6708fa72ba1f3c6a863234f 100644
+index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..48a9c70cd0cf25ed9f4238c74614ea26712632a8 100644
 --- a/lib/VM/StaticH.cpp
 +++ b/lib/VM/StaticH.cpp
 @@ -7,6 +7,7 @@
@@ -634,7 +834,35 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..fd69d540eda66b08b6708fa72ba1f3c6
  
  using namespace hermes;
  using namespace hermes::vm;
-@@ -1792,6 +1795,25 @@ _sh_ljs_create_regexp(SHRuntime *shr, SHSymbolID pattern, SHSymbolID flags) {
+@@ -1264,8 +1267,25 @@ static inline HermesValue getByIdWithReceiver_RJS(
+     CallResult<PseudoHandle<>> resPH{ExecutionStatus::EXCEPTION};
+     {
+       GCScopeMarkerRAII marker{runtime};
+-      resPH = Interpreter::getByIdTransientWithReceiver_RJS(
+-          runtime, source, symID, receiver);
++      if (source->isString() && cacheEntry &&
++          symID != Predefined::getSymbolID(Predefined::length)) {
++        auto prototype = Handle<JSObject>::vmcast(&runtime.stringPrototype);
++        // Cache the prototype's own data slot, not its current value. Replacing
++        // a method keeps reading the new slot value; changing property flags
++        // or deleting it invalidates the class match. Accessors keep the
++        // primitive receiver on the ordinary lookup path.
++        if (cacheEntry->clazz == prototype->getClassGCPtr()) {
++          return JSObject::getNamedSlotValueUnsafe(
++                     *prototype, runtime, cacheEntry->getSlot())
++              .unboxToHV(runtime);
++        }
++        resPH = JSObject::getNamedWithReceiver_RJS(
++            prototype, runtime, symID, receiver,
++            DEFAULT_PROP_OP_FLAGS(false), cacheEntry);
++      } else {
++        resPH = Interpreter::getByIdTransientWithReceiver_RJS(
++            runtime, source, symID, receiver);
++      }
+     }
+     if (LLVM_UNLIKELY(resPH == ExecutionStatus::EXCEPTION))
+       _sh_throw_current(getSHRuntime(runtime));
+@@ -1792,6 +1812,25 @@ _sh_ljs_create_regexp(SHRuntime *shr, SHSymbolID pattern, SHSymbolID flags) {
    return *cr;
  }
  
@@ -660,7 +888,7 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..fd69d540eda66b08b6708fa72ba1f3c6
  LLVM_ATTRIBUTE_NOINLINE
  extern "C" SHLegacyValue
  _sh_ljs_create_bigint(SHRuntime *shr, const uint8_t *value, uint32_t size) {
-@@ -2727,3 +2749,32 @@ _sh_asciiz_to_string(SHRuntime *shr, const char *str, ptrdiff_t len) {
+@@ -2727,3 +2766,32 @@ _sh_asciiz_to_string(SHRuntime *shr, const char *str, ptrdiff_t len) {
      _sh_throw_current(shr);
    return *res;
  }
@@ -693,6 +921,21 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..fd69d540eda66b08b6708fa72ba1f3c6
 +    return -1;
 +  return written;
 +}
+diff --git a/lib/VM/StringPrimitive.cpp b/lib/VM/StringPrimitive.cpp
+index 5bf0eb3faa636d974da9c14bd49a1f7d15044b87..67986bb7ed1a8c5160844db2f825ba0a51ca6828 100644
+--- a/lib/VM/StringPrimitive.cpp
++++ b/lib/VM/StringPrimitive.cpp
+@@ -320,6 +320,10 @@ CallResult<HermesValue> StringPrimitive::slice(
+   assert(
+       start + length <= str->getStringLength() && "Invalid length for slice");
+ 
++  if (start == 0 && length == str->getStringLength()) {
++    return str.getHermesValue();
++  }
++
+   SafeUInt32 safeLen(length);
+ 
+   // Special case for 1-character strings, some of which are cached in the
 diff --git a/test/shermes/ffi/string_write_utf8.js b/test/shermes/ffi/string_write_utf8.js
 new file mode 100644
 index 0000000000000000000000000000000000000000..a9b0fbf317cd44e6d158d1885f766e235d0adbd6
@@ -786,6 +1029,48 @@ index 0000000000000000000000000000000000000000..52f3e73c2678a0fd83a60eb5c200e8de
 +// CHECK-NEXT: 0.25 123
 +// C: _sh_ljs_create_regexp_precompiled
 +// C: _sh_ljs_imul_number
+diff --git a/test/shermes/string-method-cache.js b/test/shermes/string-method-cache.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..b371cb64710cb588e070f0fe66a87cb167179183
+--- /dev/null
++++ b/test/shermes/string-method-cache.js
+@@ -0,0 +1,36 @@
++// Copyright (c) Meta Platforms, Inc. and affiliates.
++//
++// This source code is licensed under the MIT license found in the
++// LICENSE file in the root directory of this source tree.
++
++// RUN: %shermes -exec -O %s | %FileCheck %s
++// RUN: %shermes -exec -O0 %s | %FileCheck %s
++
++function method(value) { return value.probe(); }
++function check(actual, expected) {
++  if (actual !== expected) throw new Error('String method cache changed behavior');
++}
++String.prototype.probe = function() { 'use strict'; return this; };
++for (var i = 0; i < 100; ++i) check(method('first'), 'first');
++String.prototype.probe = function() { return 'replaced'; };
++check(method('first'), 'replaced');
++Object.defineProperty(String.prototype, 'probe', {
++  configurable: true,
++  get: function() {
++    'use strict';
++    check(typeof this, 'string');
++    return function() { 'use strict'; return this; };
++  },
++});
++check(method('getter'), 'getter');
++delete String.prototype.probe;
++Object.prototype.probe = function() { return 'inherited'; };
++check(method('first'), 'inherited');
++String.prototype.probe = function() { return 'own'; };
++check(method('first'), 'own');
++check(method({ probe: function() { return 'object'; } }), 'object');
++check(method('first'), 'own');
++delete String.prototype.probe;
++delete Object.prototype.probe;
++print('string method cache passed');
++// CHECK: string method cache passed
 diff --git a/tools/shermes/shermes.cpp b/tools/shermes/shermes.cpp
 index 5db8804e8cddc6ec859f6260263f71956042f8ca..d2482518514f25a9c63b29fb31c297cd6055e103 100644
 --- a/tools/shermes/shermes.cpp
@@ -812,10 +1097,10 @@ index 5db8804e8cddc6ec859f6260263f71956042f8ca..d2482518514f25a9c63b29fb31c297cd
    optimizationOpts.metroRequireOpt = cli::MetroRequireOpt;
  
 diff --git a/unittests/API/APITest.cpp b/unittests/API/APITest.cpp
-index aae9e34229d4d5e4f039d2505f24a718e47687c0..73d42e85625cde4ef44226173cc0d94b8ca9ed40 100644
+index aae9e34229d4d5e4f039d2505f24a718e47687c0..fda43b31818b9dee5e5ede3613b22b66781a701f 100644
 --- a/unittests/API/APITest.cpp
 +++ b/unittests/API/APITest.cpp
-@@ -3694,3 +3694,80 @@ INSTANTIATE_TEST_CASE_P(
+@@ -3694,3 +3694,130 @@ INSTANTIATE_TEST_CASE_P(
      HermesRuntimeTest,
      ::testing::ValuesIn(runtimeGenerators()));
  } // namespace
@@ -866,6 +1151,56 @@ index aae9e34229d4d5e4f039d2505f24a718e47687c0..73d42e85625cde4ef44226173cc0d94b
 +  EXPECT_EQ(second.getProperty(*rt, "name").asString(*rt).utf8(*rt), "first");
 +}
 +
++TEST(HermesNativeValuesTest, StreamingConstructionAcrossCollectionAndEviction) {
++  auto rt = makeHermesRuntime();
++  const std::vector<std::string> keys{"first", "nested", "__proto__"};
++  size_t decoded = 0;
++  auto object = rt->createObjectFromEntries(
++      keys.size(), [&](size_t i) { return std::string_view(keys[i]); },
++      [&](size_t i) -> Value {
++        EXPECT_EQ(i, decoded++);
++        if (i == 0)
++          return String::createFromUtf8(*rt, "retained");
++        // Evict the enclosing layout while the partially filled object is
++        // rooted, and collect before writing each nested array element.
++        for (size_t j = 0; j < 80; ++j) {
++          std::string key = "nested" + std::to_string(j);
++          rt->createObjectFromEntries(
++              1, [&](size_t) { return std::string_view(key); },
++              [&](size_t) { return Value(static_cast<double>(j)); });
++        }
++        return rt->createArrayFromValues(3, [&](size_t j) -> Value {
++          rt->instrumentation().collectGarbage("streamed values");
++          return String::createFromUtf8(*rt, std::to_string(j));
++        });
++      });
++  rt->global().setProperty(*rt, "streamed", object);
++  EXPECT_TRUE(rt->evaluateJavaScript(std::make_shared<StringBuffer>(
++      "streamed.first === 'retained' && streamed.nested.join(',') === '0,1,2' && "
++      "streamed.__proto__.join(',') === '0,1,2' && "
++      "Object.getPrototypeOf(streamed) === Object.prototype && "
++      "Object.keys(streamed).join(',') === 'first,nested,__proto__'"),
++      "test").getBool());
++  const auto info = rt->instrumentation().getHeapInfo(false);
++  EXPECT_GT(info.at("hermes_objectLayoutEvictions"), 0);
++
++  // Dictionary objects must remain independent even after their shape changes.
++  std::vector<std::string> wideKeys;
++  for (size_t i = 0; i < 80; ++i)
++    wideKeys.push_back("field" + std::to_string(i));
++  auto makeWide = [&] {
++    return rt->createObjectFromEntries(
++        wideKeys.size(), [&](size_t i) { return std::string_view(wideKeys[i]); },
++        [&](size_t i) { return Value(static_cast<double>(i)); });
++  };
++  rt->global().setProperty(*rt, "wideFirst", makeWide());
++  rt->global().setProperty(*rt, "wideSecond", makeWide());
++  EXPECT_TRUE(rt->evaluateJavaScript(std::make_shared<StringBuffer>(
++      "delete wideFirst.field30; wideFirst.extra = 1; "
++      "wideSecond.field30 === 30 && !('extra' in wideSecond) && "
++      "Object.keys(wideSecond).length === 80"), "test").getBool());
++}
++
 +TEST(HermesNativeValuesTest, DescriptorSnapshots) {
 +  auto rt = makeHermesRuntime();
 +  auto eval = [&](const char *source) {
@@ -896,3 +1231,29 @@ index aae9e34229d4d5e4f039d2505f24a718e47687c0..73d42e85625cde4ef44226173cc0d94b
 +  auto proxy = eval("new Proxy({}, {})").asObject(*rt);
 +  EXPECT_THROW(rt->createOwnPropertyValidator(proxy, keys, false), JSINativeException);
 +}
+diff --git a/unittests/VMRuntime/StringPrimitiveTest.cpp b/unittests/VMRuntime/StringPrimitiveTest.cpp
+index 51f39b9f4771aa9d5267697e6b43778f783cd2b8..9be9fcd0da394234e0f9d9c39ddc1b2cb5b2373c 100644
+--- a/unittests/VMRuntime/StringPrimitiveTest.cpp
++++ b/unittests/VMRuntime/StringPrimitiveTest.cpp
+@@ -38,6 +38,21 @@ TEST_F(StringPrimTest, CreateTest) {
+           .equals(createUTF16Ref(u"foo")));
+ }
+ 
++TEST_F(StringPrimTest, FullSliceRetainsPrimitive) {
++  for (auto input : {u"", u"a", u"unchanged", u"\u03b1\u03b2\u03b3"}) {
++    auto str = StringPrimitive::createNoThrow(runtime, createUTF16Ref(input));
++    auto full = StringPrimitive::slice(runtime, str, 0, str->getStringLength());
++    ASSERT_NE(full, ExecutionStatus::EXCEPTION);
++    EXPECT_EQ(full->getString(), str.get());
++  }
++  auto str = StringPrimitive::createNoThrow(runtime, "abcd");
++  auto part = StringPrimitive::slice(runtime, str, 1, 2);
++  ASSERT_NE(part, ExecutionStatus::EXCEPTION);
++  auto result = runtime.makeHandle(vmcast<StringPrimitive>(*part));
++  EXPECT_TRUE(StringPrimitive::createStringView(runtime, result)
++                  .equals(createUTF16Ref(u"bc")));
++}
++
+ TEST_F(StringPrimTest, EqualityTest) {
+   auto s1 = StringPrimitive::createNoThrow(runtime, createUTF16Ref(u"abc"));
+   auto s2 = StringPrimitive::createNoThrow(runtime, createUTF16Ref(u"abc"));
