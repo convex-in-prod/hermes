@@ -51,37 +51,82 @@ Expose numeric heap and cumulative GC statistics for opt-in execution
 observation without JavaScript allocation or heap traversal. Validate normal
 and small-C computed loads, GC invalidation, detached arrays, numeric edges,
 and the native value adapter against host and Wasm builds.
+
+Retain two receiver shapes at ordinary named-read sites and two shape/key
+pairs per computed-cache set without enlarging the computed cache. Keep
+weak roots, prototype validation, accessors and dictionary-mode fallbacks.
+Add direct present-storage reads for ordinary arrays while retaining
+inherited lookup for holes and unsupported keys.
+
+Propagate known closure code through bounded parameter, phi and return
+analysis while preserving the actual closure environment. Permit bounded
+Static Hermes inlining of small field readers into try/catch callers when
+a fresh object argument exposes allocation and field operations to existing
+object promotion. Keep other backends' inlining policy unchanged.
+
+Lower proven numeric abs, ceil, floor, trunc, round and binary min/max with
+shared JavaScript rounding, NaN and signed-zero semantics. Fuse eligible
+numeric string-index comparisons with one UTF-16 code unit; guard unknown
+receivers and preserve prototype lookup, GC roots and exception cleanup.
+
+Validate callback identity and environments, inlining growth, object
+elimination, cache invalidation, indexed reads and numeric/string edges in
+host and Wasm execution, including normal and small-C output. Retain the
+existing native value-adapter and runtime ABI checks.
 ---
  API/hermes/hermes.cpp                       | 379 ++++++++++++++++++++
  API/hermes/hermes.h                         |  50 +++
- include/hermes/AST/Context.h                |   3 +
+ include/hermes/AST/Context.h                |   7 +
+ include/hermes/Support/MathFunctions.h      |  42 +++
  include/hermes/VM/CellKind.h                |   6 +
  include/hermes/VM/GCCell.h                  |   1 +
  include/hermes/VM/PropertyCache.h           |  19 +
  include/hermes/VM/StringPrimitive.h         |   8 +-
- include/hermes/VM/sh_mirror.h               |  32 ++
- include/hermes/VM/static_h.h                | 149 ++++++++
- lib/BCGen/SH/SH.cpp                         | 129 +++++--
+ include/hermes/VM/sh_mirror.h               |  38 ++
+ include/hermes/VM/static_h.h                | 202 +++++++++++
+ include/hermes/VMLayouts/PropertyCache.h    |  20 ++
+ lib/BCGen/SH/PeepholeLowering.cpp           |  98 +++++
+ lib/BCGen/SH/SH.cpp                         | 200 +++++++++--
  lib/CompilerDriver/CompilerDriver.cpp       |   7 +
+ lib/Optimizer/Scalar/FunctionAnalysis.cpp   |  85 +++++
+ lib/Optimizer/Scalar/Inlining.cpp           |  63 +++-
  lib/Optimizer/Scalar/LowerBuiltinCalls.cpp  |  10 +-
  lib/Sema/FlowChecker-expr.cpp               |   2 +-
+ lib/VM/JSArray.cpp                          |   9 +
  lib/VM/JSArrayBuffer.cpp                    |   8 +-
+ lib/VM/JSLib/Math.cpp                       |  51 +--
+ lib/VM/JSLib/MathStdFunctions.def           |   2 +-
  lib/VM/JSLib/String.cpp                     |  15 +-
  lib/VM/JSTypedArray.cpp                     |   7 +
- lib/VM/StaticH.cpp                          | 129 ++++++-
+ lib/VM/StaticH.cpp                          | 212 ++++++++++-
  lib/VM/StaticHUnit.cpp                      |   8 +
  lib/VM/StringPrimitive.cpp                  |   4 +
- test/shermes/computed-loads.js              | 113 ++++++
+ test/shermes/computed-loads.js              | 147 ++++++++
  test/shermes/ffi/string_write_utf8.js       |  38 ++
+ test/shermes/inline-object-reader-growth.js |  16 +
+ test/shermes/inline-object-reader-try.js    |  86 +++++
+ test/shermes/known-callback-targets.js      | 117 ++++++
  test/shermes/native-literal-builtins.js     |  43 +++
+ test/shermes/numeric-math.js                |  98 +++++
+ test/shermes/polymorphic-read-cache.js      |  63 ++++
+ test/shermes/string-index-comparison.js     | 122 +++++++
  test/shermes/string-method-cache.js         |  36 ++
- tools/shermes/shermes.cpp                   |   7 +
+ tools/shermes/shermes.cpp                   |   8 +
  unittests/API/APITest.cpp                   | 127 +++++++
+ unittests/VMRuntime/StaticHUnitTest.cpp     |  50 +++
  unittests/VMRuntime/StringPrimitiveTest.cpp |  15 +
- 26 files changed, 1305 insertions(+), 40 deletions(-)
+ 41 files changed, 2412 insertions(+), 107 deletions(-)
+ create mode 100644 include/hermes/Support/MathFunctions.h
+ create mode 100644 include/hermes/VMLayouts/PropertyCache.h
  create mode 100644 test/shermes/computed-loads.js
  create mode 100644 test/shermes/ffi/string_write_utf8.js
+ create mode 100644 test/shermes/inline-object-reader-growth.js
+ create mode 100644 test/shermes/inline-object-reader-try.js
+ create mode 100644 test/shermes/known-callback-targets.js
  create mode 100644 test/shermes/native-literal-builtins.js
+ create mode 100644 test/shermes/numeric-math.js
+ create mode 100644 test/shermes/polymorphic-read-cache.js
+ create mode 100644 test/shermes/string-index-comparison.js
  create mode 100644 test/shermes/string-method-cache.js
 
 diff --git a/API/hermes/hermes.cpp b/API/hermes/hermes.cpp
@@ -583,10 +628,21 @@ index 1a66be931c50da1e83e283617575b2c3bdcdb0d1..d31a89289f9c089e09299bb9d0bbaa59
  
  /// Returns a pointer to an object that can be cast into IHermesRootAPI, which
 diff --git a/include/hermes/AST/Context.h b/include/hermes/AST/Context.h
-index 2d4f58dc62642a932d19c974f12d2cd9a0c76719..02d299887099cc5fba39e8b0668d848e2177d42e 100644
+index 2d4f58dc62642a932d19c974f12d2cd9a0c76719..f5f8d28c56ad16598cd0f08689b492d0f2d1e20c 100644
 --- a/include/hermes/AST/Context.h
 +++ b/include/hermes/AST/Context.h
-@@ -72,6 +72,9 @@ struct OptimizationSettings {
+@@ -65,6 +65,10 @@ struct OptimizationSettings {
+   static constexpr unsigned kDefaultInlineMaxSize = 50;
+   unsigned inlineMaxSize{kDefaultInlineMaxSize};
+ 
++  /// Use bounded Static Hermes inlining opportunities that expose temporary
++  /// objects in callers whose values already live in rooted exception frames.
++  bool staticHermesInlining{false};
++
+   /// Reuse property cache entries for same property name.
+   bool reusePropCache{true};
+ 
+@@ -72,6 +76,9 @@ struct OptimizationSettings {
    /// into builtin calls.
    bool staticBuiltins{false};
  
@@ -596,6 +652,54 @@ index 2d4f58dc62642a932d19c974f12d2cd9a0c76719..02d299887099cc5fba39e8b0668d848e
    /// Attempt to resolve CommonJS require() calls at compile time.
    bool staticRequire{false};
  
+diff --git a/include/hermes/Support/MathFunctions.h b/include/hermes/Support/MathFunctions.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..307c42f10238473e3c33b37b90629fe8e35a069d
+--- /dev/null
++++ b/include/hermes/Support/MathFunctions.h
+@@ -0,0 +1,42 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++#ifndef HERMES_SUPPORT_MATHFUNCTIONS_H
++#define HERMES_SUPPORT_MATHFUNCTIONS_H
++
++#include <float.h>
++#include <math.h>
++#include <stdint.h>
++
++/// JavaScript rounding is toward positive infinity at a tie. Unlike round(),
++/// it preserves negative zero in [-0.5, 0). Avoid adding 0.5 where that addition
++/// would round a value below 0.5 to 1 or an already integral value upward.
++static inline double hermesMathRound(double x) {
++  const double integerThreshold = UINT64_C(1) << (DBL_MANT_DIG - 1);
++  double magnitude = fabs(x);
++  if (magnitude >= integerThreshold)
++    return x;
++  if (magnitude < 0.5)
++    return copysign(0, x);
++  return copysign(floor(x + 0.5), x);
++}
++
++/// Unlike fmin/fmax, JavaScript propagates either NaN. The sign comparison
++/// orders -0 before +0 as well as values on opposite sides of zero.
++static inline double hermesMathMin(double x, double y) {
++  if (isnan(x) || isnan(y))
++    return NAN;
++  return x < y || signbit(x) > signbit(y) ? x : y;
++}
++
++static inline double hermesMathMax(double x, double y) {
++  if (isnan(x) || isnan(y))
++    return NAN;
++  return x > y || signbit(x) < signbit(y) ? x : y;
++}
++
++#endif
 diff --git a/include/hermes/VM/CellKind.h b/include/hermes/VM/CellKind.h
 index df50d7b056d5d76fb68a1517721b247366f7b518..5ded1bc8d641c41f7f6e07df73f0f98f7b67898b 100644
 --- a/include/hermes/VM/CellKind.h
@@ -689,15 +793,21 @@ index 18f54d0dba4c39956d5fac1d2cbc02c83ebf0275..cab0a3c391c85fc229a881b874b80ef2
    /// the associated SymbolID is garbage collected.
    void clearUniquedBit() {
 diff --git a/include/hermes/VM/sh_mirror.h b/include/hermes/VM/sh_mirror.h
-index f763724f14ed57a505f2e93054b9b48afef97983..bc9ffdd1592489b8a6911bfbb25b6bc22ea16bb9 100644
+index f763724f14ed57a505f2e93054b9b48afef97983..7098fa10802ae242a34b745849cb7917b3ab55c8 100644
 --- a/include/hermes/VM/sh_mirror.h
 +++ b/include/hermes/VM/sh_mirror.h
-@@ -44,6 +44,14 @@ typedef struct SHPrivateNameCacheEntry {
+@@ -10,6 +10,7 @@
+ 
+ #include "hermes/VM/sh_legacy_value.h"
+ #include "hermes/VM/sh_runtime.h"
++#include "hermes/VMLayouts/PropertyCache.h"
+ 
+ #ifdef HERMESVM_COMPRESSED_POINTERS
+ typedef uint32_t SHCompressedPointerRawType;
+@@ -44,6 +45,12 @@ typedef struct SHPrivateNameCacheEntry {
    uint32_t slot;
  } SHPrivateNameCacheEntry;
  
-+// Several keys from the same shape often share a computed-load site.
-+#define SH_COMPUTED_READ_CACHE_WAYS 8
 +typedef struct SHComputedReadCacheEntry {
 +  SHCompressedPointerRawType clazz;
 +  SHWeakRootSymbolID key;
@@ -707,7 +817,7 @@ index f763724f14ed57a505f2e93054b9b48afef97983..bc9ffdd1592489b8a6911bfbb25b6bc2
  /// Struct mirroring the layout of GCCell.
  typedef struct SHGCCell {
    SHCompressedPointerRawType kindAndSize;
-@@ -53,6 +61,15 @@ typedef struct SHGCCell {
+@@ -53,6 +60,15 @@ typedef struct SHGCCell {
  #endif
  } SHGCCell;
  
@@ -723,7 +833,7 @@ index f763724f14ed57a505f2e93054b9b48afef97983..bc9ffdd1592489b8a6911bfbb25b6bc2
  /// Struct mirroring the layout of JSObject (without the direct props).
  typedef struct SHJSObject {
    SHGCCell base;
-@@ -62,6 +79,21 @@ typedef struct SHJSObject {
+@@ -62,6 +78,28 @@ typedef struct SHJSObject {
    SHCompressedPointerRawType propStorage;
  } SHJSObject;
  
@@ -733,6 +843,13 @@ index f763724f14ed57a505f2e93054b9b48afef97983..bc9ffdd1592489b8a6911bfbb25b6bc2
 +  uint32_t length;
 +  uint32_t offset;
 +} SHJSTypedArray;
++
++typedef struct SHArrayImpl {
++  SHJSObject base;
++  uint32_t beginIndex;
++  uint32_t elemCount;
++  SHCompressedPointer indexedStorage;
++} SHArrayImpl;
 +
 +typedef struct SHJSArrayBuffer {
 +  SHJSObject base;
@@ -746,10 +863,18 @@ index f763724f14ed57a505f2e93054b9b48afef97983..bc9ffdd1592489b8a6911bfbb25b6bc2
  typedef SHCompressedPointerRawType SHGCSmallHermesValue;
  #else
 diff --git a/include/hermes/VM/static_h.h b/include/hermes/VM/static_h.h
-index 13246ec2f260f05df9b71a8810ec1049faf179fd..8b5a6237df8b0766b7338b69b93ca3ab68aa0ced 100644
+index 13246ec2f260f05df9b71a8810ec1049faf179fd..17c114b28a5108d237e7b071b082bdf76f3a10a8 100644
 --- a/include/hermes/VM/static_h.h
 +++ b/include/hermes/VM/static_h.h
-@@ -90,6 +90,7 @@ typedef struct SHUnit {
+@@ -8,6 +8,7 @@
+ #ifndef HERMES_STATIC_H_H
+ #define HERMES_STATIC_H_H
+ 
++#include "hermes/Support/MathFunctions.h"
+ #include "hermes/Support/sh_tryfast_fp_cvt.h"
+ #include "hermes/VM/sh_legacy_value.h"
+ #include "hermes/VM/sh_mirror.h"
+@@ -90,6 +91,7 @@ typedef struct SHUnit {
    uint32_t num_read_prop_cache_entries;
    uint32_t num_write_prop_cache_entries;
    uint32_t num_private_name_cache_entries;
@@ -757,7 +882,7 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..8b5a6237df8b0766b7338b69b93ca3ab
  
    /// Pool of ASCII strings.
    const char *ascii_pool;
-@@ -121,6 +122,8 @@ typedef struct SHUnit {
+@@ -121,6 +123,8 @@ typedef struct SHUnit {
    /// `num_private_name_cache_entries` elements.  Must be zeroed
    /// initially.
    SHPrivateNameCacheEntry *private_name_cache;
@@ -766,7 +891,7 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..8b5a6237df8b0766b7338b69b93ca3ab
  
    /// Object key buffer.
    const unsigned char *obj_key_buffer;
-@@ -219,6 +222,27 @@ typedef struct SHLocals {
+@@ -219,6 +223,34 @@ typedef struct SHLocals {
      offsetof(SHUnit, num_write_prop_cache_entries))                          \
    V(unit_num_private_cache_offset,                                           \
      offsetof(SHUnit, num_private_name_cache_entries))                        \
@@ -774,6 +899,13 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..8b5a6237df8b0766b7338b69b93ca3ab
 +    offsetof(SHUnit, num_computed_read_cache_entries))                      \
 +  V(computed_cache_entry_size, sizeof(SHComputedReadCacheEntry))            \
 +  V(computed_cache_ways, SH_COMPUTED_READ_CACHE_WAYS)                       \
++  V(computed_cache_associativity, SH_COMPUTED_READ_CACHE_ASSOCIATIVITY)     \
++  V(named_cache_ways, SH_NAMED_READ_CACHE_WAYS)                             \
++  V(array_impl_size, sizeof(SHArrayImpl))                                   \
++  V(array_begin_offset, offsetof(SHArrayImpl, beginIndex))                  \
++  V(array_count_offset, offsetof(SHArrayImpl, elemCount))                    \
++  V(array_storage_offset, offsetof(SHArrayImpl, indexedStorage))            \
++  V(array_kind, SH_JSArrayKind)                                            \
 +  V(cell_kind_shift, SH_CELL_KIND_SHIFT)                                    \
 +  V(uint8_array_kind, SH_Uint8ArrayKind)                                    \
 +  V(int8_array_kind, SH_Int8ArrayKind)                                      \
@@ -794,7 +926,7 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..8b5a6237df8b0766b7338b69b93ca3ab
    V(unit_ascii_pool_offset, offsetof(SHUnit, ascii_pool))                    \
    V(unit_u16_pool_offset, offsetof(SHUnit, u16_pool))                        \
    V(unit_strings_offset, offsetof(SHUnit, strings))                          \
-@@ -226,6 +250,7 @@ typedef struct SHLocals {
+@@ -226,6 +258,7 @@ typedef struct SHLocals {
    V(unit_write_cache_offset, offsetof(SHUnit, write_prop_cache))             \
    V(unit_read_cache_offset, offsetof(SHUnit, read_prop_cache))               \
    V(unit_private_cache_offset, offsetof(SHUnit, private_name_cache))         \
@@ -802,7 +934,7 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..8b5a6237df8b0766b7338b69b93ca3ab
    V(unit_object_key_buffer_offset, offsetof(SHUnit, obj_key_buffer))         \
    V(unit_object_key_buffer_size_offset,                                      \
      offsetof(SHUnit, obj_key_buffer_size))                                   \
-@@ -316,6 +341,18 @@ _sh_init_with_error(int argc, char **argv, char **errorMessage);
+@@ -316,6 +349,18 @@ _sh_init_with_error(int argc, char **argv, char **errorMessage);
  /// Destroy a runtime instance created by \c _sh_init();
  SHERMES_EXPORT void _sh_done(SHRuntime *shr);
  
@@ -821,7 +953,51 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..8b5a6237df8b0766b7338b69b93ca3ab
  /// Check on the native stack and throw a stack overflow error if it overflows.
  /// When compiled without HERMES_CHECK_NATIVE_STACK, does nothing.
  /// TODO: Inline the fast path to allow for faster execution.
-@@ -899,6 +936,83 @@ static inline SHLegacyValue _sh_ljs_get_by_val_rjs(
+@@ -881,12 +926,43 @@ static inline SHLegacyValue _sh_ljs_get_by_id_rjs_inline(
+   return _sh_ljs_get_by_id_rjs(shr, source, symID, propCacheEntry);
+ }
+ 
++/// \pre cache points to SH_NAMED_READ_CACHE_WAYS adjacent weak-rooted entries.
++SHERMES_EXPORT SHLegacyValue _sh_ljs_get_by_id_polymorphic_rjs(
++    SHRuntime *shr,
++    const SHLegacyValue *source,
++    SHSymbolID symID,
++    SHReadPropertyCacheEntry *cache);
++
++static inline SHLegacyValue _sh_ljs_get_by_id_polymorphic_rjs_inline(
++    SHRuntime *shr,
++    const SHLegacyValue *source,
++    SHSymbolID symID,
++    SHReadPropertyCacheEntry *cache) {
++  if (SH_LIKELY(_sh_ljs_is_object(*source))) {
++    SHJSObject *object = (SHJSObject *)_sh_ljs_get_pointer(*source);
++    for (unsigned i = 0; i < SH_NAMED_READ_CACHE_WAYS; ++i) {
++      if (cache[i].clazz == object->clazz)
++        return _sh_prload_inline(shr, *source, cache[i]._slot16);
++    }
++  }
++  return _sh_ljs_get_by_id_polymorphic_rjs(shr, source, symID, cache);
++}
++
+ SHERMES_EXPORT SHLegacyValue _sh_ljs_get_by_id_with_receiver_rjs(
+     SHRuntime *shr,
+     const SHLegacyValue *source,
+     const SHLegacyValue *receiver,
+     SHSymbolID symID,
+     SHReadPropertyCacheEntry *propCacheEntry);
++/// Compare a numeric index read from a known primitive string with one UTF-16
++/// code unit. Out-of-range keys still consult the prototype.
++SHERMES_EXPORT SHLegacyValue _sh_ljs_string_index_compare(
++    SHRuntime *shr,
++    SHLegacyValue source,
++    double key,
++    uint16_t character,
++    uint8_t invert);
++
+ SHERMES_EXPORT SHLegacyValue _sh_ljs_get_by_val_with_receiver_rjs(
+     SHRuntime *shr,
+     SHLegacyValue *source,
+@@ -899,6 +975,97 @@ static inline SHLegacyValue _sh_ljs_get_by_val_rjs(
    return _sh_ljs_get_by_val_with_receiver_rjs(shr, source, key, source);
  }
  
@@ -832,20 +1008,34 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..8b5a6237df8b0766b7338b69b93ca3ab
 +    SHComputedReadCacheEntry *cache);
 +
 +/// Numeric element reads can complete without a runtime call or allocation.
-+/// No raw buffer pointer survives a call, so GC and detachment cannot invalidate
-+/// this read. Other keys, Float16 and BigInt arrays retain the runtime path.
-+static inline bool _sh_try_get_typed_element(
++/// No raw storage pointer survives a call, so GC and detachment cannot invalidate
++/// this read. Array holes must fall through to inherited-property lookup. Other
++/// keys, Float16 and BigInt arrays retain the runtime path.
++static inline bool _sh_try_get_indexed_element(
 +    SHRuntime *shr,
 +    SHLegacyValue source,
 +    double key,
 +    SHLegacyValue *result) {
-+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 +  uint32_t index;
 +  if (!_sh_ljs_is_object(source) || !sh_tryfast_f64_to_u32(key, index))
 +    return false;
 +  SHJSTypedArray *array = (SHJSTypedArray *)_sh_ljs_get_pointer(source);
 +  const unsigned kind =
 +      (unsigned)(array->base.base.kindAndSize >> SH_CELL_KIND_SHIFT) & 0xff;
++  if (kind == SH_JSArrayKind) {
++    SHArrayImpl *ordinary = (SHArrayImpl *)array;
++    uint32_t offset = index - ordinary->beginIndex;
++    if (offset >= ordinary->elemCount)
++      return false;
++    SHArrayStorageSmall *storage = (SHArrayStorageSmall *)
++        _sh_cp_decode_non_null(shr, ordinary->indexedStorage);
++    SHLegacyValue value = _sh_shv_unbox_inline(shr, storage->storage[offset]);
++    if (_sh_ljs_is_empty(value))
++      return false;
++    *result = value;
++    return true;
++  }
++#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 +  if (kind < SH_Uint8ArrayKind || kind > SH_Float64ArrayKind ||
 +      kind == SH_Float16ArrayKind)
 +    return false;
@@ -886,7 +1076,7 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..8b5a6237df8b0766b7338b69b93ca3ab
 +    SHLegacyValue *source,
 +    SHLegacyValue *key) {
 +  SHLegacyValue result;
-+  if (_sh_try_get_typed_element(shr, *source, key->f64, &result))
++  if (_sh_try_get_indexed_element(shr, *source, key->f64, &result))
 +    return result;
 +  return _sh_ljs_get_by_val_rjs(shr, source, key);
 +}
@@ -897,7 +1087,7 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..8b5a6237df8b0766b7338b69b93ca3ab
 +    SHLegacyValue *key,
 +    SHComputedReadCacheEntry *cache) {
 +  SHLegacyValue result;
-+  if (_sh_try_get_typed_element(shr, *source, key->f64, &result))
++  if (_sh_try_get_indexed_element(shr, *source, key->f64, &result))
 +    return result;
 +  return _sh_ljs_get_by_val_cached_rjs(shr, source, key, cache);
 +}
@@ -905,7 +1095,7 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..8b5a6237df8b0766b7338b69b93ca3ab
  SHERMES_EXPORT SHLegacyValue _sh_ljs_get_own_private_by_sym(
      SHRuntime *shr,
      const SHLegacyValue *source,
-@@ -910,6 +1024,16 @@ SHERMES_EXPORT SHLegacyValue _sh_ljs_get_own_private_by_sym(
+@@ -910,6 +1077,16 @@ SHERMES_EXPORT SHLegacyValue _sh_ljs_get_own_private_by_sym(
  SHERMES_EXPORT SHLegacyValue
  _sh_ljs_get_by_index_rjs(SHRuntime *shr, SHLegacyValue *source, uint32_t key);
  
@@ -914,7 +1104,7 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..8b5a6237df8b0766b7338b69b93ca3ab
 +    SHLegacyValue *source,
 +    uint32_t key) {
 +  SHLegacyValue result;
-+  if (_sh_try_get_typed_element(shr, *source, key, &result))
++  if (_sh_try_get_indexed_element(shr, *source, key, &result))
 +    return result;
 +  return _sh_ljs_get_by_index_rjs(shr, source, key);
 +}
@@ -922,7 +1112,7 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..8b5a6237df8b0766b7338b69b93ca3ab
  /// Put an enumerable property by string id.
  SHERMES_EXPORT void _sh_ljs_define_own_by_id(
      SHRuntime *shr,
-@@ -980,6 +1104,13 @@ _sh_ljs_get_string(SHRuntime *shr, SHSymbolID symID);
+@@ -980,6 +1157,13 @@ _sh_ljs_get_string(SHRuntime *shr, SHSymbolID symID);
  SHERMES_EXPORT SHLegacyValue
  _sh_ljs_create_regexp(SHRuntime *shr, SHSymbolID pattern, SHSymbolID flags);
  
@@ -936,7 +1126,7 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..8b5a6237df8b0766b7338b69b93ca3ab
  /// \param value the string of the BigInt.
  /// \param size  the size of the string \c value.
  SHERMES_EXPORT SHLegacyValue
-@@ -1616,6 +1747,16 @@ static inline uint32_t _sh_to_uint32_double(double d) {
+@@ -1616,6 +1800,16 @@ static inline uint32_t _sh_to_uint32_double(double d) {
    return (uint32_t)_sh_to_int32_double_slow_path(d);
  }
  
@@ -953,7 +1143,7 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..8b5a6237df8b0766b7338b69b93ca3ab
  /// Store a property into direct storage.
  SHERMES_EXPORT void _sh_prstore_direct(
      SHRuntime *shr,
-@@ -1877,6 +2018,14 @@ SHERMES_EXPORT int _sh_errno(void);
+@@ -1877,6 +2071,14 @@ SHERMES_EXPORT int _sh_errno(void);
  SHERMES_EXPORT SHLegacyValue
  _sh_asciiz_to_string(SHRuntime *shr, const char *str, ptrdiff_t len);
  
@@ -968,11 +1158,176 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..8b5a6237df8b0766b7338b69b93ca3ab
  static inline void _sh_ptr_write_char(char *ptr, int offset, char c) {
    ptr[offset] = c;
  }
+diff --git a/include/hermes/VMLayouts/PropertyCache.h b/include/hermes/VMLayouts/PropertyCache.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..60b71e00283bc2709968a3b7426c32ccbac8cec9
+--- /dev/null
++++ b/include/hermes/VMLayouts/PropertyCache.h
+@@ -0,0 +1,20 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++#ifndef HERMES_VMLAYOUTS_PROPERTYCACHE_H
++#define HERMES_VMLAYOUTS_PROPERTYCACHE_H
++
++// Ordinary SH named reads reserve two adjacent entries. Other users, including
++// the JIT, retain the single-entry layout and API.
++#define SH_NAMED_READ_CACHE_WAYS 2
++
++// Four sets of two shape/key pairs keep both receiver diversity and key
++// diversity bounded without increasing the per-site allocation.
++#define SH_COMPUTED_READ_CACHE_WAYS 8
++#define SH_COMPUTED_READ_CACHE_ASSOCIATIVITY 2
++
++#endif
+diff --git a/lib/BCGen/SH/PeepholeLowering.cpp b/lib/BCGen/SH/PeepholeLowering.cpp
+index f317df4027e4abfc780886ea7dae80413c43236e..399ebb19e53e54fae4c3e2d2481a4918f99d0f3b 100644
+--- a/lib/BCGen/SH/PeepholeLowering.cpp
++++ b/lib/BCGen/SH/PeepholeLowering.cpp
+@@ -6,8 +6,11 @@
+  */
+ 
+ #include "LoweringPasses.h"
++#include "hermes/AST/NativeContext.h"
+ #include "hermes/BCGen/CommonPeepholeLowering.h"
+ #include "hermes/IR/IRBuilder.h"
++#include "hermes/Optimizer/Scalar/Utils.h"
++#include "hermes/Support/UTF8.h"
+ 
+ namespace hermes::sh {
+ 
+@@ -25,8 +28,13 @@ class PeepholeLowering {
+ 
+   bool run() {
+     bool changed = false;
++    llvh::SmallVector<BinaryOperatorInst *, 16> comparisons;
+     for (auto &BB : *F_) {
+       for (auto &I : BB) {
++        if (optimize_ &&
++            (I.getKind() == ValueKind::BinaryStrictlyEqualInstKind ||
++             I.getKind() == ValueKind::BinaryStrictlyNotEqualInstKind))
++          comparisons.push_back(llvh::cast<BinaryOperatorInst>(&I));
+         if (Value *replaceVal = peep(&I)) {
+           if (replaceVal != &I)
+             I.replaceAllUsesWith(replaceVal);
+@@ -34,10 +42,100 @@ class PeepholeLowering {
+         }
+       }
+     }
++    // Guard insertion splits blocks. Visit only the original comparisons so
++    // the retained fallback cannot be specialized repeatedly.
++    for (auto *comparison : comparisons) {
++      if (auto *result = lowerStringIndexComparison(comparison)) {
++        if (result != comparison)
++          comparison->replaceAllUsesWith(result);
++        changed = true;
++      }
++    }
+     return changed;
+   }
+ 
+  private:
++  Value *lowerStringIndexComparison(BinaryOperatorInst *comparison) {
++    auto *load = llvh::dyn_cast<LoadPropertyInst>(comparison->getLeftHandSide());
++    auto *literal =
++        llvh::dyn_cast<LiteralString>(comparison->getRightHandSide());
++    if (!load || !literal) {
++      load = llvh::dyn_cast<LoadPropertyInst>(comparison->getRightHandSide());
++      literal = llvh::dyn_cast<LiteralString>(comparison->getLeftHandSide());
++    }
++    // Fuse before register allocation, and never move a potentially throwing
++    // property read across another operation. Other receivers keep their own
++    // indexed fast paths rather than paying for a string-specific helper.
++    if (!load || !literal || !load->hasOneUser() ||
++        load->getNextNode() != comparison ||
++        !F_->getParent()->getTypeContext().canBeString(load->getObject()->getType()) ||
++        !load->getProperty()->getType().isNumberType())
++      return nullptr;
++
++    auto text = literal->getValue().str();
++    if (text.size() > 3)
++      return nullptr;
++    std::u16string units;
++    convertUTF8WithSurrogatesToUTF16(
++        std::back_inserter(units), text.data(), text.data() + text.size());
++    if (units.size() != 1)
++      return nullptr;
++
++    builder_.setInsertionPoint(comparison);
++    builder_.setLocation(load->getLocation());
++    BasicBlock *continuation = nullptr;
++    BasicBlock *slow = nullptr;
++    BasicBlock *fast = nullptr;
++    if (!load->getObject()->getType().isStringType()) {
++      auto *original = load->getParent();
++      continuation = splitBasicBlock(original, load->getIterator());
++      slow = builder_.createBasicBlock(F_);
++      fast = builder_.createBasicBlock(F_);
++      builder_.setInsertionBlock(original);
++      auto *isString = builder_.createTypeOfIsInst(
++          load->getObject(),
++          builder_.getLiteralTypeOfIsTypes(TypeOfIsTypes{}.withString(true)));
++      builder_.createCondBranchInst(isString, fast, slow);
++      builder_.setInsertionBlock(fast);
++    }
++    auto &context = F_->getContext();
++    auto &native = context.getNativeContext();
++    auto *signature = native.getSignature(
++        NativeCType::c_hermes_value,
++        {NativeCType::ptr, NativeCType::c_hermes_value, NativeCType::f64,
++         NativeCType::u16, NativeCType::u8});
++    auto *callee = native.getExtern(
++        context.getStringTable().getString("_sh_ljs_string_index_compare"),
++        signature,
++        {},
++        /* declared */ true,
++        /* include */ nullptr);
++    auto *result = builder_.createNativeCallInst(
++        Type::createBoolean(),
++        builder_.getLiteralNativeExtern(callee),
++        signature,
++        {builder_.createGetNativeRuntimeInst(), load->getObject(),
++         load->getProperty(), builder_.getLiteralNumber(units[0]),
++         builder_.getLiteralNumber(
++             comparison->getKind() == ValueKind::BinaryStrictlyNotEqualInstKind)});
++    if (continuation) {
++      builder_.createBranchInst(continuation);
++      builder_.setInsertionBlock(slow);
++      auto *branch = builder_.createBranchInst(continuation);
++      load->moveBefore(branch);
++      comparison->moveBefore(branch);
++      builder_.setInsertionPoint(&*continuation->begin());
++      auto *phi = builder_.createPhiInst();
++      comparison->replaceAllUsesWith(phi);
++      phi->addEntry(result, fast);
++      phi->addEntry(comparison, slow);
++      return comparison;
++    }
++    destroyer_.add(comparison);
++    destroyer_.add(load);
++    return result;
++  }
++
+   /// Perform peephole optimization on the specified instruction. Replacement
+   /// instructions need to be created and inserted in the correct position by
+   /// using the builder. Instructions for deletion should be inserted in the
 diff --git a/lib/BCGen/SH/SH.cpp b/lib/BCGen/SH/SH.cpp
-index e030d709072f96cff72bec9ee8efa3fb820266d6..b4b4eba4dc01b8e20722862d94c06b2df8694dd6 100644
+index e030d709072f96cff72bec9ee8efa3fb820266d6..027f23727e83c97038a1b5e84fbc3498f72c8686 100644
 --- a/lib/BCGen/SH/SH.cpp
 +++ b/lib/BCGen/SH/SH.cpp
-@@ -485,6 +485,7 @@ class SHNativeJSFunctionTable {
+@@ -29,6 +29,7 @@
+ #include "hermes/Support/DenseMapInfoSpecializations.h"
+ #include "hermes/Support/HashString.h"
+ #include "hermes/Support/UTF8.h"
++#include "hermes/VMLayouts/PropertyCache.h"
+ #include "hermes/VMLayouts/StackFrameLayout.h"
+ #include "llvh/ADT/MapVector.h"
+ 
+@@ -485,6 +486,7 @@ class SHNativeJSFunctionTable {
  };
  
  struct ModuleGen {
@@ -980,7 +1335,36 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..b4b4eba4dc01b8e20722862d94c06b2d
    /// Table containing uniqued strings for the current module.
    SHStringTable stringTable{};
  
-@@ -1109,6 +1110,54 @@ class InstrGen {
+@@ -696,9 +698,10 @@ class InstrGen {
+   }
+   llvh::raw_ostream &genStringConstReadIC(
+       LiteralString *LS,
+-      Value *optValue = nullptr) {
++      Value *optValue = nullptr,
++      uint32_t entries = 1) {
+     genStringConstICCommon(LS, optValue);
+-    return genReadIC(LS);
++    return genReadIC(LS, entries);
+   }
+ 
+   /// Generate a cache index. This must be used when passing parameters to API
+@@ -712,10 +715,12 @@ class InstrGen {
+       return os_ << "shUnit->write_prop_cache + " << nextWriteCacheIdx_++;
+     return os_ << "get_write_prop_cache(shUnit) + " << nextWriteCacheIdx_++;
+   }
+-  llvh::raw_ostream &genReadIC(LiteralString *LS) {
++  llvh::raw_ostream &genReadIC(LiteralString *LS, uint32_t entries = 1) {
++    const auto index = nextReadCacheIdx_;
++    nextReadCacheIdx_ += entries;
+     if (options_.emitCBundle)
+-      return os_ << "shUnit->read_prop_cache + " << nextReadCacheIdx_++;
+-    return os_ << "get_read_prop_cache(shUnit) + " << nextReadCacheIdx_++;
++      return os_ << "shUnit->read_prop_cache + " << index;
++    return os_ << "get_read_prop_cache(shUnit) + " << index;
+   }
+   llvh::raw_ostream &genPrivateNameIC(Value *privateName) {
+     if (options_.emitCBundle)
+@@ -1109,6 +1114,54 @@ class InstrGen {
      bool bothDouble = inst.getLeftHandSide()->getType().isNumberType() &&
          inst.getRightHandSide()->getType().isNumberType();
  
@@ -1035,7 +1419,21 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..b4b4eba4dc01b8e20722862d94c06b2d
      // NOTE: this used to check whether we know that both operands are numbers
      // in the int32 range. We no longer track that information, so for now this
      // is hardcoded to false.
-@@ -1576,18 +1625,35 @@ class InstrGen {
+@@ -1565,29 +1618,46 @@ class InstrGen {
+     generateValue(inst);
+     os_ << " = ";
+     if (auto *LS = llvh::dyn_cast<LiteralString>(inst.getProperty())) {
+-      os_ << (options_.smallC ? "_sh_ljs_get_by_id_rjs"
+-                              : "_sh_ljs_get_by_id_rjs_inline")
++      os_ << (options_.smallC ? "_sh_ljs_get_by_id_polymorphic_rjs"
++                             : "_sh_ljs_get_by_id_polymorphic_rjs_inline")
+           << "(shr,&";
+       generateRegister(*inst.getObject());
+       os_ << ",";
+-      genStringConstReadIC(LS) << ");\n";
++      genStringConstReadIC(LS, nullptr, SH_NAMED_READ_CACHE_WAYS) << ");\n";
+       return;
+     }
      // If the prop is an index-like constant, generate the special bytecode.
      if (auto *litNum = llvh::dyn_cast<LiteralNumber>(inst.getProperty())) {
        if (auto idxOpt = doubleToArrayIndex(litNum->getValue())) {
@@ -1074,7 +1472,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..b4b4eba4dc01b8e20722862d94c06b2d
    }
    void generateLoadPropertyWithReceiverInst(
        LoadPropertyWithReceiverInst &inst) {
-@@ -1881,35 +1947,30 @@ class InstrGen {
+@@ -1881,35 +1951,30 @@ class InstrGen {
      hermes_fatal("DebuggerInst should have been deleted.");
    }
    void generateCreateRegExpInst(CreateRegExpInst &inst) {
@@ -1123,10 +1521,13 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..b4b4eba4dc01b8e20722862d94c06b2d
    }
    void generateTryEndInst(TryEndInst &inst) {
      // Restore the tryState to the state of the Try enclosing the catch.
-@@ -2217,6 +2278,22 @@ class InstrGen {
+@@ -2217,17 +2282,76 @@ class InstrGen {
          << (uint32_t)inst.getBuiltinIndex() << ");\n";
    }
    void generateCallBuiltinInst(CallBuiltinInst &inst) {
+-    if (inst.getBuiltinIndex() == BuiltinMethod::Math_sqrt) {
+-      if (inst.getNumArguments() == 2 &&
+-          inst.getArgument(1)->getType().isNumberType()) {
 +    if (inst.getBuiltinIndex() == BuiltinMethod::Math_imul &&
 +        inst.getNumArguments() == 3 &&
 +        inst.getArgument(1)->getType().isNumberType() &&
@@ -1143,10 +1544,65 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..b4b4eba4dc01b8e20722862d94c06b2d
 +      os_ << ");\n";
 +      return;
 +    }
-     if (inst.getBuiltinIndex() == BuiltinMethod::Math_sqrt) {
-       if (inst.getNumArguments() == 2 &&
-           inst.getArgument(1)->getType().isNumberType()) {
-@@ -2703,6 +2780,10 @@ class InstrGen {
++    // CallBuiltinInst already carries an intrinsic-identity proof. Restrict
++    // direct emission to numbers so coercions and their order stay in the VM.
++    if (inst.getNumArguments() == 2 &&
++        inst.getArgument(1)->getType().isNumberType()) {
++      const char *operation = nullptr;
++      switch (inst.getBuiltinIndex()) {
++        case BuiltinMethod::Math_abs:
++          operation = "fabs";
++          break;
++        case BuiltinMethod::Math_ceil:
++          operation = "ceil";
++          break;
++        case BuiltinMethod::Math_floor:
++          operation = "floor";
++          break;
++        case BuiltinMethod::Math_trunc:
++          operation = "trunc";
++          break;
++        case BuiltinMethod::Math_round:
++          operation = "hermesMathRound";
++          break;
++        case BuiltinMethod::Math_sqrt:
++          operation = "sqrt";
++          break;
++        default:
++          break;
++      }
++      if (operation) {
+         os_.indent(2);
+         generateRegister(inst);
+-        os_ << " = _sh_ljs_double(sqrt(_sh_ljs_get_double(";
++        os_ << " = _sh_ljs_double(" << operation << "(_sh_ljs_get_double(";
+         generateValue(*inst.getArgument(1));
+         os_ << ")));\n";
+         return;
+       }
+     }
++    if ((inst.getBuiltinIndex() == BuiltinMethod::Math_min ||
++         inst.getBuiltinIndex() == BuiltinMethod::Math_max) &&
++        inst.getNumArguments() == 3 &&
++        inst.getArgument(1)->getType().isNumberType() &&
++        inst.getArgument(2)->getType().isNumberType()) {
++      os_.indent(2);
++      generateRegister(inst);
++      os_ << " = _sh_ljs_double("
++          << (inst.getBuiltinIndex() == BuiltinMethod::Math_min
++                  ? "hermesMathMin"
++                  : "hermesMathMax")
++          << "(_sh_ljs_get_double(";
++      generateValue(*inst.getArgument(1));
++      os_ << "), _sh_ljs_get_double(";
++      generateValue(*inst.getArgument(2));
++      os_ << ")));\n";
++      return;
++    }
+     os_.indent(2);
+     generateRegister(inst);
+     os_ << " = _sh_ljs_call_builtin(shr, frame, " << inst.getNumArguments() - 1
+@@ -2703,6 +2827,10 @@ class InstrGen {
    }
    /// Convert a JS value to its corresponding native argument type.
    void convertToNativeArg(NativeCType ctype, Value *arg) {
@@ -1157,7 +1613,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..b4b4eba4dc01b8e20722862d94c06b2d
      MachineType mt = nativeContext_.md.mapCType(ctype);
      const MachineDesc::MTD &mtd = nativeContext_.md.getMTD(mt);
      int parens = 1;
-@@ -3213,6 +3294,8 @@ void generateUnitData(
+@@ -3213,6 +3341,8 @@ void generateUnitData(
       << nextReadCacheIdx << "];\n"
       << "  SHPrivateNameCacheEntry private_name_cache_data["
       << nextPrivateNameCacheIdx << "];\n"
@@ -1166,7 +1622,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..b4b4eba4dc01b8e20722862d94c06b2d
       << "  SHCompressedPointer object_literal_class_cache["
       << moduleGen.literalBuffers.objShapeTable.size() << "];\n};\n"
       << "SHUnit *CREATE_THIS_UNIT(void) {\n"
-@@ -3224,11 +3307,15 @@ void generateUnitData(
+@@ -3224,11 +3354,15 @@ void generateUnitData(
    OS << ",.num_symbols =" << moduleGen.stringTable.size()
       << ", .num_write_prop_cache_entries = " << nextWriteCacheIdx
       << ", .num_read_prop_cache_entries = " << nextReadCacheIdx
@@ -1207,6 +1663,214 @@ index 7cf6e64252b09ce93924136bff7db7add3597dd6..8b080a8b4ab0bfc9f45b05fe7b2a731b
    optimizationOpts.staticRequire = cl::StaticRequire;
  
    optimizationOpts.useLegacyMem2Reg = cl::LegacyMem2Reg;
+diff --git a/lib/Optimizer/Scalar/FunctionAnalysis.cpp b/lib/Optimizer/Scalar/FunctionAnalysis.cpp
+index fb1fa639927aeaa1074baba0e768f1bc1b47cb5d..d33b8291bbd07f35d1eab845f3af0370f25350e0 100644
+--- a/lib/Optimizer/Scalar/FunctionAnalysis.cpp
++++ b/lib/Optimizer/Scalar/FunctionAnalysis.cpp
+@@ -464,6 +464,85 @@ void analyzeFunctionCallsites(Function *F) {
+   }
+ }
+ 
++/// Resolve a closure's code through closed call arguments and returned closures.
++/// This never substitutes the closure object or its environment: separate calls
++/// to a factory may return the same code with different captured values.
++class KnownClosureTargets {
++  llvh::DenseMap<Value *, Function *> targets_;
++
++  Function *resolve(Value *value, unsigned &remaining) {
++    if (remaining == 0)
++      return nullptr;
++    --remaining;
++    auto inserted = targets_.try_emplace(value, nullptr);
++    if (!inserted.second)
++      return inserted.first->second;
++
++    Function *target = nullptr;
++    auto merge = [&](Value *candidate) {
++      auto *next = resolve(candidate, remaining);
++      if (!next || (target && target != next))
++        return false;
++      target = next;
++      return true;
++    };
++    if (auto *create = llvh::dyn_cast<BaseCreateCallableInst>(value)) {
++      target = create->getFunctionCode();
++    } else if (auto *phi = llvh::dyn_cast<PhiInst>(value)) {
++      for (unsigned i = 0; i < phi->getNumEntries(); ++i)
++        if (!merge(phi->getEntry(i).first))
++          return nullptr;
++    } else if (auto *narrow = llvh::dyn_cast<UnionNarrowTrustedInst>(value)) {
++      target = resolve(narrow->getSingleOperand(), remaining);
++    } else if (auto *parameter = llvh::dyn_cast<LoadParamInst>(value)) {
++      auto *function = parameter->getFunction();
++      // Strict functions with no unknown callers cannot acquire another
++      // callback through external invocation or an aliased arguments object.
++      if (!function->allCallsitesKnown() ||
++          function->getNumUsers() > remaining)
++        return nullptr;
++      unsigned index = parameter->getParam()->getIndexInParamList();
++      auto callsites = getKnownCallsites(function);
++      if (callsites.size() > remaining)
++        return nullptr;
++      for (auto *call : callsites)
++        if (index >= call->getNumArguments() ||
++            !merge(call->getArgument(index)))
++          return nullptr;
++    } else if (auto *call = llvh::dyn_cast<BaseCallInst>(value)) {
++      auto *function = llvh::dyn_cast<Function>(call->getTarget());
++      if (!function || !call->getNewTarget()->getType().isUndefinedType())
++        return nullptr;
++      for (auto &BB : *function) {
++        if (remaining == 0)
++          return nullptr;
++        --remaining;
++        if (auto *ret = llvh::dyn_cast<ReturnInst>(BB.getTerminator()))
++          if (!merge(ret->getValue()))
++            return nullptr;
++      }
++    }
++    // Recursive dependencies encounter the null entry above and remain unknown.
++    // Reacquire the map entry because recursive insertions can reallocate it.
++    targets_[value] = target;
++    return target;
++  }
++
++ public:
++  void analyze(BaseCallInst *call) {
++    if (!llvh::isa<EmptySentinel>(call->getTarget()))
++      return;
++    unsigned remaining = 128;
++    auto *target = resolve(call->getCallee(), remaining);
++    if (!target)
++      return;
++    call->setTarget(target);
++    call->setCalleeIsAlwaysClosure(call->getModule()->getLiteralBool(true));
++    // Leave environment empty. Inlining/direct calls must obtain the scope
++    // from the actual callback, rather than any factory's creation site.
++  }
++};
++
+ } // namespace
+ 
+ Pass *createFunctionAnalysis() {
+@@ -481,6 +560,12 @@ Pass *createFunctionAnalysis() {
+       for (Function &F : *M) {
+         analyzeFunctionCallsites(&F);
+       }
++      KnownClosureTargets targets;
++      for (Function &F : *M)
++        for (auto &BB : F)
++          for (auto &I : BB)
++            if (auto *call = llvh::dyn_cast<BaseCallInst>(&I))
++              targets.analyze(call);
+       return true;
+     }
+   };
+diff --git a/lib/Optimizer/Scalar/Inlining.cpp b/lib/Optimizer/Scalar/Inlining.cpp
+index 37debd03310953c7277fc78068647588f04fdb4a..670577ebb9a12163729e4bfc12c283095f2f0c21 100644
+--- a/lib/Optimizer/Scalar/Inlining.cpp
++++ b/lib/Optimizer/Scalar/Inlining.cpp
+@@ -512,6 +512,25 @@ static std::pair<bool, size_t> shouldTryToInline(
+   return {true, numSignificantInstructions};
+ }
+ 
++/// Identify direct parameter field reads as an inlining profitability hint.
++/// The existing object promotion pass still owns the complete escape/layout
++/// proof after the call has been exposed.
++static llvh::SmallSetVector<unsigned, 4> objectReadParameters(Function *F) {
++  llvh::SmallSetVector<unsigned, 4> parameters;
++  for (auto &BB : *F) {
++    for (auto &I : BB) {
++      Value *object = nullptr;
++      if (auto *load = llvh::dyn_cast<LoadPropertyInst>(&I))
++        object = load->getObject();
++      else if (auto *load = llvh::dyn_cast<PrLoadInst>(&I))
++        object = load->getObject();
++      if (auto *parameter = llvh::dyn_cast_or_null<LoadParamInst>(object))
++        parameters.insert(parameter->getParam()->getIndexInParamList());
++    }
++  }
++  return parameters;
++}
++
+ bool Inlining::runOnModule(Module *M) {
+   if (!M->getContext().getOptimizationSettings().inlining)
+     return false;
+@@ -530,8 +549,9 @@ bool Inlining::runOnModule(Module *M) {
+   auto *nonFunctionErrorLS =
+       builder.getLiteralString("Trying to call a non-function");
+ 
+-  // Find functions with try/catch blocks, to avoid inlining into them.
++  // Record try/catch callers for the stricter growth policy.
+   llvh::DenseSet<Function *> functionsWithTryCatch{};
++  llvh::SmallDenseMap<Function *, size_t, 8> tryInliningGrowth;
+   for (Function *FC : functionOrder) {
+     if (functionHasTryCatch(FC)) {
+       functionsWithTryCatch.insert(FC);
+@@ -567,6 +587,11 @@ bool Inlining::runOnModule(Module *M) {
+       continue;
+     }
+ 
++    const auto objectParameters =
++        M->getContext().getOptimizationSettings().staticHermesInlining
++        ? objectReadParameters(FC)
++        : llvh::SmallSetVector<unsigned, 4>{};
++
+     for (BaseCallInst *CI : callsites) {
+       // We know the callee is an IR function, so it must be possible to inline.
+       Function *intoFunction = CI->getParent()->getParent();
+@@ -599,13 +624,37 @@ bool Inlining::runOnModule(Module *M) {
+       // Very small functions are still worth inlining regardless, because the
+       // JIT/native backend deopt is more expensive than the code size.
+       static constexpr size_t kTryCatchInlineSizeLimit = 5;
++      bool objectReaderInTry = false;
+       if (functionsWithTryCatch.count(intoFunction) &&
+           numSignificantInstructions >= kTryCatchInlineSizeLimit) {
+-        LLVM_DEBUG(
+-            llvh::dbgs() << "Cannot inline function '"
+-                         << FC->getInternalNameStr()
+-                         << "': contains try/catch\n");
+-        continue;
++        // SH already stores every value of a try/catch caller in rooted locals
++        // across longjmp. A small reader of a freshly allocated argument can
++        // remove that allocation and its field operations after inlining.
++        // Bound both individual copies and total added instructions per caller
++        // per pass; keep the ordinary JIT/bytecode policy unchanged.
++        static constexpr size_t kObjectReaderInlineSizeLimit = 32;
++        static constexpr size_t kTryInlineGrowthLimit = 128;
++        if (numSignificantInstructions <= kObjectReaderInlineSizeLimit &&
++            tryInliningGrowth.lookup(intoFunction) +
++                    numSignificantInstructions <=
++                kTryInlineGrowthLimit &&
++            CI->getCalleeIsAlwaysClosure()->getValue()) {
++          for (unsigned index : objectParameters) {
++            if (index < CI->getNumArguments() &&
++                llvh::isa<BaseAllocObjectLiteralInst>(
++                    CI->getArgument(index))) {
++              objectReaderInTry = true;
++              break;
++            }
++          }
++        }
++        if (!objectReaderInTry) {
++          LLVM_DEBUG(
++              llvh::dbgs() << "Cannot inline function '"
++                           << FC->getInternalNameStr()
++                           << "': contains try/catch\n");
++          continue;
++        }
+       }
+ 
+       // We cannot inline into a potentially constructing call if the callee
+@@ -647,6 +696,8 @@ bool Inlining::runOnModule(Module *M) {
+           llvh::dbgs() << "\n";);
+ 
+       intoFunctions.insert(intoFunction);
++      if (objectReaderInTry)
++        tryInliningGrowth[intoFunction] += numSignificantInstructions;
+ 
+       // Split the block in two and move all instructions following the call
+       // to the new block.
 diff --git a/lib/Optimizer/Scalar/LowerBuiltinCalls.cpp b/lib/Optimizer/Scalar/LowerBuiltinCalls.cpp
 index 065e083154ac7b278a2d9fb7879112312d57db45..e9e44477baaf466f12c143d4fae54ae4c7ecaa3f 100644
 --- a/lib/Optimizer/Scalar/LowerBuiltinCalls.cpp
@@ -1242,6 +1906,33 @@ index da432ba756ec3e7a3faa4daf4a564e9bfe951fa6..603f366ef682895b4fb2b8fdc005249c
                &natParamType))
          return;
        natParamTypes.push_back(natParamType);
+diff --git a/lib/VM/JSArray.cpp b/lib/VM/JSArray.cpp
+index e3ddb67023cc08ee8492cb3088e500063d8782d5..27f17c7ba86723dfc47cec29a991bb598f39e77b 100644
+--- a/lib/VM/JSArray.cpp
++++ b/lib/VM/JSArray.cpp
+@@ -13,6 +13,7 @@
+ #include "hermes/VM/JSTypedArray.h"
+ #include "hermes/VM/Operations.h"
+ #include "hermes/VM/PropertyAccessor.h"
++#include "hermes/VM/sh_mirror.h"
+ 
+ namespace hermes {
+ namespace vm {
+@@ -21,6 +22,14 @@ namespace vm {
+ // class ArrayImpl
+ 
+ void ArrayImplBuildMeta(const GCCell *cell, Metadata::Builder &mb) {
++  static_assert(sizeof(ArrayImpl) == sizeof(SHArrayImpl));
++  static_assert(
++      offsetof(ArrayImpl, beginIndex_) == offsetof(SHArrayImpl, beginIndex));
++  static_assert(
++      offsetof(ArrayImpl, elemCount_) == offsetof(SHArrayImpl, elemCount));
++  static_assert(
++      offsetof(ArrayImpl, indexedStorage_) ==
++      offsetof(SHArrayImpl, indexedStorage));
+   mb.addJSObjectOverlapSlots(JSObject::numOverlapSlots<ArrayImpl>());
+   JSObjectBuildMeta(cell, mb);
+   const auto *self = static_cast<const ArrayImpl *>(cell);
 diff --git a/lib/VM/JSArrayBuffer.cpp b/lib/VM/JSArrayBuffer.cpp
 index 7378a35aa0f5e5d6abae21fef53c2c879759ac93..398305edc31f551d590d69fc48e926a085d035a2 100644
 --- a/lib/VM/JSArrayBuffer.cpp
@@ -1261,6 +1952,102 @@ index 7378a35aa0f5e5d6abae21fef53c2c879759ac93..398305edc31f551d590d69fc48e926a0
  
  void JSArrayBuffer::_finalizeImpl(GCCell *cell, GC &gc) {
    auto *self = vmcast<JSArrayBuffer>(cell);
+diff --git a/lib/VM/JSLib/Math.cpp b/lib/VM/JSLib/Math.cpp
+index 49eaf330f11513c8d4bdf43a709dcdb2f223186a..4bcb40d85338c39df68fbb6e3197c6626d51a75f 100644
+--- a/lib/VM/JSLib/Math.cpp
++++ b/lib/VM/JSLib/Math.cpp
+@@ -12,6 +12,7 @@
+ #include "JSLibInternal.h"
+ 
+ #include "hermes/Support/Conversions.h"
++#include "hermes/Support/MathFunctions.h"
+ #include "hermes/VM/JSLib/JSLibStorage.h"
+ #include "hermes/VM/Operations.h"
+ #include "hermes/VM/SingleObject.h"
+@@ -38,36 +39,6 @@ namespace vm {
+ 
+ //===----------------------------------------------------------------------===//
+ /// Math.
+-// Implementation of Math.round(), following ES 5.1 15.8.2.15
+-// This cannot be a simple call to std::round() because std::round() rounds
+-// halfways away from zero, while Math.round must round towards positive
+-// infinity.
+-// The essential algorithm is floor(x + 0.5). However this has three
+-// complications:
+-//  1. The range [-.5, -0] must round to -0, not +0
+-//  2. The largest value less than 0.5, when added to 0.5, becomes 1.0
+-//  (precision loss), causing us to round to 1 and not 0.
+-//  3. Above a certain threshold (shown below), x + 0.5 is the same as x + 1.0
+-//  (precision loss), causing us to round too high.
+-// We handle this by checking explicitly for the problematic ranges.
+-static double roundHalfwaysTowardsInfinity(double x) {
+-  // The first integer where all larger values are also integral
+-  // The -1 is to account for the implicit (hidden) bit in the mantissa
+-  static constexpr double integer_threshold = 1LLU << (DBL_MANT_DIG - 1);
+-  double absf = std::fabs(x);
+-  if (absf >= integer_threshold) {
+-    // x is necessarily already integral.
+-    return x;
+-  } else if (absf < 0.5) {
+-    // x may have too much precision to add 0.5. Just round to +/- 0.
+-    return std::copysign(0, x);
+-  } else {
+-    // Here we can apply the normal rounding algorithm, but we need to be
+-    // careful about -0.5, which must round to -0.
+-    return std::copysign(std::floor(x + 0.5), x);
+-  }
+-}
+-
+ /// The Math object has functions like sin, cos, exp, etc. Most take one
+ /// argument, a few take two arguments, min() and max() may take any number
+ /// of arguments, and random() takes none. Use context as a index to switch to
+@@ -153,15 +124,7 @@ CallResult<HermesValue> mathMax(void *, Runtime &runtime) {
+     if (LLVM_UNLIKELY(res == ExecutionStatus::EXCEPTION)) {
+       return ExecutionStatus::EXCEPTION;
+     }
+-    double arg = res->getNumber();
+-    if (std::isnan(result)) {
+-      continue;
+-    } else if (std::isnan(arg)) {
+-      result = std::numeric_limits<double>::quiet_NaN();
+-    } else if (arg > result || std::signbit(arg) < std::signbit(result)) {
+-      // signbit(arg) < signbit(result) => arg is at least +0, result at most -0
+-      result = arg;
+-    }
++    result = hermesMathMax(result, res->getNumber());
+   }
+   return HermesValue::encodeTrustedNumberValue(result);
+ }
+@@ -177,15 +140,7 @@ CallResult<HermesValue> mathMin(void *, Runtime &runtime) {
+     if (LLVM_UNLIKELY(res == ExecutionStatus::EXCEPTION)) {
+       return ExecutionStatus::EXCEPTION;
+     }
+-    double arg = res->getNumber();
+-    if (std::isnan(result)) {
+-      continue;
+-    } else if (std::isnan(arg)) {
+-      result = std::numeric_limits<double>::quiet_NaN();
+-    } else if (arg < result || std::signbit(arg) > std::signbit(result)) {
+-      // signbit(arg) > signbit(result) => arg is at most -0, result at least +0
+-      result = arg;
+-    }
++    result = hermesMathMin(result, res->getNumber());
+   }
+   return HermesValue::encodeTrustedNumberValue(result);
+ }
+diff --git a/lib/VM/JSLib/MathStdFunctions.def b/lib/VM/JSLib/MathStdFunctions.def
+index d285f9f5ba2e8e09d2d4a52eebe5ea928a129f66..f2fc74ee9aa15bc6d34824ed7e13e2b31d69ee5c 100644
+--- a/lib/VM/JSLib/MathStdFunctions.def
++++ b/lib/VM/JSLib/MathStdFunctions.def
+@@ -30,7 +30,7 @@ MATHFUNC_1ARG(log10, std::log10)
+ MATHFUNC_1ARG(log1p, ::log1p)
+ MATHFUNC_1ARG(log2, std::log2)
+ MATHFUNC_1ARG(trunc, std::trunc)
+-MATHFUNC_1ARG(round, roundHalfwaysTowardsInfinity)
++MATHFUNC_1ARG(round, hermesMathRound)
+ MATHFUNC_1ARG(sin, std::sin)
+ MATHFUNC_1ARG(sinh, ::sinh)
+ MATHFUNC_1ARG(sqrt, std::sqrt)
 diff --git a/lib/VM/JSLib/String.cpp b/lib/VM/JSLib/String.cpp
 index f355962871aefc82e2ff4352e170453ea1153699..f612a30ec5d1ba8a345a530621daa4f39960ea1a 100644
 --- a/lib/VM/JSLib/String.cpp
@@ -1321,7 +2108,7 @@ index 8ec678009b859224058f4efdf333e17e458750bc..df57095cdebcc995be485e86d175bf33
    flags_.fastIndexProperties = true;
  }
 diff --git a/lib/VM/StaticH.cpp b/lib/VM/StaticH.cpp
-index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..f5fb22bf19a988e66d18a142f8dfefaabdd2350e 100644
+index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..35d77fec80bfc155f736aae33da0d7e83f71fac2 100644
 --- a/lib/VM/StaticH.cpp
 +++ b/lib/VM/StaticH.cpp
 @@ -7,6 +7,7 @@
@@ -1332,7 +2119,7 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..f5fb22bf19a988e66d18a142f8dfefaa
  #include "hermes/VM/ArrayStorage.h"
  #include "hermes/VM/Callable.h"
  #include "hermes/VM/FastArray.h"
-@@ -25,16 +26,30 @@
+@@ -25,16 +26,31 @@
  #include "hermes/VM/StackFrame-inline.h"
  #include "hermes/VM/StaticHUtils.h"
  #include "hermes/VM/StringBuilder.h"
@@ -1340,6 +2127,7 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..f5fb22bf19a988e66d18a142f8dfefaa
  
  #include "JSLib/JSLibInternal.h"
  
++#include <algorithm>
  #include <cstdarg>
 +#include <limits>
  
@@ -1363,7 +2151,53 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..f5fb22bf19a988e66d18a142f8dfefaa
  namespace {
  /// Convert the given \p cr to a \c CallResult<HermesValue>.
  template <typename T>
-@@ -288,6 +303,51 @@ _sh_ljs_get_by_index_rjs(SHRuntime *shr, SHLegacyValue *source, uint32_t key) {
+@@ -209,6 +225,45 @@ extern "C" void _sh_ljs_reify_arguments_strict(
+   reifyArguments(shr, frame, lazyReg, true);
+ }
+ 
++LLVM_ATTRIBUTE_NOINLINE
++extern "C" SHLegacyValue _sh_ljs_string_index_compare(
++    SHRuntime *shr,
++    SHLegacyValue source,
++    double key,
++    uint16_t character,
++    uint8_t invert) {
++  auto value = *toPHV(&source);
++  assert(value.isString() && "compiler must prove a primitive string");
++  uint32_t index;
++  auto *str = value.getString();
++  if (sh_tryfast_f64_to_u32(key, index) && index < str->getStringLength())
++    return HermesValue::encodeBoolValue((str->at(index) == character) != invert);
++
++  Runtime &runtime = getRuntime(shr);
++  auto result = [&]() -> CallResult<bool> {
++    GCScopeMarkerRAII marker{runtime};
++    struct : Locals {
++      PinnedValue<> source;
++      PinnedValue<> key;
++    } lv;
++    LocalsRAII lraii{runtime, &lv};
++    // Native calls pass values by copy. Root the copies before a prototype
++    // getter can collect, and leave every RAII scope before throwing to JS.
++    lv.source = value;
++    lv.key = HermesValue::encodeTrustedNumberValue(key);
++    auto read = Interpreter::getByValTransient_RJS(runtime, lv.source, lv.key);
++    if (LLVM_UNLIKELY(read == ExecutionStatus::EXCEPTION))
++      return ExecutionStatus::EXCEPTION;
++    auto observed = read->getHermesValue();
++    return observed.isString() &&
++        observed.getString()->getStringLength() == 1 &&
++        observed.getString()->at(0) == character;
++  }();
++  if (LLVM_UNLIKELY(result == ExecutionStatus::EXCEPTION))
++    _sh_throw_current(shr);
++  return HermesValue::encodeBoolValue(result.getValue() != invert);
++}
++
+ LLVM_ATTRIBUTE_NOINLINE
+ extern "C" SHLegacyValue _sh_ljs_get_by_val_with_receiver_rjs(
+     SHRuntime *shr,
+@@ -288,6 +343,64 @@ _sh_ljs_get_by_index_rjs(SHRuntime *shr, SHLegacyValue *source, uint32_t key) {
    return res->getHermesValue();
  }
  
@@ -1386,11 +2220,16 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..f5fb22bf19a988e66d18a142f8dfefaa
 +    if (id.isValid()) {
 +      auto *obj = vmcast<JSObject>(sourceValue);
 +      const CompressedPointer clazzPtr{obj->getClassGCPtr()};
-+      auto &entry = reinterpret_cast<ComputedReadCacheEntry *>(
-+          cache)[id.unsafeGetRaw() % SH_COMPUTED_READ_CACHE_WAYS];
-+      if (entry.clazz == clazzPtr && entry.key == id) {
-+        return JSObject::getNamedSlotValueUnsafe(obj, runtime, entry.slot)
-+            .unboxToHV(runtime);
++      constexpr unsigned associativity = SH_COMPUTED_READ_CACHE_ASSOCIATIVITY;
++      constexpr unsigned sets = SH_COMPUTED_READ_CACHE_WAYS / associativity;
++      static_assert(SH_COMPUTED_READ_CACHE_WAYS % associativity == 0);
++      auto *entries = reinterpret_cast<ComputedReadCacheEntry *>(cache) +
++          (id.unsafeGetRaw() % sets) * associativity;
++      for (unsigned i = 0; i < associativity; ++i) {
++        if (entries[i].clazz == clazzPtr && entries[i].key == id) {
++          return JSObject::getNamedSlotValueUnsafe(obj, runtime, entries[i].slot)
++              .unboxToHV(runtime);
++        }
 +      }
 +      // Restrict insertion to ordinary objects and immutable shapes. No key
 +      // coercion, allocation or user code occurs between lookup and slot read.
@@ -1400,6 +2239,14 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..f5fb22bf19a988e66d18a142f8dfefaa
 +        NamedPropertyDescriptor desc;
 +        auto found = JSObject::tryGetOwnNamedDescriptorFast(obj, runtime, id, desc);
 +        if (found && *found && !desc.flags.accessor) {
++          // FIFO replacement within this key's set. Moving weak entries is safe
++          // here because descriptor lookup and the slot read cannot collect.
++          for (unsigned i = associativity - 1; i > 0; --i) {
++            entries[i].clazz = entries[i - 1].clazz.getNoBarrierUnsafe();
++            entries[i].key = entries[i - 1].key;
++            entries[i].slot = entries[i - 1].slot;
++          }
++          auto &entry = entries[0];
 +          entry.clazz = clazzPtr;
 +          entry.key = id;
 +          entry.slot = desc.slot;
@@ -1415,7 +2262,7 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..f5fb22bf19a988e66d18a142f8dfefaa
  LLVM_ATTRIBUTE_NOINLINE
  extern "C" SHLegacyValue _sh_ljs_get_own_private_by_sym(
      SHRuntime *shr,
-@@ -1264,8 +1324,25 @@ static inline HermesValue getByIdWithReceiver_RJS(
+@@ -1264,8 +1377,25 @@ static inline HermesValue getByIdWithReceiver_RJS(
      CallResult<PseudoHandle<>> resPH{ExecutionStatus::EXCEPTION};
      {
        GCScopeMarkerRAII marker{runtime};
@@ -1443,7 +2290,44 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..f5fb22bf19a988e66d18a142f8dfefaa
      }
      if (LLVM_UNLIKELY(resPH == ExecutionStatus::EXCEPTION))
        _sh_throw_current(getSHRuntime(runtime));
-@@ -1792,6 +1869,25 @@ _sh_ljs_create_regexp(SHRuntime *shr, SHSymbolID pattern, SHSymbolID flags) {
+@@ -1411,6 +1541,36 @@ extern "C" SHLegacyValue _sh_ljs_get_by_id_rjs(
+       reinterpret_cast<ReadPropertyCacheEntry *>(propCacheEntry));
+ }
+ 
++LLVM_ATTRIBUTE_NOINLINE
++extern "C" SHLegacyValue _sh_ljs_get_by_id_polymorphic_rjs(
++    SHRuntime *shr,
++    const SHLegacyValue *source,
++    SHSymbolID symID,
++    SHReadPropertyCacheEntry *cache) {
++  auto &runtime = getRuntime(shr);
++  auto *entries = reinterpret_cast<ReadPropertyCacheEntry *>(cache);
++  if (toPHV(source)->isObject()) {
++    auto *object = vmcast<JSObject>(*toPHV(source));
++    const CompressedPointer clazz{object->getClassGCPtr()};
++    for (unsigned i = 0; i < SH_NAMED_READ_CACHE_WAYS; ++i) {
++      if (entries[i].clazz == clazz) {
++        return JSObject::getNamedSlotValueUnsafe(
++                   object, runtime, entries[i].getSlot())
++            .unboxToHV(runtime);
++      }
++    }
++  }
++  // Rotate before the potentially allocating lookup, keeping every weak pointer
++  // in the unit's traced storage. The oldest entry becomes the replacement slot;
++  // uncachable reads retain both entries. Prototype validation stays in getById.
++  std::rotate(
++      cache,
++      cache + SH_NAMED_READ_CACHE_WAYS - 1,
++      cache + SH_NAMED_READ_CACHE_WAYS);
++  return getById_RJS<false>(
++      runtime, Handle<>{toPHV(source)}, SymbolID::unsafeCreate(symID), entries);
++}
++
+ LLVM_ATTRIBUTE_NOINLINE
+ extern "C" SHLegacyValue _sh_ljs_get_by_id_with_receiver_rjs(
+     SHRuntime *shr,
+@@ -1792,6 +1952,25 @@ _sh_ljs_create_regexp(SHRuntime *shr, SHSymbolID pattern, SHSymbolID flags) {
    return *cr;
  }
  
@@ -1469,7 +2353,7 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..f5fb22bf19a988e66d18a142f8dfefaa
  LLVM_ATTRIBUTE_NOINLINE
  extern "C" SHLegacyValue
  _sh_ljs_create_bigint(SHRuntime *shr, const uint8_t *value, uint32_t size) {
-@@ -2727,3 +2823,32 @@ _sh_asciiz_to_string(SHRuntime *shr, const char *str, ptrdiff_t len) {
+@@ -2727,3 +2906,32 @@ _sh_asciiz_to_string(SHRuntime *shr, const char *str, ptrdiff_t len) {
      _sh_throw_current(shr);
    return *res;
  }
@@ -1538,10 +2422,10 @@ index 5bf0eb3faa636d974da9c14bd49a1f7d15044b87..67986bb7ed1a8c5160844db2f825ba0a
    // Special case for 1-character strings, some of which are cached in the
 diff --git a/test/shermes/computed-loads.js b/test/shermes/computed-loads.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..f38e8ac44ae7a08b1bcd5c14f7600a99ae720c97
+index 0000000000000000000000000000000000000000..5367c18e5e97cec657763309f555a53f18194a79
 --- /dev/null
 +++ b/test/shermes/computed-loads.js
-@@ -0,0 +1,113 @@
+@@ -0,0 +1,147 @@
 +/**
 + * Copyright (c) Meta Platforms, Inc. and affiliates.
 + *
@@ -1600,6 +2484,40 @@ index 0000000000000000000000000000000000000000..f38e8ac44ae7a08b1bcd5c14f7600a99
 +assert(failed);
 +print('computed properties passed');
 +// CHECK: computed properties passed
++
++// The same keys occupy different slots on these two receiver shapes.
++var left = {first: 1, second: 2, [key]: 3};
++var right = {[key]: 4, second: 5, first: 6};
++for (var round = 0; round < 20; ++round) {
++  assert(read(left, 'first') === 1 && read(right, 'first') === 6);
++  assert(read(left, key) === 3 && read(right, key) === 4);
++  gc();
++}
++var ordinary = [10, undefined, 30, 40];
++for (var round = 0; round < 4; ++round) {
++  assert(read(ordinary, 0) === 10 && read(ordinary, 1) === undefined);
++  ordinary.shift();
++  ordinary.unshift(10);
++  gc();
++}
++delete ordinary[1];
++var parent = Object.create(Array.prototype);
++Object.defineProperty(parent, '1', {get() { return this[0] + 1; }});
++Object.setPrototypeOf(ordinary, parent);
++assert(read(ordinary, 1) === 11);
++Object.defineProperty(ordinary, '2', {get() { gc(); return 32; }});
++assert(read(ordinary, 2) === 32);
++ordinary.length = 1;
++assert(read(ordinary, 2) === undefined && read(ordinary, 1) === 11);
++ordinary['4294967295'] = 99;
++ordinary['-1'] = 98;
++assert(read(ordinary, 4294967295) === 99 && read(ordinary, -1) === 98);
++assert(read(ordinary, -0) === 10 && read(ordinary, 0.5) === undefined);
++assert(read(Object.freeze([42]), 0) === 42);
++assert(read(new Proxy([1], {get() { return 43; }}), 0) === 43);
++assert(read([null, {answer: 44}], 1).answer === 44);
++print('polymorphic and ordinary elements passed');
++// CHECK-NEXT: polymorphic and ordinary elements passed
 +
 +var constructors = [Uint8Array, Int8Array, Uint8ClampedArray, Uint16Array,
 +  Int16Array, Uint32Array, Int32Array, Float32Array, Float64Array];
@@ -1699,6 +2617,243 @@ index 0000000000000000000000000000000000000000..a9b0fbf317cd44e6d158d1885f766e23
 +print("bounded");
 +// CHECK: bounded
 +free(pointer);
+diff --git a/test/shermes/inline-object-reader-growth.js b/test/shermes/inline-object-reader-growth.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..47d6be05d7753f1496a2f13c0de5d429d8efef85
+--- /dev/null
++++ b/test/shermes/inline-object-reader-growth.js
+@@ -0,0 +1,16 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++// Repeated callsites in one try region must not expand without a caller budget.
++// RUN: python3 -c "from pathlib import Path; calls=''.join('sum += read({left: input | 0, right: %d});\n' % i for i in range(80)); Path(r'%t.js').write_text('(function () { \\\"use strict\\\"; function read(value) { var sum = value.left + value.right; return sum > 0 ? sum : 0; } function withManyReaders(input) { \\\"noinline\\\"; var sum = 0; try {\n' + calls + '\n} catch (e) { return -1; } return sum; } print(withManyReaders(1)); print(withManyReaders({valueOf() {throw 1;}})); })();')"
++// RUN: %shermes -O -exec %t.js | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -dump-ir -Xdump-functions=withManyReaders %t.js | %FileCheck --check-prefix=IR %s
++
++// CHECK: 3240
++// CHECK-NEXT: -1
++// IR-LABEL: function withManyReaders(
++// IR: CallInst {{.*}} %read(): functionCode
+diff --git a/test/shermes/inline-object-reader-try.js b/test/shermes/inline-object-reader-try.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..7a059ff20c9b43d5a245c22530c01f74692925af
+--- /dev/null
++++ b/test/shermes/inline-object-reader-try.js
+@@ -0,0 +1,86 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++// RUN: %shermes -O -exec %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -Xsmall-c -exec %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -fno-inline -exec %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -dump-ir -Xdump-functions=withCatch %s | %FileCheck --check-prefix=IR %s
++
++(function () {
++  'use strict';
++  function assert(value) {
++    if (!value) throw new Error('inline object reader contract');
++  }
++  function read(value) {
++    var sum = value.left + value.right;
++    return sum > 0 ? sum : 0;
++  }
++  function withCatch(left, right) {
++    'noinline';
++    try { return read({left: left | 0, right: right | 0}); }
++    catch (e) { return -1; }
++  }
++  assert(withCatch(3, 5) === 8);
++  assert(withCatch(-3, -5) === 0);
++  assert(withCatch({valueOf() { throw 1; }}, 5) === -1);
++
++  var marker = {value: 19};
++  var finallyCount = 0;
++  function readOrThrow(value) {
++    var sum = value.left + value.right;
++    gc();
++    if (value.fail) throw value.error;
++    return sum;
++  }
++  function withFinally(fail, error) {
++    'noinline';
++    var retained = {value: 23};
++    try {
++      return readOrThrow({left: 3, right: 5, fail: fail, error: error});
++    } catch (e) {
++      gc();
++      assert(retained.value === 23);
++      return e;
++    } finally {
++      gc();
++      assert(retained.value === 23);
++      ++finallyCount;
++    }
++  }
++  assert(withFinally(false, marker) === 8);
++  assert(withFinally(true, marker) === marker);
++  assert(withFinally(true, undefined) === undefined);
++  assert(withFinally(true, 0) === 0);
++  assert(finallyCount === 4);
++
++  // Object promotion must still reject a value exposed to an unknown callee.
++  function escapingReader(value, consumer) {
++    consumer(value);
++    return value.left + value.right;
++  }
++  function escapingTry(consumer) {
++    'noinline';
++    try { return escapingReader({left: 3, right: 5}, consumer); }
++    catch (e) { return e; }
++  }
++  var escaped;
++  assert(escapingTry(function (value) { escaped = value; gc(); value.left = 9; }) === 14);
++  assert(escaped.left === 9 && escaped.right === 5);
++  assert(escapingTry(function () { throw marker; }) === marker);
++  print('inline object readers in try passed');
++})();
++
++// CHECK: inline object readers in try passed
++// IR-LABEL: function withCatch(
++// IR-NOT: AllocObject
++// IR-NOT: LoadPropertyInst
++// IR-NOT: CallInst
++// IR: FAddInst
++// IR-NOT: AllocObject
++// IR-NOT: LoadPropertyInst
++// IR-NOT: CallInst
++// IR: function_end
+diff --git a/test/shermes/known-callback-targets.js b/test/shermes/known-callback-targets.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..fdd106156d1791cf2ae31b4707c5d448f131a474
+--- /dev/null
++++ b/test/shermes/known-callback-targets.js
+@@ -0,0 +1,117 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++// RUN: %shermes -O -exec %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -Xsmall-c -exec %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -fno-inline -exec %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -fno-inline -dump-ir -Xdump-functions=invokeKnown %s | %FileCheck --check-prefix=TARGET %s
++// RUN: %shermes -O -fno-inline -dump-ir -Xdump-functions=aliased %s | %FileCheck --check-prefix=LOOSE %s
++
++(function () {
++  'use strict';
++  function assert(value) {
++    if (!value) throw new Error('callback target contract');
++  }
++  function factory(captured) {
++    'noinline';
++    return function callback(input) {
++      gc();
++      return captured.value + input;
++    };
++  }
++  function invokeKnown(fn, input) {
++    'noinline';
++    return fn(input);
++  }
++  var first = factory({value: 10});
++  var second = factory({value: 20});
++  assert(first !== second);
++  assert(invokeKnown(first, 1) === 11);
++  assert(invokeKnown(second, 2) === 22);
++  function invokePhi(flag) {
++    'noinline';
++    var fn = flag ? factory({value: 30}) : factory({value: 40});
++    return fn(3);
++  }
++  assert(invokePhi(true) === 33 && invokePhi(false) === 43);
++
++  function invokeMixed(fn) {
++    'noinline';
++    return fn(4);
++  }
++  assert(invokeMixed(first) === 14);
++  assert(invokeMixed(function other(n) { return n * 2; }) === 8);
++  function invokeMissing(fn) {
++    'noinline';
++    return fn(5);
++  }
++  assert(invokeMissing(first) === 15);
++  var caught = false;
++  try { invokeMissing(); } catch (e) { caught = e instanceof TypeError; }
++  assert(caught);
++
++  globalThis.externalCallback = function externalCallback(fn) {
++    return fn(6);
++  };
++  assert(globalThis.externalCallback(first) === 16);
++  assert(globalThis.externalCallback(function (n) { return n * 3; }) === 18);
++
++  function maybeFactory(flag) {
++    'noinline';
++    if (flag) return factory({value: 50});
++  }
++  assert(maybeFactory(true)(7) === 57);
++  caught = false;
++  try { maybeFactory(false)(7); } catch (e) { caught = e instanceof TypeError; }
++  assert(caught);
++
++  function recursiveFactory(n) {
++    'noinline';
++    return n ? recursiveFactory(n - 1) : factory({value: 60});
++  }
++  assert(recursiveFactory(3)(8) === 68);
++  function constructorFactory() {
++    'noinline';
++    this.value = 70;
++    return 0;
++  }
++  caught = false;
++  try { (new constructorFactory())(); } catch (e) { caught = e instanceof TypeError; }
++  assert(caught);
++
++  var marker = {};
++  function throwingFactory() {
++    'noinline';
++    return function throwingCallback() { gc(); throw marker; };
++  }
++  function invokeThrowing(fn) {
++    'noinline';
++    try { fn(); } catch (e) { return e; }
++  }
++  assert(invokeThrowing(throwingFactory()) === marker);
++  print('known callback targets passed');
++})();
++
++// SH deliberately uses unmapped arguments even in loose mode (SpecIncompat.md).
++// The shared target analysis still restricts parameter proofs to strict functions.
++(function () {
++  function aliased(fn) {
++    'noinline';
++    arguments[0] = function () { return 2; };
++    return fn();
++  }
++  if (aliased(function () { return 1; }) !== 1)
++    throw new Error('aliased callback contract');
++  print('aliased callbacks passed');
++})();
++
++// CHECK: known callback targets passed
++// CHECK-NEXT: aliased callbacks passed
++// TARGET-LABEL: function invokeKnown(
++// TARGET: CallInst {{.*}} %callback(): functionCode, true: boolean, empty: any
++// LOOSE-LABEL: function aliased(
++// LOOSE: CallInst {{.*}} empty: any, false: boolean, empty: any
 diff --git a/test/shermes/native-literal-builtins.js b/test/shermes/native-literal-builtins.js
 new file mode 100644
 index 0000000000000000000000000000000000000000..52f3e73c2678a0fd83a60eb5c200e8de6fd9d473
@@ -1748,6 +2903,307 @@ index 0000000000000000000000000000000000000000..52f3e73c2678a0fd83a60eb5c200e8de
 +// CHECK-NEXT: 0.25 123
 +// C: _sh_ljs_create_regexp_precompiled
 +// C: _sh_ljs_imul_number
+diff --git a/test/shermes/numeric-math.js b/test/shermes/numeric-math.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..f336cde366ea46f23a961677fd28c75cc61e0412
+--- /dev/null
++++ b/test/shermes/numeric-math.js
+@@ -0,0 +1,98 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++// RUN: %shermes -O -fstatic-math-builtins -exec %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -fstatic-math-builtins -Xsmall-c -exec %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -exec %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -fstatic-math-builtins -emit-c -o %t.c %s
++// RUN: %FileCheck --check-prefix=C --input-file=%t.c %s
++
++function numeric(x) {
++  "noinline";
++  x = +x;
++  return [Math.abs(x), Math.ceil(x), Math.floor(x), Math.trunc(x),
++          Math.round(x), Math.sqrt(x)];
++}
++function bounds(x, y) {
++  "noinline";
++  return [Math.min(+x, +y), Math.max(+x, +y)];
++}
++function show(x) {
++  if (x === 0 && 1 / x < 0) return '-0';
++  return '' + x;
++}
++print(numeric(-0.5).map(show).join(' '));
++// CHECK: 0.5 -0 -1 -0 -0 NaN
++print(numeric(-0).map(show).join(' '));
++// CHECK-NEXT: 0 -0 -0 -0 -0 -0
++print(numeric(0.49999999999999994).map(show).join(' '));
++// CHECK-NEXT: 0.49999999999999994 1 0 0 0 0.7071067811865475
++print(numeric(4503599627370497)[4], numeric(-4503599627370497)[4]);
++// CHECK-NEXT: 4503599627370497 -4503599627370497
++print(bounds(0, -0).map(show).join(' '), bounds(-0, 0).map(show).join(' '));
++// CHECK-NEXT: -0 0 -0 0
++print(bounds(NaN, 3).map(show).join(' '), bounds(3, NaN).map(show).join(' '));
++// CHECK-NEXT: NaN NaN NaN NaN
++
++var methods = ['abs', 'ceil', 'floor', 'trunc', 'round', 'sqrt'];
++var values = [-Infinity, -4503599627370497, -2.5, -1.5, -0.5000000000000001,
++              -0.5, -0.49999999999999994, -Number.MIN_VALUE, -0, 0,
++              Number.MIN_VALUE, 0.49999999999999994, 0.5, 1.5,
++              4503599627370497, Infinity, NaN];
++var comparisons = 0;
++for (var x of values) {
++  var actual = numeric(x);
++  for (var i = 0; i < methods.length; ++i) {
++    if (!Object.is(actual[i], Math[methods[i]](x))) throw new Error('unary');
++    ++comparisons;
++  }
++  for (var y of values) {
++    actual = bounds(x, y);
++    for (var i = 0; i < 2; ++i) {
++      if (!Object.is(actual[i], Math[i ? 'max' : 'min'](x, y)))
++        throw new Error('bounds');
++      ++comparisons;
++    }
++  }
++}
++print(comparisons);
++// CHECK-NEXT: 680
++
++var order = '';
++function operand(label, value) {
++  return {valueOf() { order += label; return value; }};
++}
++function generic(x, y) {
++  "noinline";
++  return Math.min(x, y);
++}
++print(generic(operand('a', NaN), operand('b', 3)), order);
++// CHECK-NEXT: NaN ab
++order = '';
++try {
++  generic(operand('a', NaN), {valueOf() { order += 'b'; throw 17; }});
++} catch (e) {
++  print(e, order);
++}
++// CHECK-NEXT: 17 ab
++order = '';
++print(bounds(operand('a', -2), operand('b', 3)).join(' '), order);
++// CHECK-NEXT: -2 3 abab
++print(Math.min(), Math.max(), Math.round(), Math.min(3), Math.max(3, 7, 5));
++// CHECK-NEXT: Infinity -Infinity NaN 3 7
++order = '';
++print(Math.round(+operand('a', 2.5), +operand('b', 9)), order);
++// CHECK-NEXT: 3 ab
++
++// C-DAG: _sh_ljs_double(fabs(_sh_ljs_get_double(
++// C-DAG: _sh_ljs_double(ceil(_sh_ljs_get_double(
++// C-DAG: _sh_ljs_double(floor(_sh_ljs_get_double(
++// C-DAG: _sh_ljs_double(trunc(_sh_ljs_get_double(
++// C-DAG: _sh_ljs_double(hermesMathRound(_sh_ljs_get_double(
++// C-DAG: _sh_ljs_double(sqrt(_sh_ljs_get_double(
++// C-DAG: _sh_ljs_double(hermesMathMin(_sh_ljs_get_double(
++// C-DAG: _sh_ljs_double(hermesMathMax(_sh_ljs_get_double(
+diff --git a/test/shermes/polymorphic-read-cache.js b/test/shermes/polymorphic-read-cache.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..d680d6a3bd247c9ce391b7cfb419837e187cd00f
+--- /dev/null
++++ b/test/shermes/polymorphic-read-cache.js
+@@ -0,0 +1,63 @@
++// Copyright (c) Meta Platforms, Inc. and affiliates.
++//
++// This source code is licensed under the MIT license found in the
++// LICENSE file in the root directory of this source tree.
++
++// RUN: %shermes -O -exec %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -Xsmall-c -exec %s | %FileCheck --match-full-lines %s
++
++function read(object) {
++  'noinline';
++  return object.value;
++}
++function check(actual, expected) {
++  if (actual !== expected) throw new Error('named read contract');
++}
++var first = {value: 1};
++var second = {before: 2, value: 3};
++for (var i = 0; i < 20; ++i) {
++  check(read(first), 1);
++  check(read(second), 3);
++  gc();
++}
++first.value = 4;
++check(read(first), 4);
++var getterCalls = 0;
++Object.defineProperty(first, 'value', {configurable: true, get() {
++  ++getterCalls;
++  gc();
++  return 5;
++}});
++check(read(first), 5);
++check(getterCalls, 1);
++check(read(second), 3);
++delete second.value;
++Object.setPrototypeOf(second, {value: 6});
++check(read(second), 6);
++Object.setPrototypeOf(second, {before: 7, value: 8});
++check(read(second), 8);
++second.value = 9;
++check(read(second), 9);
++var proxyCalls = 0;
++check(read(new Proxy(second, {get(target, key, receiver) {
++  ++proxyCalls;
++  return receiver === this ? 0 : 10;
++}})), 10);
++check(proxyCalls, 1);
++String.prototype.value = 11;
++check(read('text'), 11);
++String.prototype.value = 12;
++check(read('text'), 12);
++delete String.prototype.value;
++check(read('text'), undefined);
++for (var i = 0; i < 200; ++i) second['field' + i] = i;
++delete second.field100;
++delete second.value;
++check(read(second), 8);
++second.value = 13;
++check(read(second), 13);
++var threw = false;
++try { read(null); } catch (e) { threw = e instanceof TypeError; }
++check(threw, true);
++print('named reads passed');
++// CHECK: named reads passed
+diff --git a/test/shermes/string-index-comparison.js b/test/shermes/string-index-comparison.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..095ca00cdd95b0f0f3207025384838be3627c0bb
+--- /dev/null
++++ b/test/shermes/string-index-comparison.js
+@@ -0,0 +1,122 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++// RUN: %shermes -O -exec %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -Xsmall-c -exec %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O0 -exec %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -emit-c -o %t.c %s
++// RUN: %FileCheck --check-prefix=C --input-file=%t.c %s
++
++function equal(source, index) {
++  "noinline";
++  var text = '' + source;
++  return text[+index] === 'x';
++}
++function different(source, index) {
++  "noinline";
++  var text = '' + source;
++  return 'x' !== text[+index];
++}
++function surrogate(source, index) {
++  "noinline";
++  var text = '' + source;
++  return text[+index] === '\uD800';
++}
++function nul(source, index) {
++  "noinline";
++  var text = '' + source;
++  return text[+index] === '\0';
++}
++print(equal('xy', 0), equal('xy', -0), equal('xy', 1), different('xy', 0));
++// CHECK: true true false false
++print(equal('x', 1), equal('', 0), equal('x', -1), equal('x', 0.5),
++      equal('x', NaN), equal('x', Infinity), equal('x', 4294967296));
++// CHECK-NEXT: false false false false false false false
++print(surrogate('\uD800\uDC00', 0), surrogate('\uD800\uDC00', 1),
++      surrogate('\uD800', 0), equal('\uD800x', 1), nul('a\0b', 1));
++// CHECK-NEXT: true false true true true
++
++var reads = 0;
++for (var key of ['1', '-1', '0.5', 'NaN', 'Infinity', '4294967296']) {
++  Object.defineProperty(String.prototype, key, {
++    configurable: true,
++    get() { ++reads; gc(); return 'x'; },
++  });
++}
++print(equal('a', 1), equal('a', -1), equal('a', 0.5), equal('a', NaN),
++      equal('a', Infinity), equal('a', 4294967296), reads);
++// CHECK-NEXT: true true true true true true 6
++print(equal('ab', 1), reads);
++// CHECK-NEXT: false 6
++for (var key of ['1', '-1', '0.5', 'NaN', 'Infinity', '4294967296'])
++  delete String.prototype[key];
++
++Object.defineProperty(String.prototype, '3', {
++  configurable: true,
++  get() { gc(); throw 23; },
++});
++try { equal('a', 3); } catch (e) { print(e); }
++// CHECK-NEXT: 23
++delete String.prototype[3];
++gc();
++print(equal('x', 0), different('x', 4));
++// CHECK-NEXT: true true
++
++String.prototype[2] = new String('x');
++print(equal('a', 2), different('a', 2));
++// CHECK-NEXT: false true
++delete String.prototype[2];
++
++var order = '';
++print(equal({toString() { order += 's'; return 'x'; }},
++            {valueOf() { order += 'i'; gc(); return 0; }}), order);
++// CHECK-NEXT: true si
++
++function arbitrary(source, key) {
++  "noinline";
++  return source[key] === 'x';
++}
++print(arbitrary(['x'], 0), arbitrary({get a() { gc(); return 'x'; }}, 'a'));
++// CHECK-NEXT: true true
++try { arbitrary(null, 0); } catch (e) { print(e.name); }
++// CHECK-NEXT: TypeError
++
++function dynamic(source, index) {
++  "noinline";
++  return source[+index] === 'x';
++}
++print(dynamic('x', 0), dynamic(['x'], 0), dynamic(new String('x'), 0),
++      dynamic(new Uint8Array([120]), 0));
++// CHECK-NEXT: true true true false
++Array.prototype[0] = 'x';
++print(dynamic(new Array(1), 0));
++// CHECK-NEXT: true
++delete Array.prototype[0];
++order = '';
++print(dynamic(new Proxy({}, {get(target, key) { order += key; gc(); return 'x'; }}),
++              {valueOf() { order += 'i'; return 0; }}), order);
++// CHECK-NEXT: true i0
++try { dynamic(null, 0); } catch (e) { print(e.name); }
++// CHECK-NEXT: TypeError
++var finalized = 0;
++function caught(source, index) {
++  "noinline";
++  try { return source[+index] !== 'x'; }
++  catch (e) { return e; }
++  finally { ++finalized; }
++}
++print(caught('x', 0), caught({get 0() { gc(); throw 31; }}, 0), finalized);
++// CHECK-NEXT: false 31 2
++var matches = 0;
++for (var i = 0; i < 100; ++i) {
++  var source = i % 2 ? 'x' : ['x'];
++  if (source[i % 1] === 'x') ++matches;
++}
++print(matches);
++// CHECK-NEXT: 100
++
++// C: _sh_ljs_string_index_compare(
 diff --git a/test/shermes/string-method-cache.js b/test/shermes/string-method-cache.js
 new file mode 100644
 index 0000000000000000000000000000000000000000..b371cb64710cb588e070f0fe66a87cb167179183
@@ -1791,7 +3247,7 @@ index 0000000000000000000000000000000000000000..b371cb64710cb588e070f0fe66a87cb1
 +print('string method cache passed');
 +// CHECK: string method cache passed
 diff --git a/tools/shermes/shermes.cpp b/tools/shermes/shermes.cpp
-index 5db8804e8cddc6ec859f6260263f71956042f8ca..d2482518514f25a9c63b29fb31c297cd6055e103 100644
+index 5db8804e8cddc6ec859f6260263f71956042f8ca..629d1b60fa6651f8b1e99b629a9b6654646c1ce8 100644
 --- a/tools/shermes/shermes.cpp
 +++ b/tools/shermes/shermes.cpp
 @@ -218,6 +218,12 @@ cl::opt<bool> KeepTemp(
@@ -1807,7 +3263,15 @@ index 5db8804e8cddc6ec859f6260263f71956042f8ca..d2482518514f25a9c63b29fb31c297cd
  cl::opt<StaticBuiltinSetting> StaticBuiltins(
      cl::desc(
          "recognizing of calls to global functions like Object.keys() statically"),
-@@ -643,6 +649,7 @@ std::shared_ptr<Context> createContext() {
+@@ -632,6 +638,7 @@ std::shared_ptr<Context> createContext() {
+   optimizationOpts.inlining =
+       cli::OptimizationLevel != OptLevel::O0 && cli::Inline;
+   optimizationOpts.inlineMaxSize = cli::InlineMaxSize;
++  optimizationOpts.staticHermesInlining = true;
+ 
+   optimizationOpts.reusePropCache = cli::ReusePropCache;
+ 
+@@ -643,6 +650,7 @@ std::shared_ptr<Context> createContext() {
    // parsing.
    optimizationOpts.staticBuiltins =
        cli::StaticBuiltins == StaticBuiltinSetting::ForceOn;
@@ -1950,6 +3414,72 @@ index aae9e34229d4d5e4f039d2505f24a718e47687c0..fda43b31818b9dee5e5ede3613b22b66
 +  auto proxy = eval("new Proxy({}, {})").asObject(*rt);
 +  EXPECT_THROW(rt->createOwnPropertyValidator(proxy, keys, false), JSINativeException);
 +}
+diff --git a/unittests/VMRuntime/StaticHUnitTest.cpp b/unittests/VMRuntime/StaticHUnitTest.cpp
+index 87be113a8a12acd4320fe516958a9a9846701db2..a0f1bbb39ad3ed8936ebdc981cc7baa4191143a5 100644
+--- a/unittests/VMRuntime/StaticHUnitTest.cpp
++++ b/unittests/VMRuntime/StaticHUnitTest.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include "VMRuntimeTestHelpers.h"
+ 
++#include "hermes/VM/PropertyCache.h"
+ #include "hermes/VM/StaticHUtils.h"
+ #include "hermes/VM/static_h.h"
+ 
+@@ -103,4 +104,53 @@ TEST(StaticHUnitTest, RejectsMismatchedStaticABI) {
+       "Static Hermes ABI mismatch: generated.*runtime archive");
+ }
+ 
++using StaticHCacheTest = RuntimeTestFixture;
++
++TEST_F(StaticHCacheTest, RetainsTwoShapesForNamedAndComputedReads) {
++  auto first = runtime.makeHandle(JSObject::create(runtime));
++  auto second = runtime.makeHandle(JSObject::create(runtime));
++  const auto key = Predefined::getSymbolID(Predefined::value);
++  const auto otherKey = Predefined::getSymbolID(Predefined::length);
++  ASSERT_TRUE(*JSObject::putNamed_RJS(
++      first, runtime, key, runtime.makeHandle(1.0_hd)));
++  ASSERT_TRUE(*JSObject::putNamed_RJS(
++      second, runtime, otherKey, runtime.makeHandle(2.0_hd)));
++  ASSERT_TRUE(*JSObject::putNamed_RJS(
++      second, runtime, key, runtime.makeHandle(3.0_hd)));
++  ASSERT_NE(first->getClass(runtime), second->getClass(runtime));
++
++  SHReadPropertyCacheEntry named[SH_NAMED_READ_CACHE_WAYS]{};
++  SHComputedReadCacheEntry computed[SH_COMPUTED_READ_CACHE_WAYS]{};
++  SHLegacyValue keyValue = HermesValue::encodeStringValue(
++      runtime.getStringPrimFromSymbolID(key));
++  SHLegacyValue sources[]{first.getHermesValue(), second.getHermesValue()};
++  auto *shr = getSHRuntime(runtime);
++  // No allocation or user code is possible for these own data reads. JS tests
++  // separately exercise traced unit caches across collections and invalidation.
++  for (unsigned round = 0; round < 10; ++round) {
++    for (unsigned i = 0; i < 2; ++i) {
++      EXPECT_EQ(
++          1.0 + 2 * i,
++          _sh_ljs_get_by_id_polymorphic_rjs(
++              shr, &sources[i], key.unsafeGetRaw(), named).f64);
++      EXPECT_EQ(
++          1.0 + 2 * i,
++          _sh_ljs_get_by_val_cached_rjs(
++              shr, &sources[i], &keyValue, computed).f64);
++    }
++  }
++  // Warm alternating receivers must not refill the named cache or overwrite
++  // the other receiver's computed entry.
++  EXPECT_EQ(2, named[0].numChanges + named[1].numChanges);
++  auto *computedEntries = reinterpret_cast<ComputedReadCacheEntry *>(computed);
++  unsigned retained = 0;
++  for (unsigned i = 0; i < SH_COMPUTED_READ_CACHE_WAYS; ++i) {
++    if (computedEntries[i].key == key &&
++        (computedEntries[i].clazz == first->getClassGCPtr() ||
++         computedEntries[i].clazz == second->getClassGCPtr()))
++      ++retained;
++  }
++  EXPECT_EQ(2u, retained);
++}
++
+ } // namespace
 diff --git a/unittests/VMRuntime/StringPrimitiveTest.cpp b/unittests/VMRuntime/StringPrimitiveTest.cpp
 index 51f39b9f4771aa9d5267697e6b43778f783cd2b8..9be9fcd0da394234e0f9d9c39ddc1b2cb5b2373c 100644
 --- a/unittests/VMRuntime/StringPrimitiveTest.cpp
