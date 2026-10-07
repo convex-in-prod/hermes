@@ -100,63 +100,96 @@ native, bytecode, and normal/small-C Wasm execution. Existing optimizer, Unicode
 and split-C linking regressions pass. Inspect linked Wasm and native code for
 removed conversion and generic character-read work without claiming runtime
 speedup from static counts.
+
+Retain bounded Static Hermes C allocation layouts across source edits. Keep
+string indices, native function slots, property-cache ranges, dense captured
+variables and shard membership stable where current shapes still match.
+Prefer unique environment consumers over occurrence-matched duplicate getters;
+limit duplicate closure context to property publication and small creators.
+
+Seed serialized literal pools by exact byte segments and retain separate shape
+slots for ordinary, typed and non-enumerable typed allocations. Preserve current
+serialization, overlapping storage and direct runtime access. Skip empty storage
+appends so unchanged literal pools do not acquire alignment padding.
+
+Emit an authenticated layout descriptor separately from C translation units.
+Validate and bound every retained table, and discard excessive retired hints for
+the next compilation without regenerating already lowered IR. Layouts remain
+optional, all current code regenerates, and native object reuse still requires
+exact emitted bytes. Validate edited sources, restored inputs, malformed seeds,
+compaction, typed shapes, closure environments and split-C native execution in
+114 compiler cases and 36 native executions.
 ---
- API/hermes/hermes.cpp                         | 379 ++++++++++++++++++
- API/hermes/hermes.h                           |  50 +++
+ API/hermes/hermes.cpp                         | 379 ++++++++
+ API/hermes/hermes.h                           |  50 ++
  include/hermes/AST/Context.h                  |   7 +
+ include/hermes/BCGen/LiteralBufferBuilder.h   |  23 +-
+ include/hermes/BCGen/SH/SH.h                  |   1 +
  include/hermes/Optimizer/Scalar/Utils.h       |  16 +
- include/hermes/Support/MathFunctions.h        |  42 ++
+ include/hermes/Support/MathFunctions.h        |  42 +
+ include/hermes/Utils/Options.h                |   5 +
  include/hermes/VM/CellKind.h                  |   6 +
  include/hermes/VM/GCCell.h                    |   1 +
  include/hermes/VM/PropertyCache.h             |  19 +
  include/hermes/VM/StringPrimitive.h           |   8 +-
- include/hermes/VM/sh_mirror.h                 |  38 ++
- include/hermes/VM/static_h.h                  | 215 ++++++++++
+ include/hermes/VM/sh_mirror.h                 |  38 +
+ include/hermes/VM/static_h.h                  | 215 +++++
  include/hermes/VMLayouts/PropertyCache.h      |  20 +
- lib/BCGen/SH/PeepholeLowering.cpp             | 164 ++++++++
- lib/BCGen/SH/SH.cpp                           | 252 ++++++++++--
+ lib/BCGen/LiteralBufferBuilder.cpp            | 143 ++-
+ lib/BCGen/SH/CBundleLayout.cpp                | 777 +++++++++++++++++
+ lib/BCGen/SH/CBundleLayout.h                  | 118 +++
+ lib/BCGen/SH/CMakeLists.txt                   |   1 +
+ lib/BCGen/SH/PeepholeLowering.cpp             | 164 ++++
+ lib/BCGen/SH/SH.cpp                           | 815 ++++++++++++++----
  lib/CompilerDriver/CompilerDriver.cpp         |   7 +
- lib/Optimizer/Scalar/FunctionAnalysis.cpp     |  85 ++++
- lib/Optimizer/Scalar/Inlining.cpp             |  63 ++-
+ lib/Optimizer/Scalar/FunctionAnalysis.cpp     |  85 ++
+ lib/Optimizer/Scalar/Inlining.cpp             |  63 +-
  lib/Optimizer/Scalar/InstSimplify.cpp         |   6 +
  lib/Optimizer/Scalar/LowerBuiltinCalls.cpp    |  10 +-
- lib/Optimizer/Scalar/ObjectStackPromotion.cpp | 102 ++++-
+ lib/Optimizer/Scalar/ObjectStackPromotion.cpp | 102 ++-
  lib/Optimizer/Scalar/TypeInference.cpp        |   6 +-
- lib/Optimizer/Scalar/Utils.cpp                |  65 +++
+ lib/Optimizer/Scalar/Utils.cpp                |  65 ++
  lib/Platform/Unicode/CharacterProperties.cpp  |  42 +-
  lib/Sema/FlowChecker-expr.cpp                 |   2 +-
  lib/VM/JSArray.cpp                            |   9 +
  lib/VM/JSArrayBuffer.cpp                      |   8 +-
- lib/VM/JSLib/Math.cpp                         |  51 +--
+ lib/VM/JSLib/Math.cpp                         |  51 +-
  lib/VM/JSLib/MathStdFunctions.def             |   2 +-
  lib/VM/JSLib/String.cpp                       |  15 +-
  lib/VM/JSTypedArray.cpp                       |   7 +
- lib/VM/StaticH.cpp                            | 235 ++++++++++-
+ lib/VM/StaticH.cpp                            | 235 ++++-
  lib/VM/StaticHUnit.cpp                        |   8 +
  lib/VM/StringPrimitive.cpp                    |   4 +
- test/shermes/computed-loads.js                | 147 +++++++
- test/shermes/conditional-object-spread.js     | 123 ++++++
- test/shermes/ffi/string_write_utf8.js         |  38 ++
+ test/shermes/Inputs/check-c-bundle-layout.py  | 629 ++++++++++++++
+ test/shermes/computed-loads.js                | 147 ++++
+ test/shermes/conditional-object-spread.js     | 123 +++
+ test/shermes/emit-c-bundle-layout.js          |  13 +
+ test/shermes/ffi/string_write_utf8.js         |  38 +
  test/shermes/inline-object-reader-growth.js   |  16 +
- test/shermes/inline-object-reader-try.js      |  86 ++++
- test/shermes/integer-value-proofs.js          | 101 +++++
- test/shermes/known-callback-targets.js        | 117 ++++++
- test/shermes/known-native-call.js             |  62 +++
- test/shermes/native-literal-builtins.js       |  43 ++
- test/shermes/numeric-math.js                  |  98 +++++
- test/shermes/polymorphic-read-cache.js        |  63 +++
- test/shermes/string-index-comparison.js       | 183 +++++++++
- test/shermes/string-method-cache.js           |  36 ++
- tools/shermes/shermes.cpp                     |   8 +
- unittests/API/APITest.cpp                     | 127 ++++++
- .../PlatformUnicode/CharacterPropertyTest.cpp |  26 ++
- unittests/VMRuntime/StaticHUnitTest.cpp       |  50 +++
+ test/shermes/inline-object-reader-try.js      |  86 ++
+ test/shermes/integer-value-proofs.js          | 101 +++
+ test/shermes/known-callback-targets.js        | 117 +++
+ test/shermes/known-native-call.js             |  62 ++
+ test/shermes/native-literal-builtins.js       |  43 +
+ test/shermes/numeric-math.js                  |  98 +++
+ test/shermes/polymorphic-read-cache.js        |  63 ++
+ test/shermes/string-index-comparison.js       | 183 ++++
+ test/shermes/string-method-cache.js           |  36 +
+ tools/shermes/compile.cpp                     |  18 +-
+ tools/shermes/shermes.cpp                     |  29 +
+ unittests/API/APITest.cpp                     | 127 +++
+ .../PlatformUnicode/CharacterPropertyTest.cpp |  26 +
+ unittests/VMRuntime/StaticHUnitTest.cpp       |  50 ++
  unittests/VMRuntime/StringPrimitiveTest.cpp   |  15 +
- 51 files changed, 3162 insertions(+), 121 deletions(-)
+ 61 files changed, 5333 insertions(+), 262 deletions(-)
  create mode 100644 include/hermes/Support/MathFunctions.h
  create mode 100644 include/hermes/VMLayouts/PropertyCache.h
+ create mode 100644 lib/BCGen/SH/CBundleLayout.cpp
+ create mode 100644 lib/BCGen/SH/CBundleLayout.h
+ create mode 100644 test/shermes/Inputs/check-c-bundle-layout.py
  create mode 100644 test/shermes/computed-loads.js
  create mode 100644 test/shermes/conditional-object-spread.js
+ create mode 100644 test/shermes/emit-c-bundle-layout.js
  create mode 100644 test/shermes/ffi/string_write_utf8.js
  create mode 100644 test/shermes/inline-object-reader-growth.js
  create mode 100644 test/shermes/inline-object-reader-try.js
@@ -692,6 +725,66 @@ index 2d4f58dc62642a932d19c974f12d2cd9a0c76719..f5f8d28c56ad16598cd0f08689b492d0
    /// Attempt to resolve CommonJS require() calls at compile time.
    bool staticRequire{false};
  
+diff --git a/include/hermes/BCGen/LiteralBufferBuilder.h b/include/hermes/BCGen/LiteralBufferBuilder.h
+index 6d797fecff4d34b7477e1bb85f84223896002e0f..bcf69c2f0de9e81aa324678b3479d5c82de3c511 100644
+--- a/include/hermes/BCGen/LiteralBufferBuilder.h
++++ b/include/hermes/BCGen/LiteralBufferBuilder.h
+@@ -11,6 +11,7 @@
+ #include "hermes/BCGen/HBC/BCProvider.h"
+ #include "hermes/BCGen/SerializedLiteralGenerator.h"
+ #include "hermes/BCGen/ShapeTableEntry.h"
++#include "hermes/Support/StringTableEntry.h"
+ #include "llvh/ADT/DenseMap.h"
+ 
+ namespace hermes {
+@@ -31,6 +32,25 @@ struct LiteralOffset {
+ 
+ using LiteralOffsetMapTy = llvh::DenseMap<const Instruction *, LiteralOffset>;
+ 
++/// Validated allocation hints for serialized literals. Current literals are
++/// serialized normally and matched by exact bytes before retaining an offset.
++/// An empty instance requests cold layout capture; nullptr leaves it disabled.
++struct RetainedBuffers {
++  std::vector<unsigned char> values;
++  std::vector<unsigned char> keys;
++  std::vector<StringTableEntry> valueEntries;
++  std::vector<StringTableEntry> keyEntries;
++  std::vector<ShapeTableEntry> shapes;
++  /// ValueKind of each shape's allocation; typed shapes cannot share caches
++  /// with ordinary or typed non-enumerable object shapes.
++  std::vector<uint8_t> shapeKinds;
++  size_t liveValueEntries{0};
++  size_t liveKeyEntries{0};
++  size_t liveShapes{0};
++  size_t liveValueBytes{0};
++  size_t liveKeyBytes{0};
++};
++
+ /// The LiteralBufferBuilder will build this struct as its output.
+ struct Result {
+   std::vector<unsigned char> literalValBuffer;
+@@ -48,7 +68,8 @@ Result generate(
+     const SerializedLiteralGenerator::StringLookupFn &getIdentifier,
+     const SerializedLiteralGenerator::StringLookupFn &getString,
+     bool optimize,
+-    hbc::BCProviderBase *bcProvider = nullptr);
++    hbc::BCProviderBase *bcProvider = nullptr,
++    RetainedBuffers *retainedBuffers = nullptr);
+ } // namespace LiteralBufferBuilder
+ } // namespace hermes
+ 
+diff --git a/include/hermes/BCGen/SH/SH.h b/include/hermes/BCGen/SH/SH.h
+index 8ae3bb67539e236462964b091c938e9a4c9143b3..878003a00267359492065e77f0ca5e1dab5ba056 100644
+--- a/include/hermes/BCGen/SH/SH.h
++++ b/include/hermes/BCGen/SH/SH.h
+@@ -50,6 +50,7 @@ enum class SHCBundleOversizeReason {
+ struct SHCBundleFile {
+   std::string path;
+   SHCBundleFileRole role;
++  /// Dense coverage in bundle emission order, independent of runtime labels.
+   uint32_t firstFunctionId{0};
+   uint32_t lastFunctionId{0};
+   uint32_t functionCount{0};
 diff --git a/include/hermes/Optimizer/Scalar/Utils.h b/include/hermes/Optimizer/Scalar/Utils.h
 index 30a939e600695f52d2b633d6b9b1c1614221b9f5..79d99b380635281ff439b086dc83c8ddb23817b3 100644
 --- a/include/hermes/Optimizer/Scalar/Utils.h
@@ -767,6 +860,22 @@ index 0000000000000000000000000000000000000000..307c42f10238473e3c33b37b90629fe8
 +}
 +
 +#endif
+diff --git a/include/hermes/Utils/Options.h b/include/hermes/Utils/Options.h
+index c4d27a5671c29cdb8278ff3fac9bb90daf8d0511..53a93a63c1c321528135dbc2c208020e042ed1cd 100644
+--- a/include/hermes/Utils/Options.h
++++ b/include/hermes/Utils/Options.h
+@@ -71,6 +71,11 @@ struct BytecodeGenerationOptions {
+   /// unit.
+   uint64_t cBundleShardSize = 2 * 1024 * 1024;
+ 
++  /// Emit the retained function, cache and string layout beside the C bundle. The caller must
++  /// authenticate a previous layout before supplying it to a later build.
++  bool emitCBundleLayout = false;
++  llvh::StringRef cBundleLayoutInput{};
++
+   /// Whether to strip the debug info in the bytecode binary.
+   bool stripDebugInfoSection = false;
+ 
 diff --git a/include/hermes/VM/CellKind.h b/include/hermes/VM/CellKind.h
 index df50d7b056d5d76fb68a1517721b247366f7b518..5ded1bc8d641c41f7f6e07df73f0f98f7b67898b 100644
 --- a/include/hermes/VM/CellKind.h
@@ -1264,6 +1373,1164 @@ index 0000000000000000000000000000000000000000..60b71e00283bc2709968a3b7426c32cc
 +#define SH_COMPUTED_READ_CACHE_ASSOCIATIVITY 2
 +
 +#endif
+diff --git a/lib/BCGen/LiteralBufferBuilder.cpp b/lib/BCGen/LiteralBufferBuilder.cpp
+index 200dd4b9a41371d92884dc395d04ce9eb370cf1d..51153b82355e98eccfdd5e0c2ef66ed48a478952 100644
+--- a/lib/BCGen/LiteralBufferBuilder.cpp
++++ b/lib/BCGen/LiteralBufferBuilder.cpp
+@@ -14,6 +14,7 @@
+ #include "hermes/Inst/Inst.h"
+ #include "hermes/Inst/InstDecode.h"
+ #include "hermes/VM/ObjectAllocKind.h"
++#include "llvh/ADT/BitVector.h"
+ 
+ namespace hermes::LiteralBufferBuilder::detail {
+ /// The key with which to to deduplicate shape table entries in coordToIdx.
+@@ -64,6 +65,28 @@ namespace hermes {
+ namespace LiteralBufferBuilder {
+ namespace {
+ 
++size_t liveStorageBytes(
++    llvh::ArrayRef<StringTableEntry> entries,
++    const llvh::BitVector &live) {
++  std::vector<std::pair<uint32_t, uint32_t>> ranges;
++  for (auto index : live.set_bits()) {
++    const auto &entry = entries[index];
++    ranges.emplace_back(entry.getOffset(), entry.getOffset() + entry.getLength());
++  }
++  std::sort(ranges.begin(), ranges.end());
++  uint32_t end = 0;
++  size_t bytes = 0;
++  // Optimized storage shares overlapping byte sequences. Count their union,
++  // not their summed lengths, when deciding whether retired storage is bounded.
++  for (auto range : ranges) {
++    if (range.second > end) {
++      bytes += range.second - std::max(end, range.first);
++      end = range.second;
++    }
++  }
++  return bytes;
++}
++
+ /// A container that deduplicates byte sequences, while keeping the original
+ /// insertion order with the duplicates. Note: strings are used as a
+ /// representation for code reuse and simplicity, but the contents are meant to
+@@ -132,12 +155,16 @@ class Builder {
+       const SerializedLiteralGenerator::StringLookupFn &getIdentifier,
+       const SerializedLiteralGenerator::StringLookupFn &getString,
+       bool optimize,
+-      hbc::BCProviderBase *bcProvider)
++      hbc::BCProviderBase *bcProvider,
++      RetainedBuffers *retainedBuffers)
+       : M_(m),
+         shouldVisitFunction_(shouldVisitFunction),
+         optimize_(optimize),
+         literalGenerator_(getIdentifier, getString),
+-        bcProvider_(bcProvider) {}
++        bcProvider_(bcProvider),
++        retainedBuffers_(retainedBuffers) {
++    assert(!(bcProvider && retainedBuffers) && "literal seeds are exclusive");
++  }
+ 
+   /// Do everything: collect the literals, optionally deduplicate them.
+   Result generate();
+@@ -146,6 +173,8 @@ class Builder {
+   /// Reseed the tables to be initialized with the base bytecode given.
+   void reseedFromBaseBytecode();
+ 
++  void reseedFromRetainedBuffers();
++
+   /// Traverse the module, skipping functions that should not be visited,
+   /// and collect all serialized array and object literals and the corresponding
+   /// instruction.
+@@ -182,6 +211,8 @@ class Builder {
+   SerializedLiteralGenerator literalGenerator_;
+ 
+   hbc::BCProviderBase *bcProvider_;
++  RetainedBuffers *retainedBuffers_;
++  std::vector<uint8_t> shapeKinds_;
+ 
+   /// Temporary buffer to serialize literals into. We keep it around instead
+   /// of allocating a new one every time.
+@@ -350,32 +381,78 @@ void Builder::reseedFromBaseBytecode() {
+ 
+ void Builder::makeBufferStorages() {
+   assert(
+-      bcProvider_ ||
++      bcProvider_ || retainedBuffers_ ||
+       (valueStorage_.count() == 0 && keyStorage_.count() == 0) &&
+           "with no base bytecode, storages should be empty");
+-  valueStorage_.appendStorage(
+-      hbc::ConsecutiveStringStorage{
+-          values_.beginSet() + valueStorage_.count(),
+-          values_.endSet(),
+-          std::true_type{},
+-          optimize_});
+-  keyStorage_.appendStorage(
+-      hbc::ConsecutiveStringStorage{
+-          objKeys_.beginSet() + keyStorage_.count(),
+-          objKeys_.endSet(),
+-          std::true_type{},
+-          optimize_});
++  // Appending even an empty storage aligns the existing bytes. Avoid changing
++  // retained metadata when all current literals already have exact entries.
++  if (!retainedBuffers_ ||
++      values_.beginSet() + valueStorage_.count() != values_.endSet()) {
++    valueStorage_.appendStorage(
++        hbc::ConsecutiveStringStorage{
++            values_.beginSet() + valueStorage_.count(),
++            values_.endSet(),
++            std::true_type{},
++            optimize_});
++  }
++  if (!retainedBuffers_ ||
++      objKeys_.beginSet() + keyStorage_.count() != objKeys_.endSet()) {
++    keyStorage_.appendStorage(
++        hbc::ConsecutiveStringStorage{
++            objKeys_.beginSet() + keyStorage_.count(),
++            objKeys_.endSet(),
++            std::true_type{},
++            optimize_});
++  }
++}
++
++void Builder::reseedFromRetainedBuffers() {
++  auto &seed = *retainedBuffers_;
++  auto restore = [](UniquedStringVector &strings,
++                    hbc::ConsecutiveStringStorage &storage,
++                    std::vector<StringTableEntry> &entries,
++                    std::vector<unsigned char> &bytes) {
++    for (const auto &entry : entries) {
++      strings.push_back(llvh::StringRef{
++          bytes.empty()
++              ? ""
++              : reinterpret_cast<const char *>(bytes.data()) + entry.getOffset(),
++          entry.getLength()});
++    }
++    storage =
++        hbc::ConsecutiveStringStorage{std::move(entries), std::move(bytes)};
++  };
++  restore(values_, valueStorage_, seed.valueEntries, seed.values);
++  restore(objKeys_, keyStorage_, seed.keyEntries, seed.keys);
++  objShapeTable_ = std::move(seed.shapes);
++  shapeKinds_ = std::move(seed.shapeKinds);
++  for (uint32_t i = 0; i < objShapeTable_.size(); ++i) {
++    const auto &shape = objShapeTable_[i];
++    keyOffsetToShapeIdx_.insert({
++        {shape.keyBufferOffset,
++         shape.numProps,
++         static_cast<ValueKind>(shapeKinds_[i])},
++        i});
++  }
+ }
+ 
+ LiteralBufferBuilder::Result Builder::generate() {
+   if (bcProvider_) {
+     reseedFromBaseBytecode();
++  } else if (retainedBuffers_) {
++    reseedFromRetainedBuffers();
+   }
+   traverse();
+   makeBufferStorages();
+ 
+   // Populate the offset map.
+   LiteralOffsetMapTy literalOffsetMap{};
++  llvh::BitVector liveValues, liveKeys, liveShapes;
++  if (retainedBuffers_) {
++    liveValues.resize(valueStorage_.count());
++    liveKeys.resize(keyStorage_.count());
++    liveShapes.resize(objShapeTable_.size());
++  }
+ 
+   // Visit all object/array literal values.
+   // Cast these to const to make sure we're calling the correct overload and no
+@@ -389,6 +466,8 @@ LiteralBufferBuilder::Result Builder::generate() {
+         literalOffsetMap.count(Inst) == 0 &&
+         "instruction literal can't be serialized twice");
+     uint32_t arrayIndexInSet = values_.indexInSet(idx);
++    if (retainedBuffers_)
++      liveValues.set(arrayIndexInSet);
+     literalOffsetMap[Inst] = {UINT32_MAX, valView[arrayIndexInSet].getOffset()};
+   }
+ 
+@@ -422,14 +501,38 @@ LiteralBufferBuilder::Result Builder::generate() {
+     if (success) {
+       // This is a new entry, add it to the shape table.
+       objShapeTable_.push_back({keyBufferOffset, len});
++      if (retainedBuffers_) {
++        shapeKinds_.push_back(static_cast<uint8_t>(allocKind));
++        liveShapes.resize(objShapeTable_.size());
++      }
++    }
++    if (retainedBuffers_) {
++      liveValues.set(valIndexInSet);
++      liveKeys.set(keyIndexInSet);
++      liveShapes.set(shapeID);
+     }
+     literalOffsetMap[Inst] =
+         LiteralOffset{shapeID, valView[valIndexInSet].getOffset()};
+   }
+ 
++  auto values = std::move(valueStorage_).acquireStringTableAndStorage();
++  auto keys = std::move(keyStorage_).acquireStringTableAndStorage();
++  if (retainedBuffers_) {
++    retainedBuffers_->liveValueBytes = liveStorageBytes(values.first, liveValues);
++    retainedBuffers_->liveKeyBytes = liveStorageBytes(keys.first, liveKeys);
++    retainedBuffers_->values = values.second;
++    retainedBuffers_->keys = keys.second;
++    retainedBuffers_->valueEntries = std::move(values.first);
++    retainedBuffers_->keyEntries = std::move(keys.first);
++    retainedBuffers_->shapes = objShapeTable_;
++    retainedBuffers_->shapeKinds = std::move(shapeKinds_);
++    retainedBuffers_->liveValueEntries = liveValues.count();
++    retainedBuffers_->liveKeyEntries = liveKeys.count();
++    retainedBuffers_->liveShapes = liveShapes.count();
++  }
+   return {
+-      std::move(valueStorage_).acquireStringTableAndStorage().second,
+-      std::move(keyStorage_).acquireStringTableAndStorage().second,
++      std::move(values.second),
++      std::move(keys.second),
+       std::move(objShapeTable_),
+       std::move(literalOffsetMap)};
+ }
+@@ -547,14 +650,16 @@ Result generate(
+     const SerializedLiteralGenerator::StringLookupFn &getIdentifier,
+     const SerializedLiteralGenerator::StringLookupFn &getString,
+     bool optimize,
+-    hbc::BCProviderBase *bcProvider) {
++    hbc::BCProviderBase *bcProvider,
++    RetainedBuffers *retainedBuffers) {
+   return Builder(
+              m,
+              shouldVisitFunction,
+              getIdentifier,
+              getString,
+              optimize,
+-             bcProvider)
++             bcProvider,
++             retainedBuffers)
+       .generate();
+ }
+ 
+diff --git a/lib/BCGen/SH/CBundleLayout.cpp b/lib/BCGen/SH/CBundleLayout.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..5d9fd1eaa3fdc3c63149a85a6d604310da02ce05
+--- /dev/null
++++ b/lib/BCGen/SH/CBundleLayout.cpp
+@@ -0,0 +1,777 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++#include "CBundleLayout.h"
++
++#include "hermes/IR/Instrs.h"
++#include "llvh/ADT/BitVector.h"
++#include "llvh/ADT/StringMap.h"
++#include "llvh/ADT/StringSet.h"
++#include "llvh/Support/SHA1.h"
++
++#include <set>
++#include <tuple>
++
++namespace hermes::sh {
++namespace {
++
++constexpr size_t kRetainedFunctionSlots = 64 * 1024;
++constexpr uint32_t kRetainedCacheSlots = 1024 * 1024;
++constexpr uint32_t kRetainedEnvironmentSlots = 256 * 1024;
++constexpr size_t kVariableAnchors = 4;
++constexpr size_t kRetainedShardGroups = 65533;
++constexpr size_t kRetainedLiteralBytes = 8 * 1024 * 1024;
++constexpr size_t kRetainedLiteralEntries = 256 * 1024;
++constexpr size_t kRetainedLiteralShapes = 64 * 1024;
++
++/// Function-local shape, without source coordinates, identifier spellings, or
++/// module ordinals. This deliberately is not a semantic program hash: changed
++/// callees, captures, attributes, and even hash collisions still regenerate C.
++/// Occurrence suffixes keep duplicate shapes injective within each compilation.
++std::string functionLayoutKey(Function *function) {
++  llvh::SHA1 hash;
++  auto number = [&](uint64_t value) {
++    uint8_t bytes[8];
++    for (unsigned i = 0; i < 8; ++i)
++      bytes[i] = value >> (8 * i);
++    hash.update(bytes);
++  };
++  auto string = [&](llvh::StringRef value) {
++    number(value.size());
++    hash.update(value);
++  };
++  llvh::DenseMap<Value *, uint32_t> localValues;
++  for (auto &block : *function) {
++    localValues.try_emplace(&block, localValues.size());
++    for (auto &instruction : block)
++      localValues.try_emplace(&instruction, localValues.size());
++  }
++  number(static_cast<unsigned>(function->getKind()));
++  number(function->getExpectedParamCountIncludingThis());
++  for (auto &block : *function) {
++    number(block.size());
++    for (auto &instruction : block) {
++      number(static_cast<unsigned>(instruction.getKind()));
++      number(instruction.getNumOperands());
++      for (unsigned i = 0; i < instruction.getNumOperands(); ++i) {
++        auto *value = instruction.getOperand(i);
++        if (!value) {
++          number(UINT64_MAX);
++          continue;
++        }
++        number(static_cast<unsigned>(value->getKind()));
++        if (auto *literal = llvh::dyn_cast<LiteralNumber>(value)) {
++          number(llvh::DoubleToBits(literal->getValue()));
++        } else if (auto *literal = llvh::dyn_cast<LiteralString>(value)) {
++          string(literal->getValue().str());
++        } else if (auto *literal = llvh::dyn_cast<LiteralBigInt>(value)) {
++          string(literal->getValue()->str());
++        } else if (auto *literal = llvh::dyn_cast<LiteralBool>(value)) {
++          number(literal->getValue());
++        } else if (auto *param = llvh::dyn_cast<JSDynamicParam>(value)) {
++          number(param->getIndexInParamList());
++        } else {
++          // Number external references by first local use, preserving their
++          // equality relationships without importing a changing parent layout.
++          auto entry = localValues.try_emplace(value, localValues.size());
++          number(entry.first->second);
++        }
++      }
++    }
++  }
++  std::string key;
++  const char *hex = "0123456789abcdef";
++  for (unsigned char byte : hash.final()) {
++    key += hex[byte >> 4];
++    key += hex[byte & 15];
++  }
++  return key;
++}
++
++bool validFunctionKey(llvh::StringRef key) {
++  if (key.size() < 42 || key.size() > 51 || key[40] != ':')
++    return false;
++  for (char c : key.take_front(40))
++    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
++      return false;
++  auto occurrence = key.drop_front(41);
++  if (occurrence.size() > 1 && occurrence.front() == '0')
++    return false;
++  for (char c : occurrence)
++    if (c < '0' || c > '9')
++      return false;
++  return true;
++}
++
++} // namespace
++
++bool CBundleFunctionLayout::readLiterals(const llvh::json::Value &seed) {
++  if (seed.getAsNull())
++    return true;
++  const auto *object = seed.getAsObject();
++  if (!object || object->size() != 5)
++    return false;
++  auto decode = [&](llvh::StringRef bytesKey,
++                    llvh::StringRef entriesKey,
++                    std::vector<unsigned char> &bytes,
++                    std::vector<StringTableEntry> &entries) {
++    const auto text = object->getString(bytesKey);
++    const auto *rawEntries = object->getArray(entriesKey);
++    if (!text || text->size() % 2 ||
++        text->size() / 2 > kRetainedLiteralBytes ||
++        !rawEntries || rawEntries->size() > kRetainedLiteralEntries)
++      return false;
++    unsigned byte = 0;
++    for (size_t i = 0; i < text->size(); ++i) {
++      char c = (*text)[i];
++      if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
++        return false;
++      byte = byte * 16 + (c <= '9' ? c - '0' : c - 'a' + 10);
++      if (i % 2) {
++        bytes.push_back(byte);
++        byte = 0;
++      }
++    }
++    llvh::StringSet<> seen;
++    for (const auto &rawEntry : *rawEntries) {
++      const auto *entry = rawEntry.getAsArray();
++      if (!entry || entry->size() != 2)
++        return false;
++      auto offset = (*entry)[0].getAsInteger();
++      auto length = (*entry)[1].getAsInteger();
++      if (!offset || !length || *offset < 0 || *length < 0 ||
++          static_cast<uint64_t>(*offset) > bytes.size() ||
++          static_cast<uint64_t>(*length) > bytes.size() - *offset)
++        return false;
++      llvh::StringRef segment{
++          bytes.empty()
++              ? ""
++              : reinterpret_cast<const char *>(bytes.data()) + *offset,
++          static_cast<size_t>(*length)};
++      // The storage table and the uniqued serialized set must have matching
++      // indices. Overlap is valid compression, but repeated exact entries are not.
++      if (!seen.insert(segment).second)
++        return false;
++      entries.emplace_back(*offset, *length, false);
++    }
++    return true;
++  };
++  if (!decode(
++          "values",
++          "valueEntries",
++          literalBuffers_.values,
++          literalBuffers_.valueEntries) ||
++      !decode(
++          "keys",
++          "keyEntries",
++          literalBuffers_.keys,
++          literalBuffers_.keyEntries))
++    return false;
++  const auto *shapes = object->getArray("shapes");
++  if (!shapes || shapes->size() > kRetainedLiteralShapes)
++    return false;
++  llvh::DenseSet<uint32_t> keyOffsets;
++  for (const auto &entry : literalBuffers_.keyEntries)
++    keyOffsets.insert(entry.getOffset());
++  std::set<std::tuple<uint32_t, uint32_t, uint8_t>> seenShapes;
++  for (const auto &rawShape : *shapes) {
++    const auto *shape = rawShape.getAsArray();
++    if (!shape || shape->size() != 3)
++      return false;
++    auto offset = (*shape)[0].getAsInteger();
++    auto count = (*shape)[1].getAsInteger();
++    auto kind = (*shape)[2].getAsInteger();
++    if (!offset || !count || !kind || *offset < 0 || *offset > UINT32_MAX ||
++        *count < 0 || *count > UINT32_MAX || !keyOffsets.count(*offset) ||
++        (*kind !=
++             static_cast<uint8_t>(ValueKind::LIRAllocObjectFromBufferInstKind) &&
++         *kind != static_cast<uint8_t>(
++                      ValueKind::LIRAllocTypedObjectFromBufferInstKind) &&
++         *kind != static_cast<uint8_t>(
++                      ValueKind::LIRAllocTypedNonEnumObjectFromBufferInstKind)) ||
++        !seenShapes.emplace(*offset, *count, *kind).second)
++      return false;
++    literalBuffers_.shapes.push_back(
++        {static_cast<uint32_t>(*offset), static_cast<uint32_t>(*count)});
++    literalBuffers_.shapeKinds.push_back(*kind);
++  }
++  return true;
++}
++
++llvh::json::Value CBundleFunctionLayout::generateLiterals() const {
++  const auto &buffers = literalBuffers_;
++  auto excess = [](size_t total, size_t live, size_t minimum) {
++    return total - live > std::max(minimum, live / 4);
++  };
++  if (buffers.values.size() > kRetainedLiteralBytes ||
++      buffers.keys.size() > kRetainedLiteralBytes ||
++      buffers.valueEntries.size() > kRetainedLiteralEntries ||
++      buffers.keyEntries.size() > kRetainedLiteralEntries ||
++      buffers.shapes.size() > kRetainedLiteralShapes ||
++      excess(buffers.valueEntries.size(), buffers.liveValueEntries, 1024) ||
++      excess(buffers.keyEntries.size(), buffers.liveKeyEntries, 1024) ||
++      excess(buffers.shapes.size(), buffers.liveShapes, 1024) ||
++      excess(buffers.values.size(), buffers.liveValueBytes, 64 * 1024) ||
++      excess(buffers.keys.size(), buffers.liveKeyBytes, 64 * 1024))
++    return nullptr;
++  auto encode = [](llvh::ArrayRef<unsigned char> bytes) {
++    std::string result;
++    result.reserve(bytes.size() * 2);
++    const char *hex = "0123456789abcdef";
++    for (unsigned char byte : bytes) {
++      result += hex[byte >> 4];
++      result += hex[byte & 15];
++    }
++    return result;
++  };
++  auto entries = [](llvh::ArrayRef<StringTableEntry> entries) {
++    llvh::json::Array result;
++    for (const auto &entry : entries)
++      result.push_back(llvh::json::Array{entry.getOffset(), entry.getLength()});
++    return result;
++  };
++  llvh::json::Array shapes;
++  for (size_t i = 0; i < buffers.shapes.size(); ++i) {
++    const auto &shape = buffers.shapes[i];
++    shapes.push_back(llvh::json::Array{
++        shape.keyBufferOffset, shape.numProps, buffers.shapeKinds[i]});
++  }
++  return llvh::json::Object{
++      {"values", encode(buffers.values)},
++      {"valueEntries", entries(buffers.valueEntries)},
++      {"keys", encode(buffers.keys)},
++      {"keyEntries", entries(buffers.keyEntries)},
++      {"shapes", std::move(shapes)},
++  };
++}
++
++bool CBundleFunctionLayout::read(const llvh::json::Array &seed) {
++  if (seed.size() > kRetainedFunctionSlots)
++    return false;
++  llvh::StringSet<> keys;
++  std::array<llvh::BitVector, CacheKindCount> occupied;
++  for (auto &bits : occupied)
++    bits.resize(kRetainedCacheSlots);
++  uint64_t totalSlots = 0;
++  for (const auto &value : seed) {
++    const auto *entry = value.getAsArray();
++    if (!entry || entry->size() != 1 + CacheKindCount)
++      return false;
++    auto key = (*entry)[0].getAsString();
++    if (!key || (slots_.empty() ? *key != "global" : !validFunctionKey(*key)) ||
++        !keys.insert(*key).second)
++      return false;
++    Slot slot;
++    slot.key = key->str();
++    for (unsigned kind = 0; kind < CacheKindCount; ++kind) {
++      const auto *ranges = (*entry)[kind + 1].getAsArray();
++      if (!ranges)
++        return false;
++      for (const auto &rangeValue : *ranges) {
++        const auto *range = rangeValue.getAsArray();
++        if (!range || range->size() != 2)
++          return false;
++        auto start = (*range)[0].getAsInteger();
++        auto count = (*range)[1].getAsInteger();
++        if (!start || !count || *start < 0 || *count <= 0 ||
++            *start >= kRetainedCacheSlots ||
++            *count > kRetainedCacheSlots - *start ||
++            (kind != Read && *count != 1))
++          return false;
++        totalSlots += *count;
++        if (totalSlots > kRetainedCacheSlots)
++          return false;
++        const uint32_t end = *start + *count;
++        for (uint32_t index = *start; index < end; ++index) {
++          if (occupied[kind].test(index))
++            return false;
++          occupied[kind].set(index);
++        }
++        cacheSizes_[kind] = std::max(cacheSizes_[kind], end);
++        slot.caches[kind].push_back(
++            {static_cast<uint32_t>(*start), static_cast<uint32_t>(*count)});
++      }
++    }
++    slots_.push_back(std::move(slot));
++  }
++  // Gaps can inflate a unit even with very few retained sites. Bound the total
++  // allocated extent, including holes, rather than just the seed's records.
++  uint64_t extent = 0;
++  for (auto size : cacheSizes_)
++    extent += size;
++  return extent <= kRetainedCacheSlots;
++}
++
++bool CBundleFunctionLayout::readScopes(const llvh::json::Array &seed) {
++  if (seed.size() > kRetainedEnvironmentSlots ||
++      (slots_.empty() && !seed.empty()))
++    return false;
++  llvh::DenseSet<uint64_t> seen;
++  uint64_t totalSlots = 0;
++  for (const auto &value : seed) {
++    const auto *scope = value.getAsArray();
++    if (!scope || scope->empty())
++      return false;
++    totalSlots += scope->size();
++    if (totalSlots > kRetainedEnvironmentSlots)
++      return false;
++    ScopeSlots entries;
++    for (const auto &entryValue : *scope) {
++      const auto *anchors = entryValue.getAsArray();
++      if (!anchors || anchors->size() > kVariableAnchors)
++        return false;
++      std::vector<uint64_t> entry;
++      for (const auto &anchorValue : *anchors) {
++        auto anchor = anchorValue.getAsInteger();
++        if (!anchor || *anchor < 0 ||
++            (static_cast<uint64_t>(*anchor) >> 32) >= slots_.size() ||
++            (!entry.empty() && static_cast<uint64_t>(*anchor) <= entry.back()) ||
++            !seen.insert(*anchor).second)
++          return false;
++        entry.push_back(*anchor);
++      }
++      entries.push_back(std::move(entry));
++    }
++    retainedScopes_.push_back(std::move(entries));
++  }
++  return true;
++}
++
++void CBundleFunctionLayout::assign(llvh::ArrayRef<Function *> functions) {
++  llvh::StringMap<uint32_t> byKey;
++  for (uint32_t index = 0; index < slots_.size(); ++index)
++    byKey[slots_[index].key] = index;
++  llvh::DenseMap<Function *, std::string> shapes;
++  llvh::DenseMap<Function *, size_t> sizes;
++  llvh::StringMap<uint32_t> shapeCounts;
++  for (auto *function : functions) {
++    auto shape = functionLayoutKey(function);
++    ++shapeCounts[shape];
++    shapes[function] = std::move(shape);
++    size_t size = 0;
++    for (auto &block : *function)
++      size += block.size();
++    sizes[function] = size;
++  }
++  llvh::StringMap<uint32_t> occurrences;
++  for (auto *function : functions) {
++    std::string key = "global";
++    if (function != functions.front()) {
++      auto shape = shapes.find(function)->second;
++      if (shapeCounts[shape] > 1) {
++        // Unrelated parents often create identical small closures. Distinguish
++        // them by property publication, or by a small creating parent's shape.
++        // Never import arbitrary callers or large initializer shapes: one edit
++        // there would otherwise change thousands of unrelated closure slots.
++        std::vector<std::string> callers;
++        std::vector<std::string> publications;
++        for (auto *user : function->getUsers()) {
++          if (!llvh::isa<BaseCreateLexicalChildInst>(user))
++            continue;
++          auto *caller = user->getFunction();
++          if (caller != functions.front() && sizes.find(caller)->second <= 256)
++            callers.push_back("parent:" + shapes.find(caller)->second);
++          for (auto *consumer : user->getUsers()) {
++            Value *property = nullptr;
++            if (auto *store = llvh::dyn_cast<BaseStorePropertyInst>(consumer)) {
++              if (store->getStoredValue() == user)
++                property = store->getProperty();
++            } else if (auto *define = llvh::dyn_cast<DefineOwnPropertyInst>(consumer)) {
++              if (define->getStoredValue() == user)
++                property = define->getProperty();
++            }
++            if (auto *name = llvh::dyn_cast_or_null<LiteralString>(property))
++              publications.push_back("property:" + name->getValue().str().str());
++          }
++        }
++        if (!publications.empty())
++          callers = std::move(publications);
++        std::sort(callers.begin(), callers.end());
++        callers.erase(std::unique(callers.begin(), callers.end()), callers.end());
++        llvh::SHA1 hash;
++        hash.update(shape);
++        for (const auto &caller : callers) {
++          hash.update(std::to_string(caller.size()));
++          hash.update(":");
++          hash.update(caller);
++        }
++        shape.clear();
++        const char *hex = "0123456789abcdef";
++        for (unsigned char byte : hash.final()) {
++          shape += hex[byte >> 4];
++          shape += hex[byte & 15];
++        }
++      }
++      key = shape + ":" + std::to_string(occurrences[shape]++);
++    }
++    auto entry = byKey.try_emplace(key, slots_.size());
++    if (entry.second) {
++      Slot slot;
++      slot.key = std::move(key);
++      slots_.push_back(std::move(slot));
++    }
++    auto index = entry.first->second;
++    assert(!slots_[index].function && "function slots must be injective");
++    slots_[index].function = function;
++    functionSlots_[function] = index;
++  }
++  // An occurrence-matched getter can refer to another binding after deletion.
++  // One uniquely matched consumer must outweigh every ambiguous hint for a
++  // variable. The global initializer's local positions are also weak hints.
++  for (auto &slot : slots_) {
++    if (slot.function && slot.key != "global" &&
++        occurrences[llvh::StringRef(slot.key).take_front(40)] == 1)
++      slot.anchorWeight = kVariableAnchors + 1;
++  }
++}
++
++bool CBundleFunctionLayout::readShards(const llvh::json::Array &seed) {
++  if (seed.size() > kRetainedShardGroups ||
++      (slots_.empty() && !seed.empty()))
++    return false;
++  llvh::BitVector seen(slots_.size());
++  for (const auto &value : seed) {
++    const auto *members = value.getAsArray();
++    if (!members || members->size() > slots_.size())
++      return false;
++    std::vector<uint32_t> group;
++    for (const auto &member : *members) {
++      auto slot = member.getAsInteger();
++      if (!slot || *slot < 0 || static_cast<uint64_t>(*slot) >= slots_.size() ||
++          seen.test(*slot))
++        return false;
++      seen.set(*slot);
++      group.push_back(*slot);
++    }
++    retainedShards_.push_back(std::move(group));
++  }
++  return true;
++}
++
++std::vector<CBundleFunctionLayout::ShardGroup>
++CBundleFunctionLayout::groupFunctions(llvh::ArrayRef<Function *> functions) {
++  std::vector<ShardGroup> groups;
++  llvh::DenseMap<Function *, uint32_t> membership;
++  for (uint32_t index = 0; index < retainedShards_.size(); ++index) {
++    groups.push_back({index, true, {}});
++    for (uint32_t slot : retainedShards_[index]) {
++      if (auto *function = slots_[slot].function) {
++        groups.back().functions.push_back(function);
++        membership[function] = index;
++      }
++    }
++  }
++  currentShards_.resize(groups.size());
++  if (membership.empty()) {
++    groups.push_back({
++        static_cast<uint32_t>(groups.size()),
++        false,
++        std::vector<Function *>(functions.begin(), functions.end()),
++    });
++    return groups;
++  }
++
++  // Function shape is not stable through a body edit. Keep new shapes near
++  // their original neighbours instead of moving every edited function into a
++  // separate translation unit. This is packing policy, not semantic identity.
++  std::vector<size_t> nextMatch(functions.size(), functions.size());
++  size_t next = functions.size();
++  for (size_t i = functions.size(); i-- > 0;) {
++    if (membership.count(functions[i]))
++      next = i;
++    nextMatch[i] = next;
++  }
++  size_t previous = functions.size();
++  for (size_t i = 0; i < functions.size(); ++i) {
++    if (membership.count(functions[i])) {
++      previous = i;
++      continue;
++    }
++    next = nextMatch[i];
++    const size_t neighbour = previous == functions.size() ? next
++        : next == functions.size()                       ? previous
++        : i - previous < next - i                        ? previous
++                                                         : next;
++    groups[membership.find(functions[neighbour])->second].functions.push_back(
++        functions[i]);
++  }
++  return groups;
++}
++
++void CBundleFunctionLayout::recordShard(
++    uint32_t group,
++    llvh::ArrayRef<Function *> functions) {
++  if (currentShards_.size() <= group)
++    currentShards_.resize(group + 1);
++  auto &members = currentShards_[group];
++  for (auto *function : functions) {
++    const auto slot = getSlot(function);
++    // Outlined fragments are consecutive pieces of the same function.
++    if (members.empty() || members.back() != slot)
++      members.push_back(slot);
++  }
++}
++
++llvh::json::Array CBundleFunctionLayout::generateShards() const {
++  llvh::json::Array result;
++  size_t empty = 0;
++  for (const auto &group : currentShards_)
++    empty += group.empty();
++  if (currentShards_.size() > kRetainedShardGroups ||
++      empty > std::max<size_t>(1024, (currentShards_.size() - empty) / 4))
++    return result;
++  for (const auto &group : currentShards_) {
++    llvh::json::Array members;
++    for (auto slot : group)
++      members.push_back(slot);
++    result.push_back(std::move(members));
++  }
++  return result;
++}
++
++void CBundleFunctionLayout::assignScopes(Module *module) {
++  // Each function numbers its distinct captured variables by first use.
++  // Stable consumers supply identity when a shared initializer is edited or
++  // a minifier changes every binding name. Keep several anchors per variable
++  // so losing one consumer need not renumber the remaining environment.
++  // Prefer unambiguous consumers, then consumers of few variables. Thousands
++  // of identical getters can otherwise outweigh a stable, unique consumer.
++  using Candidate = std::tuple<bool, uint32_t, uint64_t>;
++  llvh::DenseMap<Variable *, std::vector<Candidate>> candidates;
++  for (auto *function : functionsBySlot()) {
++    if (!function)
++      continue;
++    llvh::DenseMap<Variable *, uint32_t> localVariables;
++    for (auto &block : *function) {
++      for (auto &instruction : block) {
++        for (unsigned i = 0; i < instruction.getNumOperands(); ++i) {
++          auto *variable = llvh::dyn_cast_or_null<Variable>(
++              instruction.getOperand(i));
++          if (!variable)
++            continue;
++          localVariables.try_emplace(variable, localVariables.size());
++        }
++      }
++    }
++    for (auto variable : localVariables) {
++      uint64_t anchor = (uint64_t(getSlot(function)) << 32) | variable.second;
++      Candidate candidate{
++          slots_[getSlot(function)].anchorWeight == 1,
++          localVariables.size(),
++          anchor};
++      auto &references = candidates[variable.first];
++      auto position =
++          std::lower_bound(references.begin(), references.end(), candidate);
++      if (position != references.end() || references.size() < kVariableAnchors) {
++        references.insert(position, candidate);
++        if (references.size() > kVariableAnchors)
++          references.pop_back();
++      }
++    }
++  }
++  llvh::DenseMap<Variable *, std::vector<uint64_t>> anchors;
++  for (const auto &entry : candidates) {
++    auto &references = anchors[entry.first];
++    for (auto candidate : entry.second)
++      references.push_back(std::get<2>(candidate));
++    std::sort(references.begin(), references.end());
++  }
++
++  using Location = std::pair<uint32_t, uint32_t>;
++  llvh::DenseMap<uint64_t, Location> previousAnchors;
++  for (uint32_t scope = 0; scope < retainedScopes_.size(); ++scope)
++    for (uint32_t slot = 0; slot < retainedScopes_[scope].size(); ++slot)
++      for (auto anchor : retainedScopes_[scope][slot])
++        previousAnchors[anchor] = {scope, slot};
++
++  std::vector<VariableScope *> scopes;
++  for (auto &scope : module->getVariableScopes()) {
++    scopeSizes_[&scope] = scope.getVariables().size();
++    if (!scope.getVariables().empty())
++      scopes.push_back(&scope);
++  }
++  struct Match {
++    uint32_t votes;
++    uint32_t current;
++    uint32_t previous;
++  };
++  auto strongestFirst = [](const Match &a, const Match &b) {
++    if (a.votes != b.votes)
++      return a.votes > b.votes;
++    if (a.current != b.current)
++      return a.current < b.current;
++    return a.previous < b.previous;
++  };
++  std::vector<Match> matches;
++  for (uint32_t scope = 0; scope < scopes.size(); ++scope) {
++    llvh::DenseMap<uint32_t, uint32_t> votes;
++    for (auto *variable : scopes[scope]->getVariables()) {
++      for (auto anchor : anchors[variable]) {
++        auto previous = previousAnchors.find(anchor);
++        if (previous != previousAnchors.end())
++          votes[previous->second.first] += slots_[anchor >> 32].anchorWeight;
++      }
++    }
++    for (auto vote : votes)
++      matches.push_back({vote.second, scope, vote.first});
++  }
++  std::sort(matches.begin(), matches.end(), strongestFirst);
++  std::vector<uint32_t> previousScope(scopes.size(), UINT32_MAX);
++  llvh::BitVector usedScopes(retainedScopes_.size());
++  for (auto match : matches) {
++    if (previousScope[match.current] == UINT32_MAX &&
++        !usedScopes.test(match.previous)) {
++      previousScope[match.current] = match.previous;
++      usedScopes.set(match.previous);
++    }
++  }
++
++  for (uint32_t scope = 0; scope < scopes.size(); ++scope) {
++    auto variables = scopes[scope]->getVariables();
++    auto previous = previousScope[scope];
++    const auto oldSize = previous == UINT32_MAX
++        ? 0
++        : retainedScopes_[previous].size();
++    const auto capacity = std::max(oldSize, variables.size());
++    std::vector<uint32_t> assignment(variables.size(), UINT32_MAX);
++    llvh::BitVector usedSlots(capacity);
++    matches.clear();
++    for (uint32_t variable = 0; variable < variables.size(); ++variable) {
++      llvh::DenseMap<uint32_t, uint32_t> votes;
++      for (auto anchor : anchors[variables[variable]]) {
++        auto old = previousAnchors.find(anchor);
++        if (old != previousAnchors.end() && old->second.first == previous)
++          votes[old->second.second] += slots_[anchor >> 32].anchorWeight;
++      }
++      for (auto vote : votes)
++        matches.push_back({vote.second, variable, vote.first});
++    }
++    std::sort(matches.begin(), matches.end(), strongestFirst);
++    for (auto match : matches) {
++      if (assignment[match.current] == UINT32_MAX &&
++          !usedSlots.test(match.previous)) {
++        assignment[match.current] = match.previous;
++        usedSlots.set(match.previous);
++      }
++    }
++    // All surviving variables have claimed their slots before holes can be
++    // assigned to new variables. Never alias two live variables, even when
++    // approximate anchors matched different bindings in the previous source.
++    uint32_t nextFree = 0;
++    for (uint32_t variable = 0; variable < variables.size(); ++variable) {
++      if (assignment[variable] == UINT32_MAX) {
++        while (usedSlots.test(nextFree))
++          ++nextFree;
++        assignment[variable] = nextFree;
++        usedSlots.set(nextFree);
++      }
++    }
++    // Keep exactly the live environment size: extra slots would add allocation
++    // and GC work. Fill deletion holes with variables beyond the new end,
++    // changing only those variables' offsets, before any body is emitted.
++    nextFree = 0;
++    for (auto &slot : assignment) {
++      if (slot < variables.size())
++        continue;
++      while (usedSlots.test(nextFree))
++        ++nextFree;
++      assert(nextFree < variables.size() && "a live variable needs a free slot");
++      usedSlots.reset(slot);
++      slot = nextFree;
++      usedSlots.set(nextFree);
++    }
++    ScopeSlots emitted(variables.size());
++    for (uint32_t variable = 0; variable < variables.size(); ++variable) {
++      variableSlots_[variables[variable]] = assignment[variable];
++      emitted[assignment[variable]] = std::move(anchors[variables[variable]]);
++    }
++    currentScopes_.push_back(std::move(emitted));
++  }
++}
++
++llvh::json::Array CBundleFunctionLayout::generateScopes() const {
++  uint64_t count = 0;
++  for (const auto &scope : currentScopes_)
++    count += scope.size();
++  llvh::json::Array result;
++  if (count > kRetainedEnvironmentSlots || slots_.size() > kRetainedFunctionSlots)
++    return result;
++  for (const auto &scope : currentScopes_) {
++    llvh::json::Array entries;
++    for (const auto &slot : scope) {
++      llvh::json::Array anchors;
++      for (auto anchor : slot)
++        anchors.push_back(static_cast<int64_t>(anchor));
++      entries.push_back(std::move(anchors));
++    }
++    result.push_back(std::move(entries));
++  }
++  return result;
++}
++
++std::vector<Function *> CBundleFunctionLayout::functionsBySlot() const {
++  std::vector<Function *> result;
++  result.reserve(slots_.size());
++  for (const auto &slot : slots_)
++    result.push_back(slot.function);
++  return result;
++}
++
++uint32_t CBundleFunctionLayout::allocateCache(
++    Function *function,
++    CacheKind kind,
++    uint32_t count) {
++  auto &slot = slots_[getSlot(function)];
++  auto &ranges = slot.caches[kind];
++  const auto site = slot.usedRanges[kind]++;
++  if (site < ranges.size() && ranges[site].count >= count)
++    return ranges[site].start;
++  if (count > UINT32_MAX - cacheSizes_[kind])
++    hermes_fatal("Static Hermes property cache exceeds index capacity");
++  Range range{cacheSizes_[kind], count};
++  cacheSizes_[kind] += count;
++  if (site < ranges.size())
++    ranges[site] = range;
++  else
++    ranges.push_back(range);
++  return range.start;
++}
++
++llvh::json::Array CBundleFunctionLayout::generate() const {
++  size_t liveFunctions = 0;
++  uint64_t liveCacheSlots = 0, cacheSlots = 0;
++  for (const auto &slot : slots_) {
++    if (slot.function)
++      ++liveFunctions;
++    for (unsigned kind = 0; kind < CacheKindCount; ++kind)
++      for (size_t site = 0; site < slot.usedRanges[kind]; ++site)
++        liveCacheSlots += slot.caches[kind][site].count;
++  }
++  for (auto size : cacheSizes_)
++    cacheSlots += size;
++  llvh::json::Array result;
++  if (slots_.size() > kRetainedFunctionSlots ||
++      cacheSlots > kRetainedCacheSlots ||
++      slots_.size() - liveFunctions >
++          std::max<size_t>(1024, liveFunctions / 4) ||
++      cacheSlots - liveCacheSlots >
++          std::max<uint64_t>(1024, liveCacheSlots / 4))
++    return result;
++  for (const auto &slot : slots_) {
++    llvh::json::Array entry{slot.key};
++    for (const auto &ranges : slot.caches) {
++      llvh::json::Array encoded;
++      for (const auto &range : ranges)
++        encoded.push_back(llvh::json::Array{range.start, range.count});
++      entry.push_back(std::move(encoded));
++    }
++    result.push_back(std::move(entry));
++  }
++  return result;
++}
++
++} // namespace hermes::sh
+diff --git a/lib/BCGen/SH/CBundleLayout.h b/lib/BCGen/SH/CBundleLayout.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..b6c062643ce88b5edc8a282134de055bfab32384
+--- /dev/null
++++ b/lib/BCGen/SH/CBundleLayout.h
+@@ -0,0 +1,118 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++#ifndef HERMES_BCGEN_SH_CBUNDLELAYOUT_H
++#define HERMES_BCGEN_SH_CBUNDLELAYOUT_H
++
++#include "hermes/BCGen/LiteralBufferBuilder.h"
++#include "hermes/IR/IR.h"
++#include "llvh/Support/JSON.h"
++
++#include <array>
++
++namespace hermes::sh {
++
++/// Retained allocation hints, never authority to reuse generated code. Every
++/// function and metadata entry is regenerated from the current lowered IR.
++class CBundleFunctionLayout {
++ public:
++  enum CacheKind { Write, Read, PrivateName, ComputedRead, CacheKindCount };
++
++  struct ShardGroup {
++    uint32_t index;
++    bool retained;
++    std::vector<Function *> functions;
++  };
++
++ private:
++  struct Range {
++    uint32_t start;
++    uint32_t count;
++  };
++  struct Slot {
++    std::string key;
++    Function *function{nullptr};
++    uint32_t anchorWeight{1};
++    std::array<std::vector<Range>, CacheKindCount> caches;
++    std::array<size_t, CacheKindCount> usedRanges{};
++  };
++  std::vector<Slot> slots_;
++  llvh::DenseMap<Function *, uint32_t> functionSlots_;
++  std::array<uint32_t, CacheKindCount> cacheSizes_{};
++  using ScopeSlots = std::vector<std::vector<uint64_t>>;
++  std::vector<ScopeSlots> retainedScopes_;
++  std::vector<ScopeSlots> currentScopes_;
++  llvh::DenseMap<Variable *, uint32_t> variableSlots_;
++  llvh::DenseMap<VariableScope *, uint32_t> scopeSizes_;
++  std::vector<std::vector<uint32_t>> retainedShards_;
++  std::vector<std::vector<uint32_t>> currentShards_;
++  LiteralBufferBuilder::RetainedBuffers literalBuffers_;
++
++ public:
++  /// Validate a seed before any code is emitted, including disjoint cache
++  /// ranges across all live and retired function slots.
++  bool read(const llvh::json::Array &seed);
++
++  bool readScopes(const llvh::json::Array &seed);
++
++  bool readShards(const llvh::json::Array &seed);
++
++  bool readLiterals(const llvh::json::Value &seed);
++
++  LiteralBufferBuilder::RetainedBuffers &literalBuffers() {
++    return literalBuffers_;
++  }
++
++  /// Assign slots before register allocation mutates the lowered functions.
++  void assign(llvh::ArrayRef<Function *> functions);
++
++  /// Match environments by their unchanged consumers, even when the function
++  /// creating the environment changes. This does not alter IR/debug indices.
++  void assignScopes(Module *module);
++
++  /// Preserve cold packing and the relative order of surviving functions.
++  /// New shapes join a nearby surviving group to retain native inlining
++  /// opportunities; current body sizes still determine splits within a group.
++  std::vector<ShardGroup> groupFunctions(
++      llvh::ArrayRef<Function *> functions);
++
++  void recordShard(uint32_t group, llvh::ArrayRef<Function *> functions);
++
++  uint32_t getVariableSlot(Variable *variable) const {
++    return variableSlots_.find(variable)->second;
++  }
++
++  uint32_t scopeSize(VariableScope *scope) const {
++    return scopeSizes_.find(scope)->second;
++  }
++
++  uint32_t getSlot(Function *function) const {
++    return functionSlots_.find(function)->second;
++  }
++
++  std::vector<Function *> functionsBySlot() const;
++
++  /// Allocate one site, keeping a contiguous range for polymorphic reads.
++  uint32_t allocateCache(Function *function, CacheKind kind, uint32_t count);
++
++  uint32_t cacheSize(CacheKind kind) const {
++    return cacheSizes_[kind];
++  }
++
++  /// Excess retired state resets the next build's hints, never current C.
++  llvh::json::Array generate() const;
++
++  llvh::json::Array generateScopes() const;
++
++  llvh::json::Array generateShards() const;
++
++  llvh::json::Value generateLiterals() const;
++};
++
++} // namespace hermes::sh
++
++#endif
+diff --git a/lib/BCGen/SH/CMakeLists.txt b/lib/BCGen/SH/CMakeLists.txt
+index 08f09cb1ff6b09cf62add4d4be8a743865d530c7..7b6e72b7b321df3664852d1c38925e3f4049767c 100644
+--- a/lib/BCGen/SH/CMakeLists.txt
++++ b/lib/BCGen/SH/CMakeLists.txt
+@@ -10,6 +10,7 @@ add_hermes_library(hermesSHBackend
+   RecreateCheapValues.cpp
+   LowerNanBoxedUnionNarrowT.cpp
+   PeepholeLowering.cpp
++  CBundleLayout.cpp CBundleLayout.h
+   SH.cpp
+   SHRegAlloc.cpp SHRegAlloc.h
+   LineDirectiveEmitter.cpp LineDirectiveEmitter.h
 diff --git a/lib/BCGen/SH/PeepholeLowering.cpp b/lib/BCGen/SH/PeepholeLowering.cpp
 index f317df4027e4abfc780886ea7dae80413c43236e..10c187ad63c1b226c865c15cb22456a46e1bf664 100644
 --- a/lib/BCGen/SH/PeepholeLowering.cpp
@@ -1462,10 +2729,18 @@ index f317df4027e4abfc780886ea7dae80413c43236e..10c187ad63c1b226c865c15cb22456a4
    /// instructions need to be created and inserted in the correct position by
    /// using the builder. Instructions for deletion should be inserted in the
 diff --git a/lib/BCGen/SH/SH.cpp b/lib/BCGen/SH/SH.cpp
-index e030d709072f96cff72bec9ee8efa3fb820266d6..aa6db54d846aca8cf3bde7f2cc3458fe0e473462 100644
+index e030d709072f96cff72bec9ee8efa3fb820266d6..feac5206de3eab7383906c14db18485dea5c8ca6 100644
 --- a/lib/BCGen/SH/SH.cpp
 +++ b/lib/BCGen/SH/SH.cpp
-@@ -25,10 +25,12 @@
+@@ -7,6 +7,7 @@
+ 
+ #include "hermes/BCGen/SH/SH.h"
+ 
++#include "CBundleLayout.h"
+ #include "LineDirectiveEmitter.h"
+ #include "LoweringPasses.h"
+ #include "SHRegAlloc.h"
+@@ -25,15 +26,20 @@
  #include "hermes/IR/IR.h"
  #include "hermes/IR/IRVerifier.h"
  #include "hermes/IR/Instrs.h"
@@ -1478,15 +2753,361 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..aa6db54d846aca8cf3bde7f2cc3458fe
  #include "hermes/VMLayouts/StackFrameLayout.h"
  #include "llvh/ADT/MapVector.h"
  
-@@ -485,6 +487,7 @@ class SHNativeJSFunctionTable {
+ #include "llvh/ADT/BitVector.h"
+ #include "llvh/ADT/SetVector.h"
++#include "llvh/ADT/StringSet.h"
++#include "llvh/Support/JSON.h"
++#include "llvh/Support/MemoryBuffer.h"
+ 
+ #include <iterator>
+ 
+@@ -53,9 +59,97 @@ const char *boolStr(bool b) {
+   return b ? "true" : "false";
+ }
+ 
++constexpr size_t kRetainedStringSlots = 256 * 1024;
++constexpr size_t kRetainedStringBytes = 8 * 1024 * 1024;
++constexpr size_t kRetainedLayoutBytes = 32 * 1024 * 1024;
++
++bool readRetainedLayout(
++    Module *M,
++    const BytecodeGenerationOptions &options,
++    std::vector<std::string> &strings,
++    sh::CBundleFunctionLayout &functionLayout) {
++  if (options.cBundleLayoutInput.empty())
++    return true;
++  auto reject = [&]() {
++    M->getContext().getSourceErrorManager().error(
++        SMLoc{}, "Invalid retained Static Hermes C layout");
++    return false;
++  };
++  auto buffer = llvh::MemoryBuffer::getFile(options.cBundleLayoutInput);
++  if (!buffer || (*buffer)->getBufferSize() > kRetainedLayoutBytes)
++    return reject();
++  auto parsed = llvh::json::parse((*buffer)->getBuffer());
++  if (!parsed) {
++    llvh::consumeError(parsed.takeError());
++    return reject();
++  }
++  const auto *object = parsed->getAsObject();
++  if (!object || object->size() != (object->get("literals") ? 7 : 6) ||
++      object->getString("kind") !=
++          llvh::StringRef("static-hermes-c-layout-v1") ||
++      object->getString("unitName") != options.unitName)
++    return reject();
++  if (const auto *literals = object->get("literals")) {
++    if (!functionLayout.readLiterals(*literals))
++      return reject();
++  }
++  const auto *functions = object->getArray("functions");
++  if (!functions || !functionLayout.read(*functions))
++    return reject();
++  const auto *scopes = object->getArray("scopes");
++  if (!scopes || !functionLayout.readScopes(*scopes))
++    return reject();
++  const auto *shards = object->getArray("shards");
++  if (!shards || !functionLayout.readShards(*shards))
++    return reject();
++  const auto *slots = object->getArray("strings");
++  if (!slots || slots->size() > kRetainedStringSlots)
++    return reject();
++  llvh::StringSet<> seen;
++  size_t bytes = 0;
++  for (const auto &slot : *slots) {
++    auto encoded = slot.getAsString();
++    if (!encoded || encoded->size() % 2 != 0 ||
++        encoded->size() / 2 > kRetainedStringBytes - bytes)
++      return reject();
++    std::string decoded;
++    decoded.reserve(encoded->size() / 2);
++    unsigned byte = 0;
++    for (size_t index = 0; index < encoded->size(); ++index) {
++      char c = (*encoded)[index];
++      if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
++        return reject();
++      byte = byte * 16 + (c <= '9' ? c - '0' : c - 'a' + 10);
++      if (index % 2 == 1) {
++        decoded.push_back(static_cast<char>(byte));
++        byte = 0;
++      }
++    }
++    const size_t size = decoded.size();
++    // The decoder assumes enough readable bytes for a complete code point.
++    // Padding makes truncated externally supplied strings safe to reject.
++    decoded.append(UTF8CodepointMaxBytes, '\0');
++    const char *cursor = decoded.data();
++    const char *end = cursor + size;
++    bool valid = true;
++    while (cursor < end && valid)
++      decodeUTF8<true>(cursor, [&](const llvh::Twine &) { valid = false; });
++    decoded.resize(size);
++    if (!valid)
++      return reject();
++    if (!seen.insert(decoded).second)
++      return reject();
++    bytes += decoded.size();
++    strings.push_back(std::move(decoded));
++  }
++  return true;
++}
++
+ /// Helper to unique and store the contents of strings.
+ class SHStringTable {
+   StringSetVector strings_;
++  std::vector<bool> used_;
++  bool hasRetainedStrings_;
+ 
+   /// Append a printable representation of the character \p c, that when
+   /// enclosed in single quotes in a C file, will produce the same character.
+@@ -84,6 +178,16 @@ class SHStringTable {
+   }
+ 
+  public:
++  explicit SHStringTable(llvh::ArrayRef<std::string> retained = {})
++      : hasRetainedStrings_(!retained.empty()) {
++    for (const auto &str : retained) {
++      const auto index = strings_.insert(str);
++      assert(index == used_.size() && "retained strings must be unique");
++      (void)index;
++      used_.push_back(false);
++    }
++  }
++
+   /// \return the current number of strings in the table.
+   uint32_t size() const {
+     return strings_.size();
+@@ -92,7 +196,91 @@ class SHStringTable {
+   /// Add the string \p str to the table if it is not already in it.
+   /// \return the index associated with str.
+   uint32_t add(llvh::StringRef str) {
+-    return strings_.insert(str);
++    const auto index = strings_.insert(str);
++    if (hasRetainedStrings_) {
++      if (index == used_.size())
++        used_.push_back(true);
++      else
++        used_[index] = true;
++    }
++    return index;
++  }
++
++  bool needsCompaction() const {
++    if (!hasRetainedStrings_)
++      return false;
++    size_t liveSlots = 0, liveBytes = 0, retiredBytes = 0;
++    size_t index = 0;
++    for (const auto &str : strings_) {
++      if (used_[index++]) {
++        ++liveSlots;
++        liveBytes += str.size();
++      } else {
++        retiredBytes += str.size();
++      }
++    }
++    return strings_.size() - liveSlots > std::max<size_t>(1024, liveSlots / 4) ||
++        retiredBytes > std::max<size_t>(64 * 1024, liveBytes / 4);
++  }
++
++  void generateLayout(
++      llvh::raw_ostream &os,
++      llvh::StringRef unitName,
++      const sh::CBundleFunctionLayout &functionLayout) const {
++    llvh::json::Array slots;
++    size_t bytes = 0;
++    const char *hex = "0123456789abcdef";
++    const bool reset = needsCompaction();
++    for (const auto &str : strings_) {
++      // A reset applies to the next compilation. This emission already used
++      // the retained indices and must not replace its table underneath them.
++      if (reset)
++        break;
++      // Retain a bounded prefix even for unusually large live tables. Numeric
++      // slots outside that prefix are regenerated from the next source input.
++      if (slots.size() == kRetainedStringSlots ||
++          str.size() > kRetainedStringBytes - bytes)
++        break;
++      std::string encoded;
++      encoded.reserve(str.size() * 2);
++      for (unsigned char c : str) {
++        encoded += hex[c >> 4];
++        encoded += hex[c & 15];
++      }
++      bytes += str.size();
++      slots.push_back(std::move(encoded));
++    }
++    // Hex preserves the exact internal string bytes, including lone surrogates
++    // which cannot round-trip through an ordinary UTF-8 JSON string.
++    auto functions = functionLayout.generate();
++    auto scopes = functions.empty() ? llvh::json::Array{}
++                                   : functionLayout.generateScopes();
++    auto shards = functions.empty() ? llvh::json::Array{}
++                                   : functionLayout.generateShards();
++    llvh::json::Value layout(llvh::json::Object{
++        {"kind", "static-hermes-c-layout-v1"},
++        {"literals", functionLayout.generateLiterals()},
++        {"functions", std::move(functions)},
++        {"scopes", std::move(scopes)},
++        {"shards", std::move(shards)},
++        {"strings", std::move(slots)},
++        {"unitName", unitName},
++    });
++    std::string encoded;
++    llvh::raw_string_ostream encodedOS(encoded);
++    encodedOS << layout << '\n';
++    encodedOS.flush();
++    if (encoded.size() > kRetainedLayoutBytes) {
++      // Independently bounded tables can exceed the combined input budget.
++      // Drop function hints for the next build; the bounded string prefix fits.
++      (*layout.getAsObject())["functions"] = llvh::json::Array{};
++      (*layout.getAsObject())["scopes"] = llvh::json::Array{};
++      (*layout.getAsObject())["shards"] = llvh::json::Array{};
++      (*layout.getAsObject())["literals"] = nullptr;
++      os << layout << '\n';
++    } else {
++      os << encoded;
++    }
+   }
+ 
+   /// Turn the table of strings into the SH C data structures that are necessary
+@@ -196,13 +384,16 @@ class SHLiteralBuffers {
+   explicit SHLiteralBuffers(
+       Module *M,
+       SHStringTable &table,
+-      bool optimizationEnabled) {
++      bool optimizationEnabled,
++      sh::CBundleFunctionLayout *layout) {
+     LiteralBufferBuilder::Result bufs = LiteralBufferBuilder::generate(
+         M,
+         [](const Function *) { return true; },
+         [&table](llvh::StringRef str) { return table.add(str); },
+         [&table](llvh::StringRef str) { return table.add(str); },
+-        optimizationEnabled);
++        optimizationEnabled,
++        nullptr,
++        layout ? &layout->literalBuffers() : nullptr);
+     literalValueBuffer = std::move(bufs.literalValBuffer);
+     objKeyBuffer = std::move(bufs.keyBuffer);
+     objShapeTable = std::move(bufs.shapeTable);
+@@ -362,16 +553,19 @@ class SHNativeJSFunctionTable {
+   SHStringTable &stringTable_;
+   /// Prefix used to give cross-translation-unit symbols unique linkage.
+   std::string bundlePrefix_;
++  sh::CBundleFunctionLayout *layout_;
+ 
+  public:
+   explicit SHNativeJSFunctionTable(
+       Module *M,
+       SHStringTable &stringTable,
+-      llvh::StringRef bundleUnitName = {})
++      llvh::StringRef bundleUnitName = {},
++      sh::CBundleFunctionLayout *layout = nullptr)
+       : stringTable_(stringTable),
+         bundlePrefix_(bundleUnitName.empty()
+                           ? std::string{}
+-                          : ("sh_" + bundleUnitName + "_").str()) {
++                          : ("sh_" + bundleUnitName + "_").str()),
++        layout_(layout) {
+     // Ensure that the top level function has an id of 0.
+     auto topLevelFunc = M->getTopLevelFunction();
+     funcMap_[topLevelFunc] = 0;
+@@ -385,11 +579,17 @@ class SHNativeJSFunctionTable {
+     }
+   }
+ 
++  /// Dense declaration-bitset ordinal, independent of runtime slots and
++  /// retained shard emission order.
+   /// \return the unique index for the given \p F.
+   uint32_t getIndex(Function *F) const {
+     return funcMap_.find(F)->second;
+   }
+ 
++  uint32_t getRuntimeIndex(Function *F) const {
++    return layout_ ? layout_->getSlot(F) : getIndex(F);
++  }
++
+   /// \return size of the function table.
+   size_t size() const {
+     return funcMap_.size();
+@@ -408,7 +608,10 @@ class SHNativeJSFunctionTable {
+   void generateFunctionLabel(Function *F, llvh::raw_ostream &OS) const {
+     if (!bundlePrefix_.empty())
+       OS << bundlePrefix_ << 'f';
+-    OS << '_' << getIndex(F) << '_';
++    OS << '_' << getRuntimeIndex(F);
++    if (layout_)
++      return;
++    OS << '_';
+ 
+     auto name = F->getInternalNameStr();
+     for (auto c : name) {
+@@ -440,7 +643,7 @@ class SHNativeJSFunctionTable {
+       Function *F,
+       llvh::raw_ostream &OS) const {
+     assert(isBundle() && "outlined state requires bundle labels");
+-    OS << bundlePrefix_ << "f_" << getIndex(F) << "_state";
++    OS << bundlePrefix_ << "f_" << getRuntimeIndex(F) << "_state";
+   }
+ 
+   void generateOutlinedPartLabel(
+@@ -448,7 +651,7 @@ class SHNativeJSFunctionTable {
+       uint32_t part,
+       llvh::raw_ostream &OS) const {
+     assert(isBundle() && "outlined part requires bundle labels");
+-    OS << bundlePrefix_ << "f_" << getIndex(F) << "_part_"
++    OS << bundlePrefix_ << "f_" << getRuntimeIndex(F) << "_part_"
+        << llvh::format("%05u", part);
+   }
+ 
+@@ -460,9 +663,7 @@ class SHNativeJSFunctionTable {
+   /// structures.
+   void generate(llvh::raw_ostream &OS) const {
+     // Sort the keys by function index.
+-    std::vector<const Function *> sortedKeys{funcMap_.size()};
+-    for (auto &entry : funcMap_)
+-      sortedKeys[entry.second] = entry.first;
++    auto sortedKeys = layout_ ? layout_->functionsBySlot() : functionsByIndex();
+ 
+     if (isBundle())
+       OS << "\nSH_BUNDLE_HIDDEN SHNativeFuncInfo ";
+@@ -471,6 +672,10 @@ class SHNativeJSFunctionTable {
+     generateFunctionInfoTableLabel(OS);
+     OS << "[] = {\n";
+     for (const Function *F : sortedKeys) {
++      if (!F) {
++        OS << "  {0},\n";
++        continue;
++      }
+       uint32_t nameIdx = stringTable_.add(F->getOriginalOrInferredName().str());
+       uint32_t argCount = F->getExpectedParamCountIncludingThis() - 1;
+       auto kindVal = F->getKind();
+@@ -485,6 +690,8 @@ class SHNativeJSFunctionTable {
  };
  
  struct ModuleGen {
++  sh::CBundleFunctionLayout *functionLayout;
 +  uint32_t nextComputedReadCacheIdx{0};
    /// Table containing uniqued strings for the current module.
    SHStringTable stringTable{};
  
-@@ -696,9 +699,10 @@ class InstrGen {
+@@ -501,10 +708,14 @@ struct ModuleGen {
+   explicit ModuleGen(
+       Module *M,
+       bool optimizationEnabled,
+-      llvh::StringRef bundleUnitName = {})
+-      : literalBuffers{M, stringTable, optimizationEnabled},
++      llvh::StringRef bundleUnitName = {},
++      llvh::ArrayRef<std::string> retainedStrings = {},
++      sh::CBundleFunctionLayout *layout = nullptr)
++      : functionLayout{layout},
++        stringTable{retainedStrings},
++        literalBuffers{M, stringTable, optimizationEnabled, layout},
+         srcLocationTable{stringTable},
+-        nativeFunctionTable{M, stringTable, bundleUnitName} {}
++        nativeFunctionTable{M, stringTable, bundleUnitName, layout} {}
+ };
+ 
+ /// \return true if the SHLegacyValue representations of values \p a and \p b
+@@ -696,9 +907,10 @@ class InstrGen {
    }
    llvh::raw_ostream &genStringConstReadIC(
        LiteralString *LS,
@@ -1499,12 +3120,24 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..aa6db54d846aca8cf3bde7f2cc3458fe
    }
  
    /// Generate a cache index. This must be used when passing parameters to API
-@@ -712,10 +716,12 @@ class InstrGen {
+@@ -708,16 +920,30 @@ class InstrGen {
+   /// different instructions accessing the same property probably are for
+   /// objects of the same hidden class, and should get the same offset.
+   llvh::raw_ostream &genWriteIC(LiteralString *LS) {
++    if (moduleGen_.functionLayout)
++      return os_ << "shUnit->write_prop_cache + "
++                 << moduleGen_.functionLayout->allocateCache(
++                        &F_, sh::CBundleFunctionLayout::Write, 1);
+     if (options_.emitCBundle)
        return os_ << "shUnit->write_prop_cache + " << nextWriteCacheIdx_++;
      return os_ << "get_write_prop_cache(shUnit) + " << nextWriteCacheIdx_++;
    }
 -  llvh::raw_ostream &genReadIC(LiteralString *LS) {
 +  llvh::raw_ostream &genReadIC(LiteralString *LS, uint32_t entries = 1) {
++    if (moduleGen_.functionLayout)
++      return os_ << "shUnit->read_prop_cache + "
++                 << moduleGen_.functionLayout->allocateCache(
++                        &F_, sh::CBundleFunctionLayout::Read, entries);
 +    const auto index = nextReadCacheIdx_;
 +    nextReadCacheIdx_ += entries;
      if (options_.emitCBundle)
@@ -1514,8 +3147,14 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..aa6db54d846aca8cf3bde7f2cc3458fe
 +    return os_ << "get_read_prop_cache(shUnit) + " << index;
    }
    llvh::raw_ostream &genPrivateNameIC(Value *privateName) {
++    if (moduleGen_.functionLayout)
++      return os_ << "shUnit->private_name_cache + "
++                 << moduleGen_.functionLayout->allocateCache(
++                        &F_, sh::CBundleFunctionLayout::PrivateName, 1);
      if (options_.emitCBundle)
-@@ -865,9 +871,9 @@ class InstrGen {
+       return os_ << "shUnit->private_name_cache + "
+                  << nextPrivateNameCacheIdx_++;
+@@ -865,9 +1091,9 @@ class InstrGen {
      generateRegister(inst);
      os_ << " = ";
      if (inst.getSingleOperand()->getType().isNumberType()) {
@@ -1528,7 +3167,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..aa6db54d846aca8cf3bde7f2cc3458fe
      } else {
        os_
            << (options_.smallC
-@@ -882,9 +888,9 @@ class InstrGen {
+@@ -882,9 +1108,9 @@ class InstrGen {
      generateRegister(inst);
      os_ << " = ";
      if (inst.getSingleOperand()->getType().isNumberType()) {
@@ -1541,7 +3180,21 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..aa6db54d846aca8cf3bde7f2cc3458fe
      } else {
        os_
            << (options_.smallC
-@@ -1083,6 +1089,29 @@ class InstrGen {
+@@ -1006,7 +1232,12 @@ class InstrGen {
+     generateValue(inst);
+     os_ << " = _sh_ljs_load_from_env(";
+     generateValue(*inst.getScope());
+-    os_ << ", " << inst.getLoadVariable()->getIndexInVariableList() << ");\n";
++    os_ << ", "
++        << (moduleGen_.functionLayout
++                ? moduleGen_.functionLayout->getVariableSlot(
++                      inst.getLoadVariable())
++                : inst.getLoadVariable()->getIndexInVariableList())
++        << ");\n";
+   }
+   void generateLIRLoadConstInst(LIRLoadConstInst &inst) {
+     os_.indent(2);
+@@ -1083,6 +1314,29 @@ class InstrGen {
      // Nothing to do here.
      os_ << "  // PhiInst\n";
    }
@@ -1571,7 +3224,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..aa6db54d846aca8cf3bde7f2cc3458fe
    void generateBinaryOperatorInst(BinaryOperatorInst &inst) {
      os_.indent(2);
      generateRegister(inst);
-@@ -1109,6 +1138,52 @@ class InstrGen {
+@@ -1109,6 +1363,52 @@ class InstrGen {
      bool bothDouble = inst.getLeftHandSide()->getType().isNumberType() &&
          inst.getRightHandSide()->getType().isNumberType();
  
@@ -1624,7 +3277,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..aa6db54d846aca8cf3bde7f2cc3458fe
      // NOTE: this used to check whether we know that both operands are numbers
      // in the int32 range. We no longer track that information, so for now this
      // is hardcoded to false.
-@@ -1565,29 +1640,46 @@ class InstrGen {
+@@ -1565,29 +1865,49 @@ class InstrGen {
      generateValue(inst);
      os_ << " = ";
      if (auto *LS = llvh::dyn_cast<LiteralString>(inst.getProperty())) {
@@ -1672,12 +3325,28 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..aa6db54d846aca8cf3bde7f2cc3458fe
      generateRegister(*inst.getProperty());
 -    os_ << ");\n";
 +    os_ << ", shUnit->computed_read_cache + "
-+        << moduleGen_.nextComputedReadCacheIdx++
++        << (moduleGen_.functionLayout
++                ? moduleGen_.functionLayout->allocateCache(
++                      &F_, sh::CBundleFunctionLayout::ComputedRead, 1)
++                : moduleGen_.nextComputedReadCacheIdx++)
 +        << " * SH_COMPUTED_READ_CACHE_WAYS);\n";
    }
    void generateLoadPropertyWithReceiverInst(
        LoadPropertyWithReceiverInst &inst) {
-@@ -1881,35 +1973,30 @@ class InstrGen {
+@@ -1763,7 +2083,11 @@ class InstrGen {
+     generateValue(*inst.getScope());
+     os_ << ",";
+     generateValue(*inst.getValue());
+-    os_ << ", " << inst.getVariable()->getIndexInVariableList() << ");\n";
++    os_ << ", "
++        << (moduleGen_.functionLayout
++                ? moduleGen_.functionLayout->getVariableSlot(inst.getVariable())
++                : inst.getVariable()->getIndexInVariableList())
++        << ");\n";
+   }
+   void generateAllocStackInst(AllocStackInst &inst) {
+     // This is a no-op.
+@@ -1881,35 +2205,30 @@ class InstrGen {
      hermes_fatal("DebuggerInst should have been deleted.");
    }
    void generateCreateRegExpInst(CreateRegExpInst &inst) {
@@ -1726,7 +3395,34 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..aa6db54d846aca8cf3bde7f2cc3458fe
    }
    void generateTryEndInst(TryEndInst &inst) {
      // Restore the tryState to the state of the Try enclosing the catch.
-@@ -2174,13 +2261,19 @@ class InstrGen {
+@@ -1977,7 +2296,7 @@ class InstrGen {
+     os_ << '&';
+     moduleGen_.nativeFunctionTable.generateFunctionInfoTableLabel(os_);
+     os_ << '['
+-        << moduleGen_.nativeFunctionTable.getIndex(inst.getFunctionCode())
++        << moduleGen_.nativeFunctionTable.getRuntimeIndex(inst.getFunctionCode())
+         << "]" << ", shUnit);\n";
+   }
+   void generateCreateGeneratorInst(CreateGeneratorInst &inst) {
+@@ -1995,7 +2314,7 @@ class InstrGen {
+     os_ << '&';
+     moduleGen_.nativeFunctionTable.generateFunctionInfoTableLabel(os_);
+     os_ << '['
+-        << moduleGen_.nativeFunctionTable.getIndex(inst.getFunctionCode())
++        << moduleGen_.nativeFunctionTable.getRuntimeIndex(inst.getFunctionCode())
+         << "]" << ", shUnit);\n";
+   }
+   void generateCreateClassInst(CreateClassInst &inst) {
+@@ -2014,7 +2333,7 @@ class InstrGen {
+     os_ << '&';
+     moduleGen_.nativeFunctionTable.generateFunctionInfoTableLabel(os_);
+     os_ << '['
+-        << moduleGen_.nativeFunctionTable.getIndex(inst.getFunctionCode())
++        << moduleGen_.nativeFunctionTable.getRuntimeIndex(inst.getFunctionCode())
+         << "]";
+     os_ << ", (SHUnit *)shUnit, ";
+     generateRegisterPtr(*inst.getHomeObjectOutput());
+@@ -2174,13 +2493,19 @@ class InstrGen {
      // new.target is set up in LowerCalls.
    }
    void generateCallInst(CallInst &inst) {
@@ -1748,7 +3444,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..aa6db54d846aca8cf3bde7f2cc3458fe
          // Fast path, avoid all indirection and just call the function.
          moduleGen_.nativeFunctionTable.generateFunctionLabel(targetFunc, os_);
          os_ << "(shr);\n";
-@@ -2217,17 +2310,84 @@ class InstrGen {
+@@ -2217,17 +2542,84 @@ class InstrGen {
          << (uint32_t)inst.getBuiltinIndex() << ");\n";
    }
    void generateCallBuiltinInst(CallBuiltinInst &inst) {
@@ -1837,7 +3533,20 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..aa6db54d846aca8cf3bde7f2cc3458fe
      os_.indent(2);
      generateRegister(inst);
      os_ << " = _sh_ljs_call_builtin(shr, frame, " << inst.getNumArguments() - 1
-@@ -2703,6 +2863,10 @@ class InstrGen {
+@@ -2255,7 +2647,11 @@ class InstrGen {
+       os_ << "NULL";
+     else
+       generateRegisterPtr(*inst.getParentScope());
+-    os_ << ", " << inst.getVariableScope()->getVariables().size() << ");\n";
++    os_ << ", "
++        << (moduleGen_.functionLayout
++                ? moduleGen_.functionLayout->scopeSize(inst.getVariableScope())
++                : inst.getVariableScope()->getVariables().size())
++        << ");\n";
+   }
+   void generateHBCCreateFunctionEnvironmentInst(
+       HBCCreateFunctionEnvironmentInst &inst) {
+@@ -2703,6 +3099,10 @@ class InstrGen {
    }
    /// Convert a JS value to its corresponding native argument type.
    void convertToNativeArg(NativeCType ctype, Value *arg) {
@@ -1848,7 +3557,23 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..aa6db54d846aca8cf3bde7f2cc3458fe
      MachineType mt = nativeContext_.md.mapCType(ctype);
      const MachineDesc::MTD &mtd = nativeContext_.md.getMTD(mt);
      int parens = 1;
-@@ -3213,6 +3377,8 @@ void generateUnitData(
+@@ -2869,9 +3269,12 @@ void generateFunction(
+   }
+ 
+   auto &srcMgr = F.getContext().getSourceErrorManager();
+-  OS << "// ";
+-  srcMgr.dumpCoords(OS, F.getSourceRange().Start);
+-  OS << '\n';
++  if (!options.emitCBundleLayout || options.emitSourceLocations ||
++      options.emitLineDirectives) {
++    OS << "// ";
++    srcMgr.dumpCoords(OS, F.getSourceRange().Start);
++    OS << '\n';
++  }
+ 
+   llvh::DenseMap<BasicBlock *, TryStartInst *> enclosingTrys;
+   if (!tryIDs.empty())
+@@ -3213,6 +3616,8 @@ void generateUnitData(
       << nextReadCacheIdx << "];\n"
       << "  SHPrivateNameCacheEntry private_name_cache_data["
       << nextPrivateNameCacheIdx << "];\n"
@@ -1857,7 +3582,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..aa6db54d846aca8cf3bde7f2cc3458fe
       << "  SHCompressedPointer object_literal_class_cache["
       << moduleGen.literalBuffers.objShapeTable.size() << "];\n};\n"
       << "SHUnit *CREATE_THIS_UNIT(void) {\n"
-@@ -3224,11 +3390,15 @@ void generateUnitData(
+@@ -3224,11 +3629,15 @@ void generateUnitData(
    OS << ",.num_symbols =" << moduleGen.stringTable.size()
       << ", .num_write_prop_cache_entries = " << nextWriteCacheIdx
       << ", .num_read_prop_cache_entries = " << nextReadCacheIdx
@@ -1873,6 +3598,364 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..aa6db54d846aca8cf3bde7f2cc3458fe
       << ".obj_key_buffer = s_obj_key_buffer, .obj_key_buffer_size = "
       << moduleGen.literalBuffers.objKeyBuffer.size() << ", "
       << ".literal_val_buffer = s_literal_val_buffer, .literal_val_buffer_size = "
+@@ -3780,9 +4189,13 @@ std::vector<BufferedBundleFunction> generateOutlinedBundleFunction(
+       OS << '\n';
+     }
+ 
+-    OS << "// ";
+-    srcMgr.dumpCoords(OS, F.getSourceRange().Start);
+-    OS << "\nSH_BUNDLE_HIDDEN SHLegacyValue ";
++    if (!options.emitCBundleLayout || options.emitSourceLocations ||
++        options.emitLineDirectives) {
++      OS << "// ";
++      srcMgr.dumpCoords(OS, F.getSourceRange().Start);
++      OS << '\n';
++    }
++    OS << "SH_BUNDLE_HIDDEN SHLegacyValue ";
+     moduleGen.nativeFunctionTable.generateFunctionLabel(&F, OS);
+     OS << "(SHRuntime *shr) {\n";
+     OS.setDirectiveInfo(F.getSourceRange().Start, srcMgr);
+@@ -4116,12 +4529,19 @@ bool generateBundleFunctionShard(
+     const std::vector<BufferedBundleFunction> &functions,
+     uint64_t bodyBytes,
+     uint32_t shardIndex,
++    uint32_t groupIndex,
++    uint32_t groupPart,
++    uint32_t firstFunctionId,
+     uint64_t targetBytes,
+     sh::SHCBundleFile &file) {
+   std::string path;
+   llvh::raw_string_ostream pathOS(path);
+-  pathOS << "sh_" << unitName << "_functions_"
+-         << llvh::format("%05u", shardIndex) << ".c";
++  pathOS << "sh_" << unitName << "_functions_";
++  if (moduleGen.functionLayout)
++    pathOS << llvh::format("%05u_%05u", groupIndex, groupPart);
++  else
++    pathOS << llvh::format("%05u", shardIndex);
++  pathOS << ".c";
+   pathOS.flush();
+ 
+   llvh::BitVector declarations(moduleGen.nativeFunctionTable.size());
+@@ -4176,10 +4596,21 @@ bool generateBundleFunctionShard(
+         OS << "#include \"" << headerPath << "\"\n\n";
+         generateExternCIncludes(M, OS, *usedExterns);
+         generateExternC(M, OS, *usedExterns);
++        std::vector<Function *> declaredFunctions;
+         for (int index = declarations.find_first(); index >= 0;
+-             index = declarations.find_next(index)) {
++             index = declarations.find_next(index))
++          declaredFunctions.push_back(functionsByIndex[index]);
++        if (moduleGen.functionLayout) {
++          std::sort(
++              declaredFunctions.begin(), declaredFunctions.end(),
++              [&](Function *left, Function *right) {
++                return moduleGen.nativeFunctionTable.getRuntimeIndex(left) <
++                    moduleGen.nativeFunctionTable.getRuntimeIndex(right);
++              });
++        }
++        for (auto *function : declaredFunctions) {
+           generateBundleFunctionDeclaration(
+-              OS, functionsByIndex[index], moduleGen.nativeFunctionTable);
++              OS, function, moduleGen.nativeFunctionTable);
+         }
+         OS << '\n';
+         for (const auto &function : functions)
+@@ -4191,8 +4622,8 @@ bool generateBundleFunctionShard(
+   file = {
+       path,
+       sh::SHCBundleFileRole::Function,
+-      moduleGen.nativeFunctionTable.getIndex(functions.front().function),
+-      moduleGen.nativeFunctionTable.getIndex(functions.back().function),
++      firstFunctionId,
++      firstFunctionId + static_cast<uint32_t>(functions.size()) - 1,
+       static_cast<uint32_t>(functions.size()),
+       targetBytes,
+       oversize,
+@@ -4216,6 +4647,10 @@ bool generateModuleBundle(
+   assert(
+       (options.format == DumpBytecode || options.format == EmitBundle) &&
+       "bundle generation requires C output");
++  std::vector<std::string> retainedStrings;
++  sh::CBundleFunctionLayout functionLayout;
++  if (!readRetainedLayout(M, options, retainedStrings, functionLayout))
++    return false;
+   if (!lowerModuleIR(M, options.optimizationEnabled))
+     return false;
+ 
+@@ -4232,10 +4667,18 @@ bool generateModuleBundle(
+   uint32_t nextReadCacheIdx = 0;
+   uint32_t nextPrivateNameCacheIdx = 0;
+   ModuleGen moduleGen{
+-      M, options.optimizationEnabled, options.unitName};
++      M,
++      options.optimizationEnabled,
++      options.unitName,
++      retainedStrings,
++      options.emitCBundleLayout ? &functionLayout : nullptr};
+   const auto functionsByIndex =
+       moduleGen.nativeFunctionTable.functionsByIndex();
+   M->assignIndexToVariables();
++  if (options.emitCBundleLayout) {
++    functionLayout.assign(functionsByIndex);
++    functionLayout.assignScopes(M);
++  }
+ 
+   const std::string headerPath =
+       bundleFilePath(options.unitName, "_internal.h");
+@@ -4249,107 +4692,149 @@ bool generateModuleBundle(
+   std::vector<BufferedBundleFunction> bufferedFunctions;
+   uint64_t bufferedBytes = 0;
+   uint32_t shardIndex = 0;
+-  auto flushShard = [&]() {
+-    if (bufferedFunctions.empty())
++  uint32_t firstFunctionId = 0;
++  std::vector<sh::CBundleFunctionLayout::ShardGroup> groups;
++  if (options.emitCBundleLayout)
++    groups = functionLayout.groupFunctions(functionsByIndex);
++  else
++    groups.push_back({0, false, functionsByIndex});
++  for (const auto &group : groups) {
++    uint32_t groupIndex = group.index;
++    uint32_t groupPart = 0;
++    auto flushShard = [&]() {
++      if (bufferedFunctions.empty())
++        return true;
++      if (shardIndex >= kMaxBundleFunctionShards - options.emitCBundleLayout) {
++        hermes_fatal("Static Hermes C bundle has too many function shards");
++      }
++      sh::SHCBundleFile file;
++      if (!generateBundleFunctionShard(
++              M,
++              writeFile,
++              headerPath,
++              options.unitName,
++              moduleGen,
++              functionsByIndex,
++              bufferedFunctions,
++              bufferedBytes,
++              shardIndex++,
++              groupIndex,
++              groupPart++,
++              firstFunctionId,
++              options.cBundleShardSize,
++              file)) {
++        return false;
++      }
++      if (options.emitCBundleLayout) {
++        std::vector<Function *> members;
++        for (const auto &function : bufferedFunctions)
++          members.push_back(function.function);
++        functionLayout.recordShard(groupIndex, members);
++      }
++      // Manifest ordinals describe output coverage. Declaration bitsets keep
++      // their original module indices, and generated labels use runtime slots.
++      // An outlined function occupies one ordinal across all of its fragments.
++      if (file.functionFragmentCount == 0 ||
++          file.functionFragmentIndex + 1 == file.functionFragmentCount) {
++        firstFunctionId += file.functionCount;
++        if (!group.retained) {
++          ++groupIndex;
++          groupPart = 0;
++        }
++      }
++      functionFiles.push_back(std::move(file));
++      bufferedFunctions.clear();
++      bufferedBytes = 0;
+       return true;
+-    if (shardIndex >= kMaxBundleFunctionShards) {
+-      hermes_fatal("Static Hermes C bundle has too many function shards");
+-    }
+-    sh::SHCBundleFile file;
+-    if (!generateBundleFunctionShard(
+-            M,
+-            writeFile,
+-            headerPath,
+-            options.unitName,
+-            moduleGen,
+-            functionsByIndex,
+-            bufferedFunctions,
+-            bufferedBytes,
+-            shardIndex++,
+-            options.cBundleShardSize,
+-            file)) {
+-      return false;
+-    }
+-    functionFiles.push_back(std::move(file));
+-    bufferedFunctions.clear();
+-    bufferedBytes = 0;
+-    return true;
+-  };
++    };
+ 
+-  // Keep function generation sequential. String, source-location, and cache
+-  // indexes are allocated while bodies are emitted and are shared by all
+-  // shards in this logical unit.
+-  for (Function *function : functionsByIndex) {
+-    const auto cOptimizationLevel =
+-        cOptimizationLevelForFunction(function);
+-    std::vector<BufferedBundleFunction> generatedFunctions;
+-    if (canOutlineFunction(function)) {
+-      generatedFunctions = generateOutlinedBundleFunction(
+-          *function,
+-          moduleGen,
+-          nextWriteCacheIdx,
+-          nextReadCacheIdx,
+-          nextPrivateNameCacheIdx,
+-          cOptimizationLevel,
+-          options);
+-    } else {
+-      std::string source;
+-      llvh::raw_string_ostream sourceOS(source);
+-      {
+-        sh::LineDirectiveEmitter emitter(sourceOS);
+-        generateFunction(
++    // Keep function generation sequential. String, source-location, and cache
++    // indexes are allocated while bodies are emitted and are shared by all
++    // shards in this logical unit.
++    for (Function *function : group.functions) {
++      const auto cOptimizationLevel =
++          cOptimizationLevelForFunction(function);
++      std::vector<BufferedBundleFunction> generatedFunctions;
++      if (canOutlineFunction(function)) {
++        generatedFunctions = generateOutlinedBundleFunction(
+             *function,
+-            emitter,
+             moduleGen,
+             nextWriteCacheIdx,
+             nextReadCacheIdx,
+             nextPrivateNameCacheIdx,
++            cOptimizationLevel,
+             options);
+-      }
+-      sourceOS.flush();
+-      size_t instructionCount = 0;
+-      for (const auto &block : *function) {
+-        for (const auto &instruction : block) {
+-          (void)instruction;
+-          ++instructionCount;
++      } else {
++        std::string source;
++        llvh::raw_string_ostream sourceOS(source);
++        {
++          sh::LineDirectiveEmitter emitter(sourceOS);
++          generateFunction(
++              *function,
++              emitter,
++              moduleGen,
++              nextWriteCacheIdx,
++              nextReadCacheIdx,
++              nextPrivateNameCacheIdx,
++              options);
+         }
++        sourceOS.flush();
++        size_t instructionCount = 0;
++        for (const auto &block : *function) {
++          for (const auto &instruction : block) {
++            (void)instruction;
++            ++instructionCount;
++          }
++        }
++        auto oversizeReason = sh::SHCBundleOversizeReason::None;
++        if (source.size() > options.cBundleShardSize) {
++          if (instructionCount == 1)
++            oversizeReason = sh::SHCBundleOversizeReason::SingleInstruction;
++          else
++            oversizeReason = sh::SHCBundleOversizeReason::NoOutlineableRun;
++        }
++        generatedFunctions.push_back({
++            function,
++            std::move(source),
++            cOptimizationLevel == sh::SHCBundleCOptimizationLevel::O0,
++            0,
++            0,
++            cOptimizationLevel,
++            oversizeReason,
++        });
+       }
+-      auto oversizeReason = sh::SHCBundleOversizeReason::None;
+-      if (source.size() > options.cBundleShardSize) {
+-        if (instructionCount == 1)
+-          oversizeReason = sh::SHCBundleOversizeReason::SingleInstruction;
+-        else
+-          oversizeReason = sh::SHCBundleOversizeReason::NoOutlineableRun;
+-      }
+-      generatedFunctions.push_back({
+-          function,
+-          std::move(source),
+-          cOptimizationLevel == sh::SHCBundleCOptimizationLevel::O0,
+-          0,
+-          0,
+-          cOptimizationLevel,
+-          oversizeReason,
+-      });
+-    }
+ 
+-    for (auto &generated : generatedFunctions) {
+-      const uint64_t functionBytes = generated.source.size();
+-      const bool isolate = generated.isolate;
+-      if (!bufferedFunctions.empty() &&
+-          (isolate || bufferedBytes >= options.cBundleShardSize ||
+-           functionBytes > options.cBundleShardSize - bufferedBytes)) {
+-        if (!flushShard())
++      for (auto &generated : generatedFunctions) {
++        const uint64_t functionBytes = generated.source.size();
++        const bool isolate = generated.isolate;
++        if (!bufferedFunctions.empty() &&
++            (isolate || bufferedBytes >= options.cBundleShardSize ||
++             functionBytes > options.cBundleShardSize - bufferedBytes)) {
++          if (!flushShard())
++            return false;
++        }
++        bufferedBytes += functionBytes;
++        bufferedFunctions.push_back(std::move(generated));
++        if ((isolate || functionBytes > options.cBundleShardSize) &&
++            !flushShard())
+           return false;
+       }
+-      bufferedBytes += functionBytes;
+-      bufferedFunctions.push_back(std::move(generated));
+-      if ((isolate || functionBytes > options.cBundleShardSize) &&
+-          !flushShard())
+-        return false;
+     }
++    if (!flushShard())
++      return false;
++  }
++  assert(firstFunctionId == functionsByIndex.size() &&
++         "bundle manifest must cover every current function exactly once");
++
++  if (options.emitCBundleLayout) {
++    nextWriteCacheIdx =
++        functionLayout.cacheSize(sh::CBundleFunctionLayout::Write);
++    nextReadCacheIdx = functionLayout.cacheSize(sh::CBundleFunctionLayout::Read);
++    nextPrivateNameCacheIdx =
++        functionLayout.cacheSize(sh::CBundleFunctionLayout::PrivateName);
++    moduleGen.nextComputedReadCacheIdx =
++        functionLayout.cacheSize(sh::CBundleFunctionLayout::ComputedRead);
+   }
+-  if (!flushShard())
+-    return false;
+ 
+   // The metadata tables must be emitted after every body has allocated its
+   // shared indexes.
+@@ -4372,6 +4857,16 @@ bool generateModuleBundle(
+     return false;
+   }
+ 
++  if (options.emitCBundleLayout) {
++    if (!writeFile(
++            bundleFilePath(options.unitName, "_layout.json"),
++            [&](llvh::raw_ostream &OS) {
++              moduleGen.stringTable.generateLayout(
++                  OS, options.unitName, functionLayout);
++            }))
++      return false;
++  }
++
+   files.clear();
+   files.push_back({headerPath, sh::SHCBundleFileRole::Header});
+   files.push_back({metadataPath, sh::SHCBundleFileRole::Metadata});
 diff --git a/lib/CompilerDriver/CompilerDriver.cpp b/lib/CompilerDriver/CompilerDriver.cpp
 index 7cf6e64252b09ce93924136bff7db7add3597dd6..8b080a8b4ab0bfc9f45b05fe7b2a731b6f1c3541 100644
 --- a/lib/CompilerDriver/CompilerDriver.cpp
@@ -2999,6 +5082,641 @@ index 5bf0eb3faa636d974da9c14bd49a1f7d15044b87..67986bb7ed1a8c5160844db2f825ba0a
    SafeUInt32 safeLen(length);
  
    // Special case for 1-character strings, some of which are cached in the
+diff --git a/test/shermes/Inputs/check-c-bundle-layout.py b/test/shermes/Inputs/check-c-bundle-layout.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ddc23ae5226d0bbf4144ebdb116ac6f4737cbfc5
+--- /dev/null
++++ b/test/shermes/Inputs/check-c-bundle-layout.py
+@@ -0,0 +1,629 @@
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++#
++# This source code is licensed under the MIT license found in the
++# LICENSE file in the root directory of this source tree.
++
++import hashlib
++import json
++import pathlib
++import re
++import subprocess
++import sys
++
++
++compiler = pathlib.Path(sys.argv[1]).resolve()
++root = pathlib.Path(sys.argv[2]).resolve()
++root.mkdir(parents=True, exist_ok=True)
++assert len(sys.argv) in (3, 8)
++native = sys.argv[3:]
++compile_count = 0
++execute_count = 0
++source = '''
++function read(value) {
++  "noinline";
++  return value.stableProperty;
++}
++print(read({stableProperty: "kept"}));
++print("\\ud800");
++'''
++
++
++def compile_source(name, text, retained=None, succeeds=True, emit_layout=True,
++                   shard_size=None, typed=False):
++    global compile_count
++    compile_count += 1
++    directory = root / name
++    directory.mkdir()
++    (directory / "input.js").write_text(text)
++    command = [
++        str(compiler), "-O", "-emit-c", "-Xemit-c-bundle",
++        "-o", "unit.c.json",
++    ]
++    if emit_layout:
++        command.append("-Xemit-c-layout")
++    if typed:
++        command.append("-typed")
++    if shard_size is not None:
++        command.append("-Xemit-c-shard-size=" + str(shard_size))
++    if retained is not None:
++        path = directory / "retained.json"
++        path.write_text(json.dumps(retained))
++        command.append("-Xc-layout-input=" + str(path))
++    result = subprocess.run(
++        command + ["input.js"], cwd=directory, capture_output=True,
++        text=True, timeout=60,
++    )
++    if not succeeds:
++        assert result.returncode != 0, name
++        assert "Invalid retained Static Hermes C layout" in result.stderr, result.stderr
++        assert not (directory / "unit.c.json").exists(), name
++        return None
++    assert result.returncode == 0, result.stderr
++    layout_path = directory / "sh_this_unit_layout.json"
++    if emit_layout:
++        layout = json.loads(layout_path.read_text())
++    else:
++        assert not layout_path.exists()
++        layout = None
++    manifest = json.loads((directory / "unit.c.json").read_text())
++    if emit_layout:
++        layout_bytes = layout_path.read_bytes()
++        assert manifest["layout"] == {
++            "path": layout_path.name,
++            "sha256": hashlib.sha256(layout_bytes).hexdigest(),
++            "size": len(layout_bytes),
++        }
++    else:
++        assert "layout" not in manifest
++    members = manifest["translationUnits"]
++    next_function = 0
++    previous = None
++    for member in members:
++        if member["role"] != "function":
++            continue
++        assert member["functionCount"] == member["lastFunctionId"] - member["firstFunctionId"] + 1
++        if member.get("functionFragmentIndex", 0) == 0:
++            if previous and "functionFragmentIndex" in previous:
++                assert previous["functionFragmentIndex"] + 1 == previous["functionFragmentCount"]
++            assert member["firstFunctionId"] == next_function
++            next_function = member["lastFunctionId"] + 1
++        else:
++            assert previous is not None
++            assert member["firstFunctionId"] == previous["firstFunctionId"]
++            assert member["functionFragmentIndex"] == previous["functionFragmentIndex"] + 1
++            assert member["functionFragmentCount"] == previous["functionFragmentCount"]
++        previous = member
++    if previous and "functionFragmentIndex" in previous:
++        assert previous["functionFragmentIndex"] + 1 == previous["functionFragmentCount"]
++    text = "\n".join((directory / member["path"]).read_text() for member in members)
++    return layout, text
++
++
++cold, cold_c = compile_source("cold", source)
++_, default_c = compile_source("default", source, emit_layout=False)
++assert "sh_this_unit_f_1_read" in default_c
++assert "sh_this_unit_f_1_read" not in cold_c
++assert cold["kind"] == "static-hermes-c-layout-v1"
++assert cold["unitName"] == "this_unit"
++strings = [bytes.fromhex(value) for value in cold["strings"]]
++assert b"\xed\xa0\x80" in strings
++assert len(strings) == len(set(strings))
++property_index = strings.index(b"stableProperty")
++assert "symbols[{}] /*stableProperty*/".format(property_index) in cold_c
++
++edited, edited_c = compile_source("edited", 'print("added-before-existing");\n' + source, cold)
++assert edited["strings"][:len(cold["strings"])] == cold["strings"]
++assert "symbols[{}] /*stableProperty*/".format(property_index) in edited_c
++assert b"added-before-existing".hex() in edited["strings"]
++unchanged, unchanged_c = compile_source("unchanged", 'print("added-before-existing");\n' + source, edited)
++assert unchanged == edited
++assert unchanged_c == edited_c
++
++removed, _ = compile_source("removed", source, edited)
++assert removed["strings"] == edited["strings"]
++for name, values in [
++    ("slot-reset", ["retired-{}".format(i).encode().hex() for i in range(1100)]),
++    ("byte-reset", [("x" * (65 * 1024)).encode().hex()]),
++]:
++    seed = {**cold, "strings": cold["strings"] + values}
++    reset, reset_c = compile_source(name, source, seed)
++    assert reset["strings"] == []
++    assert "symbols[{}] /*stableProperty*/".format(property_index) in reset_c
++    compacted, compacted_c = compile_source(name + "-next", source, reset)
++    assert compacted == cold
++    assert compacted_c == cold_c
++
++for name, seed in [
++    ("duplicate", {**cold, "strings": ["61", "61"]}),
++    ("invalid-hex", {**cold, "strings": ["6g"]}),
++    ("odd-hex", {**cold, "strings": ["6"]}),
++    ("invalid-utf8", {**cold, "strings": ["ff"]}),
++    ("truncated-utf8", {**cold, "strings": ["e080"]}),
++    ("overlong-utf8", {**cold, "strings": ["c0af"]}),
++    ("outside-unicode", {**cold, "strings": ["f4908080"]}),
++    ("slot-bound", {**cold, "strings": ["61"] * (256 * 1024 + 1)}),
++    ("byte-bound", {**cold, "strings": ["61" * (8 * 1024 * 1024 + 1)]}),
++    ("wrong-unit", {**cold, "unitName": "other"}),
++    ("unknown-field", {**cold, "extra": True}),
++    ("wrong-version", {**cold, "kind": "unknown"}),
++    ("wrong-shape", {**cold, "strings": {}}),
++]:
++    compile_source(name, source, seed, succeeds=False)
++
++def bodies(text):
++    return dict(re.findall(
++        r"SH_BUNDLE_HIDDEN SHLegacyValue (sh_this_unit_f_[0-9]+)"
++        r"\(SHRuntime \*shr\) \{(.*?)^}", text, re.M | re.S,
++    ))
++
++
++cold_bodies = bodies(cold_c)
++read_label = next(name for name, body in cold_bodies.items() if "stableProperty" in body)
++inserted_source = '''
++function inserted(value, key) {
++  "noinline";
++  value.extraProperty = 17;
++  return value[key];
++}
++print(inserted({first: 11}, "first"));
++''' + source.replace("read", "renamed")
++inserted, inserted_c = compile_source("inserted-function", inserted_source, cold)
++assert inserted["functions"][1:len(cold["functions"])] == cold["functions"][1:]
++assert bodies(inserted_c)[read_label] == cold_bodies[read_label]
++again, again_c = compile_source("inserted-repeat", inserted_source, inserted)
++assert again == inserted and again_c == inserted_c
++restored, restored_c = compile_source("removed-function", source, inserted)
++assert restored["functions"] == inserted["functions"]
++assert bodies(restored_c)[read_label] == cold_bodies[read_label]
++
++# Identical local shapes must receive distinct runtime slots and preserve the
++# original names in metadata. Returning current C keeps a changed caller safe.
++duplicate_source = '''
++function first(value) { "noinline"; return value.entry; }
++function second(value) { "noinline"; return value.entry; }
++print(first({entry: 10}), second({entry: 20}), first.name, second.name);
++'''
++duplicates, duplicate_c = compile_source("duplicates", duplicate_source)
++keys = [slot[0] for slot in duplicates["functions"]]
++assert len(keys) == len(set(keys))
++assert len(bodies(duplicate_c)) == len(keys)
++changed_duplicate = duplicate_source.replace("return value.entry;", "return value.entry + 1;", 1)
++compile_source("duplicate-edited", changed_duplicate, duplicates)
++
++# Identical closures in unrelated parents must not shift all caller references
++# when a different parent's closure is removed. Names are deliberately changed.
++caller_source = '''
++function wrapLeft() {
++  "noinline";
++  var result = {};
++  result.left = function(value) { "noinline"; return value.entry; };
++  return result;
++}
++function wrapRight() {
++  "noinline";
++  var result = {};
++  result.right = function(value) { "noinline"; return value.entry; };
++  return result;
++}
++function wrapLast() {
++  "noinline";
++  var result = {};
++  result.last = function(value) { "noinline"; return value.entry; };
++  return result;
++}
++print(wrapLeft().left({entry: 10}), wrapRight().right({entry: 20}), wrapLast().last({entry: 30}));
++'''
++callers, caller_c = compile_source("duplicate-callers", caller_source)
++caller_bodies = bodies(caller_c)
++right_label = next(name for name, body in caller_bodies.items()
++                   if "/*right*/" in body and "/*last*/" not in body
++                   and "_sh_ljs_create_closure" in body)
++caller_edit = caller_source[caller_source.index("function wrapRight"):]
++caller_edit = caller_edit.replace("wrapLeft().left({entry: 10}), ", "")
++caller_edit = caller_edit.replace("wrapRight", "renamedRight")
++_, caller_edit_c = compile_source("duplicate-callers-removed", caller_edit, callers)
++assert bodies(caller_edit_c)[right_label] == caller_bodies[right_label]
++
++# A deleted getter shifts identical getter occurrences, but the unique consumer
++# still identifies its captured binding. Keep the creating initializer large so
++# its changed shape cannot serve as a closure identity.
++weighted_source = '''
++function touch(box, value) { "noinline"; box.count = value; }
++function factory(a, b, added) {
++  "noinline";
++  var box = {};
++''' + "\n".join(f"  touch(box, {i});" for i in range(300)) + '''
++  return [function() { return a; }, function() { return b; },
++          function() { "noinline"; return b + 101; }];
++}
++var values = factory(10, 20, 30);
++print(values[1](), values[2]());
++'''
++weighted, weighted_c = compile_source("weighted-environment", weighted_source)
++weighted_bodies = bodies(weighted_c)
++unique_label = next(name for name, body in weighted_bodies.items()
++                    if "101" in body and "_sh_ljs_load_from_env" in body
++                    and "_sh_ljs_create_closure" not in body)
++weighted_edit_source = weighted_source.replace(
++    "function() { return a; }, function() { return b; },",
++    "function() { return b; },",
++).replace("return b + 101; }];", "return b + 101; }, function() { return added; }];")
++weighted_edit_source = weighted_edit_source.replace(
++    "print(values[1](), values[2]());", "print(values[0](), values[1](), values[2]());",
++)
++_, weighted_edit_c = compile_source("weighted-environment-edited", weighted_edit_source, weighted)
++assert bodies(weighted_edit_c)[unique_label] == weighted_bodies[unique_label]
++
++# All four cache kinds and closure/class/generator metadata references execute
++# from the current source after function insertion and name changes.
++semantic_source = '''
++class Counter {
++  #value = 3;
++  read(key) { "noinline"; this.publicValue = 8; return this.#value + this[key]; }
++}
++function *items() { yield 5; }
++function capture(value) { return function inner() { return value + 1; }; }
++const counter = new Counter();
++print(counter.read("publicValue"), items().next().value, capture(9)());
++print(Counter.name, Counter.length, capture.name, capture.length);
++'''
++semantic, _ = compile_source("semantic", semantic_source)
++compile_source("semantic-default", semantic_source, emit_layout=False)
++compile_source("semantic-edited", inserted_source + semantic_source, semantic)
++assert all(any(slot[kind] for slot in semantic["functions"]) for kind in range(1, 5))
++
++environment_source = '''
++function factory(a, b) {
++  "noinline";
++  function reader(value) { "noinline"; return a + b + value; }
++  function change(value) { "noinline"; a = value; }
++  return {reader: reader, change: change};
++}
++var x = factory(3, 4);
++print(x.reader(5));
++x.change(8);
++print(x.reader(5));
++var y = factory(10, 20);
++print(y.reader(5));
++'''
++environment, environment_c = compile_source("environment", environment_source)
++environment_bodies = bodies(environment_c)
++reader_label = next(name for name, body in environment_bodies.items()
++                    if body.count("_sh_ljs_load_from_env(") == 2)
++assert environment["scopes"]
++edited_environment_source = re.sub(r"\ba\b", "renamedA", environment_source)
++edited_environment_source = re.sub(r"\bb\b", "renamedB", edited_environment_source)
++edited_environment_source = edited_environment_source.replace(
++    "factory(renamedA, renamedB)", "factory(added, renamedA, renamedB)",
++).replace(
++    "  function reader", '  function extra() { "noinline"; return added; }\n  function reader',
++).replace(
++    "return {reader: reader, change: change};", "return {reader: reader, change: change, extra: extra};",
++).replace("factory(3, 4)", "factory(99, 3, 4)").replace(
++    "factory(10, 20)", "factory(100, 10, 20)",
++) + "print(x.extra());\n"
++environment_edit, environment_edit_c = compile_source(
++    "environment-edited", edited_environment_source, environment,
++)
++assert bodies(environment_edit_c)[reader_label] == environment_bodies[reader_label]
++environment_removed, environment_removed_c = compile_source(
++    "environment-removed", environment_source, environment_edit,
++)
++assert bodies(environment_removed_c)[reader_label] == environment_bodies[reader_label]
++
++# A sparse hint must not increase allocation size or the environment scanned by GC.
++sparse_environment = json.loads(json.dumps(environment))
++sparse_environment["scopes"] = [[[]] * 1100 + scope for scope in environment["scopes"]]
++compacted_environment, compacted_environment_c = compile_source(
++    "environment-compacted", environment_source, sparse_environment,
++)
++assert compacted_environment["scopes"] == environment["scopes"]
++assert bodies(compacted_environment_c)[reader_label] == environment_bodies[reader_label]
++
++scope_anchor = next(anchor for scope in environment["scopes"] for slot in scope for anchor in slot)
++for name, scopes in [
++    ("scope-shape", [True]),
++    ("empty-scope", [[]]),
++    ("scope-slot-shape", [[False]]),
++    ("scope-negative-anchor", [[[-1]]]),
++    ("scope-fractional-anchor", [[[0.5]]]),
++    ("scope-missing-function", [[[len(environment["functions"]) << 32]]]),
++    ("scope-duplicate-anchor", [[[scope_anchor], [scope_anchor]]]),
++    ("scope-anchor-bound", [[[scope_anchor] * 5]]),
++    ("scope-slot-bound", [[[]] * (256 * 1024 + 1)]),
++]:
++    compile_source(name, environment_source, {**environment, "scopes": scopes}, succeeds=False)
++
++# Invalid seeds must not overlap sites, overflow indices, or alias functions.
++read_slot = next(slot for slot in cold["functions"] if slot[2])
++read_range = read_slot[2][0]
++for name, functions in [
++    ("duplicate-function-key", cold["functions"] + [cold["functions"][-1]]),
++    ("missing-global-slot", cold["functions"][1:]),
++    ("bad-function-key", [["wrong", [], [], [], []]]),
++    ("wrong-function-shape", [["global"]]),
++    ("overlapping-cache", [["global", [], [read_range, read_range], [], []]]),
++    ("negative-cache", [["global", [], [[-1, 1]], [], []]]),
++    ("zero-cache", [["global", [], [[0, 0]], [], []]]),
++    ("fractional-cache", [["global", [], [[0.5, 1]], [], []]]),
++    ("cache-bound", [["global", [], [[1024 * 1024, 1]], [], []]]),
++    ("cache-extent", [["global", [[1024 * 1024 - 1, 1]], [[1, 1]], [], []]]),
++    ("write-width", [["global", [[0, 2]], [], [], []]]),
++]:
++    compile_source(name, source, {**cold, "functions": functions}, succeeds=False)
++
++retired_functions = [
++    ["{:040x}:0".format(i), [], [], [], []] for i in range(1100)
++]
++function_reset, function_reset_c = compile_source(
++    "function-reset", source,
++    {**cold, "functions": cold["functions"] + retired_functions},
++)
++assert function_reset["functions"] == []
++assert bodies(function_reset_c)[read_label] == cold_bodies[read_label]
++function_next, _ = compile_source("function-reset-next", source, function_reset)
++assert function_next == cold
++cache_seed = json.loads(json.dumps(cold))
++cache_seed["functions"].append(["f" * 40 + ":0", [], [[2000, 1]], [], []])
++cache_reset, _ = compile_source("cache-reset", source, cache_seed)
++assert cache_reset["functions"] == []
++cache_next, _ = compile_source("cache-reset-next", source, cache_reset)
++assert cache_next == cold
++
++# Removing one packed group must not rename or repack the following groups.
++# New shapes retain nearby native inlining opportunities; a smaller target
++# still splits only the affected group, including outlined functions.
++def shard_source(indices):
++    return "\n".join(
++        'function f{0}(x) {{ "noinline"; return x.p{0}; }}'.format(i)
++        for i in indices
++    ) + "\n" + "\n".join(
++        'print(f{0}({{p{0}: {0}}}));'.format(i) for i in indices
++    )
++
++
++def function_members(name):
++    directory = root / name
++    manifest = json.loads((directory / "unit.c.json").read_text())
++    return {m["path"]: (directory / m["path"]).read_bytes()
++            for m in manifest["translationUnits"] if m["role"] == "function"}
++
++
++shard_indices = list(range(32))
++sharded, sharded_c = compile_source(
++    "shards", shard_source(shard_indices), shard_size=6000,
++)
++assert len(sharded["shards"]) >= 4
++removed_group = next(i for i, group in enumerate(sharded["shards"])
++                     if len(group) > 1 and 0 not in group)
++slot_to_source = {
++    int(label.rsplit("_", 1)[1]): int(re.search(r"/\*p([0-9]+)\*/", body)[1])
++    for label, body in bodies(sharded_c).items() if "/*p" in body and not label.endswith("_0")
++}
++removed_indices = {slot_to_source[slot] for slot in sharded["shards"][removed_group]}
++remaining_indices = [i for i in shard_indices if i not in removed_indices]
++deleted, _ = compile_source(
++    "shards-deleted", shard_source(remaining_indices), sharded, shard_size=6000,
++)
++assert deleted["shards"][removed_group] == []
++original_members = function_members("shards")
++deleted_members = function_members("shards-deleted")
++for path, body in original_members.items():
++    group = int(re.search(r"_functions_([0-9]+)_", path)[1])
++    if group != removed_group and 0 not in sharded["shards"][group]:
++        assert deleted_members[path] == body, path
++inserted_indices = [-1] + remaining_indices
++# Use a valid identifier for the inserted function.
++inserted_shard_source = shard_source(inserted_indices).replace("f-1", "added").replace("p-1", "added")
++shard_inserted, shard_inserted_c = compile_source(
++    "shards-inserted", inserted_shard_source, deleted, shard_size=6000,
++)
++shard_repeat, shard_repeat_c = compile_source(
++    "shards-repeat", inserted_shard_source, shard_inserted, shard_size=6000,
++)
++assert shard_repeat == shard_inserted and shard_repeat_c == shard_inserted_c
++unrelated_members = {path: body for path, body in deleted_members.items()
++                     if "_functions_00000_" not in path}
++inserted_members = function_members("shards-inserted")
++assert sum(body == inserted_members.get(path)
++           for path, body in unrelated_members.items()) >= len(unrelated_members) - 1
++split_shards, _ = compile_source(
++    "shards-split", inserted_shard_source, shard_inserted, shard_size=3000,
++)
++assert len(function_members("shards-split")) > len(function_members("shards-inserted"))
++assert split_shards["shards"] == shard_inserted["shards"]
++
++for name, shards in [
++    ("shards-wrong-shape", [False]),
++    ("shards-missing-slot", [[len(cold["functions"])]]),
++    ("shards-negative-slot", [[-1]]),
++    ("shards-fractional-slot", [[0.5]]),
++    ("shards-duplicate-slot", [[0], [0]]),
++    ("shards-group-bound", [[]] * 65534),
++]:
++    compile_source(name, source, {**cold, "shards": shards}, succeeds=False)
++shard_reset, _ = compile_source(
++    "shards-reset", source, {**cold, "shards": [[]] * 1100 + cold["shards"]},
++)
++assert shard_reset["shards"] == []
++shard_reset_next, _ = compile_source("shards-reset-next", source, shard_reset)
++assert shard_reset_next == cold
++
++# Adding unrelated literals must not shift existing serialized offsets or shape
++# cache slots. Changed literals still serialize from current source.
++literal_source = '''
++function array() { "noinline"; return [101, 203, 307]; }
++function object() { "noinline"; return {stableKey: 701, otherKey: "kept"}; }
++print(JSON.stringify(array()), JSON.stringify(object()));
++'''
++literal_prefix = '''
++function extra() { "noinline"; return [401, 503, 607, 809, 911, 1013]; }
++function extraObject() { "noinline"; return {inserted: 1201, text: "new"}; }
++print(JSON.stringify(extra()), JSON.stringify(extraObject()));
++'''
++literals, literal_c = compile_source("literals", literal_source)
++literal_bodies = bodies(literal_c)
++array_label = next(name for name, body in literal_bodies.items()
++                   if "_sh_ljs_new_array_with_buffer" in body)
++object_label = next(name for name, body in literal_bodies.items()
++                    if "_sh_ljs_new_object_with_buffer" in body)
++literal_inserted, literal_inserted_c = compile_source(
++    "literals-inserted", literal_prefix + literal_source, literals,
++)
++for label in (array_label, object_label):
++    assert bodies(literal_inserted_c)[label] == literal_bodies[label]
++literal_edited, literal_edited_c = compile_source(
++    "literals-edited", literal_prefix + literal_source.replace("203", "211"),
++    literal_inserted,
++)
++assert bodies(literal_edited_c)[object_label] == literal_bodies[object_label]
++literal_restored, literal_restored_c = compile_source(
++    "literals-restored", literal_source, literal_edited,
++)
++for label in (array_label, object_label):
++    assert bodies(literal_restored_c)[label] == literal_bodies[label]
++literal_repeat, literal_repeat_c = compile_source(
++    "literals-repeat", literal_source, literal_restored,
++)
++assert literal_repeat == literal_restored and literal_repeat_c == literal_restored_c
++legacy, legacy_c = compile_source(
++    "literals-legacy", literal_source,
++    {key: value for key, value in literals.items() if key != "literals"},
++)
++assert legacy == literals and legacy_c == literal_c
++
++# Compressed byte segments can overlap. Seed bytes are allocation hints, never
++# parsed as program data unless current serialization matches the exact segment.
++empty_literals = {"values": "", "valueEntries": [], "keys": "", "keyEntries": [], "shapes": []}
++for name, seed in [
++    ("overlap", {**empty_literals, "values": "010203", "valueEntries": [[0, 2], [1, 2]]}),
++    ("empty", {**empty_literals, "valueEntries": [[0, 0]], "keyEntries": [[0, 0]]}),
++]:
++    compile_source("literals-" + name, literal_source, {**literals, "literals": seed})
++
++ordinary_kind = literals["literals"]["shapes"][0][2]
++for name, seed in [
++    ("wrong-type", []),
++    ("unknown-field", {**empty_literals, "extra": 0}),
++    ("missing-field", {key: value for key, value in empty_literals.items() if key != "values"}),
++    ("invalid-hex", {**empty_literals, "values": "0g"}),
++    ("odd-hex", {**empty_literals, "values": "0"}),
++    ("uppercase-hex", {**empty_literals, "values": "AA"}),
++    ("negative-offset", {**empty_literals, "valueEntries": [[-1, 0]]}),
++    ("fractional-offset", {**empty_literals, "valueEntries": [[0.5, 0]]}),
++    ("overflow-offset", {**empty_literals, "valueEntries": [[2**32, 0]]}),
++    ("negative-length", {**empty_literals, "valueEntries": [[0, -1]]}),
++    ("fractional-length", {**empty_literals, "valueEntries": [[0, 0.5]]}),
++    ("overflow-length", {**empty_literals, "values": "00", "valueEntries": [[1, 1]]}),
++    ("duplicate-entry", {**empty_literals, "values": "aaaa", "valueEntries": [[0, 1], [1, 1]]}),
++    ("entry-bound", {**empty_literals, "valueEntries": [[0, 0]] * (256 * 1024 + 1)}),
++    ("byte-bound", {**empty_literals, "values": "00" * (8 * 1024 * 1024 + 1)}),
++    ("key-range", {**empty_literals, "keys": "00", "keyEntries": [[0, 2]]}),
++    ("missing-key", {**empty_literals, "shapes": [[0, 0, ordinary_kind]]}),
++    ("bad-kind", {**literals["literals"], "shapes": [[0, 1, 0]]}),
++    ("negative-count", {**literals["literals"], "shapes": [[0, -1, ordinary_kind]]}),
++    ("fractional-count", {**literals["literals"], "shapes": [[0, 0.5, ordinary_kind]]}),
++    ("overflow-count", {**literals["literals"], "shapes": [[0, 2**32, ordinary_kind]]}),
++    ("duplicate-shape", {**literals["literals"], "shapes": literals["literals"]["shapes"] * 2}),
++    ("shape-bound", {**empty_literals, "shapes": [[0, 0, ordinary_kind]] * (64 * 1024 + 1)}),
++]:
++    compile_source("literals-reject-" + name, literal_source,
++                   {**literals, "literals": seed}, succeeds=False)
++
++retired_values = b"".join(i.to_bytes(2, "little") for i in range(1100))
++for name, seed in [
++    ("bytes", {**empty_literals, "values": "00" * (65 * 1024), "valueEntries": [[0, 1]]}),
++    ("entries", {**empty_literals, "values": retired_values.hex(),
++                 "valueEntries": [[i * 2, 2] for i in range(1100)]}),
++    ("shapes", {**empty_literals, "keyEntries": [[0, 0]],
++                "shapes": [[0, i, ordinary_kind] for i in range(1100)]}),
++]:
++    reset, _ = compile_source("literals-reset-" + name, literal_source,
++                              {**literals, "literals": seed})
++    assert reset["literals"] is None
++    compacted, compacted_c = compile_source("literals-reset-" + name + "-next", literal_source, reset)
++    assert compacted == literals and compacted_c == literal_c
++
++# Identical property keys need distinct hidden-class caches for ordinary, typed,
++# and non-enumerable typed allocations, including after retaining old shapes.
++typed_literal_source = '''
++'use strict';
++class Item {
++  x: number = 7;
++  read(): number { return this.x; }
++}
++var typedItem = new Item();
++var ordinaryItem = {x: 11};
++print(typedItem.read(), ordinaryItem.x);
++print(Object.keys(typedItem).join(","), Object.keys(ordinaryItem).join(","),
++      Object.keys(Object.getPrototypeOf(typedItem)).join(","));
++'''
++typed_literals, _ = compile_source("literals-typed", typed_literal_source, typed=True)
++shape_kinds = {shape[2] for shape in typed_literals["literals"]["shapes"]}
++assert len(shape_kinds) == 3
++typed_literal_edit = typed_literal_source.replace("'use strict';", "'use strict';\nprint({extra: 13}.extra);")
++compile_source("literals-typed-edited", typed_literal_edit, typed_literals, typed=True)
++
++if native:
++    cc, config, include, vm, console = native
++
++    def execute(name):
++        global execute_count
++        execute_count += 1
++        directory = root / name
++        manifest = json.loads((directory / "unit.c.json").read_text())
++        units = manifest["translationUnits"]
++        objects = []
++        for unit in units:
++            obj = unit["path"] + ".o"
++            subprocess.run([
++                cc, "-DNDEBUG", "-O0", "-I" + config, "-I" + include,
++                "-c", unit["path"], "-o", obj,
++            ], cwd=directory, check=True, timeout=60)
++            objects.append(obj)
++        subprocess.run([
++            cc, *objects, "-L" + vm, "-L" + console,
++            "-Wl,-rpath," + vm, "-Wl,-rpath," + console,
++            "-lshermes_console", "-lhermesvm", "-lm", "-o", "executable",
++        ], cwd=directory, check=True, timeout=60)
++        result = subprocess.run(
++            [str(directory / "executable")], check=True,
++            capture_output=True, timeout=60,
++        )
++        return result.stdout
++
++    baseline = execute("default")
++    for name in ("cold", "removed-function", "function-reset", "cache-reset"):
++        assert execute(name) == baseline, name
++    assert execute("inserted-function") == b"11\n" + baseline
++    assert execute("duplicates") == b"10 20 first second\n"
++    assert execute("duplicate-edited") == b"11 20 first second\n"
++    assert execute("duplicate-callers") == b"10 20 30\n"
++    assert execute("duplicate-callers-removed") == b"20 30\n"
++    assert execute("weighted-environment") == b"20 121\n"
++    assert execute("weighted-environment-edited") == b"20 121 30\n"
++    expected = execute("semantic-default")
++    assert execute("semantic") == expected
++    assert execute("semantic-edited") == b"11\n" + baseline + expected
++    environment_expected = b"12\n17\n35\n"
++    for name in ("environment", "environment-removed", "environment-compacted"):
++        assert execute(name) == environment_expected
++    assert execute("environment-edited") == environment_expected + b"99\n"
++    for name, indices in [("shards", shard_indices),
++                          ("shards-deleted", remaining_indices),
++                          ("shards-inserted", inserted_indices),
++                          ("shards-split", inserted_indices)]:
++        assert execute(name) == "".join(str(i) + "\n" for i in indices).encode()
++    literal_expected = b'[101,203,307] {"stableKey":701,"otherKey":"kept"}\n'
++    inserted_expected = b'[401,503,607,809,911,1013] {"inserted":1201,"text":"new"}\n'
++    for name in ("literals", "literals-restored", "literals-repeat", "literals-legacy",
++                 "literals-overlap", "literals-empty", "literals-reset-bytes",
++                 "literals-reset-entries", "literals-reset-shapes"):
++        assert execute(name) == literal_expected, name
++    assert execute("literals-inserted") == inserted_expected + literal_expected
++    assert execute("literals-edited") == inserted_expected + literal_expected.replace(b"203", b"211")
++    assert execute("literals-typed") == b"7 11\nx x \n"
++    assert execute("literals-typed-edited") == b"13\n7 11\nx x \n"
++
++print(f"{compile_count} retained-layout compiler cases passed; "
++      f"{execute_count} native execution cases passed")
 diff --git a/test/shermes/computed-loads.js b/test/shermes/computed-loads.js
 new file mode 100644
 index 0000000000000000000000000000000000000000..5367c18e5e97cec657763309f555a53f18194a79
@@ -3281,6 +5999,25 @@ index 0000000000000000000000000000000000000000..bc1bf6d514ea751fa6e2bb53831188da
 +// LOOP-NOT: copyDataProperties
 +// LOOP-NOT: AllocObjectLiteralInst
 +// LOOP: function_end
+diff --git a/test/shermes/emit-c-bundle-layout.js b/test/shermes/emit-c-bundle-layout.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..2786d4b0440e4b7812ba331c3db95144bb44cd5d
+--- /dev/null
++++ b/test/shermes/emit-c-bundle-layout.js
+@@ -0,0 +1,13 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++// REQUIRES: linux
++// RUN: rm -rf %t.dir
++// RUN: %python %S/Inputs/check-c-bundle-layout.py %shermes %t.dir %c_compiler %static_h_config %S/../../include %hermesvm_lib_dir %shermes_console_lib_dir
++
++// The driver checks edited sources, bounded retained slots, function/cache/literal stability,
++// typed shape separation, exact surrogate bytes and malformed layout rejection in separate processes.
 diff --git a/test/shermes/ffi/string_write_utf8.js b/test/shermes/ffi/string_write_utf8.js
 new file mode 100644
 index 0000000000000000000000000000000000000000..a9b0fbf317cd44e6d158d1885f766e235d0adbd6
@@ -4190,11 +6927,64 @@ index 0000000000000000000000000000000000000000..b371cb64710cb588e070f0fe66a87cb1
 +delete Object.prototype.probe;
 +print('string method cache passed');
 +// CHECK: string method cache passed
+diff --git a/tools/shermes/compile.cpp b/tools/shermes/compile.cpp
+index d23009ed6b3a4919c5ceff2b9c23e586fbd5607e..23e35b56ee7f47799de10a8f198e00e1bbf30d8e 100644
+--- a/tools/shermes/compile.cpp
++++ b/tools/shermes/compile.cpp
+@@ -429,6 +429,15 @@ bool compileToCBundle(
+       return false;
+     identities.push_back(std::move(*identity));
+   }
++  const std::string layoutPath = generatedFilePrefix + "layout.json";
++  llvh::Optional<BundleFileIdentity> layoutIdentity;
++  if (params.genOptions.emitCBundleLayout) {
++    llvh::SmallString<128> fullPath(outputDirectory);
++    llvh::sys::path::append(fullPath, layoutPath);
++    layoutIdentity = identifyBundleFile(fullPath);
++    if (!layoutIdentity)
++      return false;
++  }
+ 
+   OutputStream manifest;
+   if (!manifest.open(outputFilename, llvh::sys::fs::F_None))
+@@ -443,8 +452,13 @@ bool compileToCBundle(
+   };
+   OS << "{\"header\":{";
+   emitCommonFields(0);
+-  OS << "},\"kind\":\"static-hermes-c-bundle-v1\",\"schemaVersion\":1,"
+-        "\"translationUnits\":[";
++  OS << "},\"kind\":\"static-hermes-c-bundle-v1\",";
++  if (layoutIdentity) {
++    OS << "\"layout\":{\"path\":\"" << layoutPath << "\",\"sha256\":\""
++       << layoutIdentity->sha256 << "\",\"size\":" << layoutIdentity->size
++       << "},";
++  }
++  OS << "\"schemaVersion\":1,\"translationUnits\":[";
+   for (size_t index = 1; index < files.size(); ++index) {
+     if (index != 1)
+       OS << ',';
 diff --git a/tools/shermes/shermes.cpp b/tools/shermes/shermes.cpp
-index 5db8804e8cddc6ec859f6260263f71956042f8ca..629d1b60fa6651f8b1e99b629a9b6654646c1ce8 100644
+index 5db8804e8cddc6ec859f6260263f71956042f8ca..b7ce026f36c9e7893c72c360554bdd0a93ba675c 100644
 --- a/tools/shermes/shermes.cpp
 +++ b/tools/shermes/shermes.cpp
-@@ -218,6 +218,12 @@ cl::opt<bool> KeepTemp(
+@@ -137,6 +137,16 @@ static cl::opt<unsigned> EmitCShardSize(
+     cl::init(2 * 1024 * 1024),
+     cl::desc("Target function-body bytes per generated C translation unit"));
+ 
++static cl::opt<bool> EmitCBundleLayout(
++    "Xemit-c-layout",
++    cl::init(false),
++    cl::desc("Emit reusable function, cache and string assignments beside the C bundle"));
++
++static cl::opt<std::string> CBundleLayoutInput(
++    "Xc-layout-input",
++    cl::init(""),
++    cl::desc("Authenticated metadata layout from a previous C bundle"));
++
+ cl::opt<DebugLevel> DebugInfoLevel(
+     cl::desc("Choose debug info level:"),
+     cl::init(DebugLevel::g0),
+@@ -218,6 +228,12 @@ cl::opt<bool> KeepTemp(
      cl::desc("Keep temporary files made along the way (for debugging)"),
      cl::cat(CompilerCategory));
  
@@ -4207,7 +6997,7 @@ index 5db8804e8cddc6ec859f6260263f71956042f8ca..629d1b60fa6651f8b1e99b629a9b6654
  cl::opt<StaticBuiltinSetting> StaticBuiltins(
      cl::desc(
          "recognizing of calls to global functions like Object.keys() statically"),
-@@ -632,6 +638,7 @@ std::shared_ptr<Context> createContext() {
+@@ -632,6 +648,7 @@ std::shared_ptr<Context> createContext() {
    optimizationOpts.inlining =
        cli::OptimizationLevel != OptLevel::O0 && cli::Inline;
    optimizationOpts.inlineMaxSize = cli::InlineMaxSize;
@@ -4215,7 +7005,7 @@ index 5db8804e8cddc6ec859f6260263f71956042f8ca..629d1b60fa6651f8b1e99b629a9b6654
  
    optimizationOpts.reusePropCache = cli::ReusePropCache;
  
-@@ -643,6 +650,7 @@ std::shared_ptr<Context> createContext() {
+@@ -643,6 +660,7 @@ std::shared_ptr<Context> createContext() {
    // parsing.
    optimizationOpts.staticBuiltins =
        cli::StaticBuiltins == StaticBuiltinSetting::ForceOn;
@@ -4223,6 +7013,31 @@ index 5db8804e8cddc6ec859f6260263f71956042f8ca..629d1b60fa6651f8b1e99b629a9b6654
  
    optimizationOpts.metroRequireOpt = cli::MetroRequireOpt;
  
+@@ -933,6 +951,15 @@ bool compileFromCommandLineOptions() {
+     llvh::errs() << "Error: -Xemit-c-shard-size must be positive.\n";
+     return false;
+   }
++  if ((cli::EmitCBundleLayout || !cli::CBundleLayoutInput.empty()) &&
++      !cli::EmitCBundle) {
++    llvh::errs() << "Error: retained C layout requires -Xemit-c-bundle.\n";
++    return false;
++  }
++  if (!cli::CBundleLayoutInput.empty() && !cli::EmitCBundleLayout) {
++    llvh::errs() << "Error: -Xc-layout-input requires -Xemit-c-layout.\n";
++    return false;
++  }
+   if (!cli::ExportedUnit.empty()) {
+     if (cli::OutputLevel == OutputLevelKind::Run ||
+         cli::OutputLevel == OutputLevelKind::Executable) {
+@@ -1083,6 +1110,8 @@ bool compileFromCommandLineOptions() {
+   genOptions.smallC = cli::SmallC;
+   genOptions.emitCBundle = cli::EmitCBundle;
+   genOptions.cBundleShardSize = cli::EmitCShardSize;
++  genOptions.emitCBundleLayout = cli::EmitCBundleLayout;
++  genOptions.cBundleLayoutInput = cli::CBundleLayoutInput;
+ 
+   genOptions.emitSourceLocations =
+       cli::DumpSourceLocation != LocationDumpMode::None;
 diff --git a/unittests/API/APITest.cpp b/unittests/API/APITest.cpp
 index aae9e34229d4d5e4f039d2505f24a718e47687c0..fda43b31818b9dee5e5ede3613b22b66781a701f 100644
 --- a/unittests/API/APITest.cpp
