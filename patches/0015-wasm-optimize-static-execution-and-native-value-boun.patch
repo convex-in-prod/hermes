@@ -73,56 +73,96 @@ Validate callback identity and environments, inlining growth, object
 elimination, cache invalidation, indexed reads and numeric/string edges in
 host and Wasm execution, including normal and small-C output. Retain the
 existing native value-adapter and runtime ABI checks.
+
+Prove bounded signed/unsigned integer ranges through producers and phi inputs,
+remove idempotent conversions, and consume those proofs in numeric bitwise and
+imul emission. Keep general conversions for unknown values and preserve BigInt
+coercion through objects. The existing numeric type factories remain unchanged.
+
+Share one indexed character read across strict single-code-unit comparisons.
+Preserve the property read position, key coercion, inherited values and errors;
+root receiver and key through fallback getters and collection.
+
+Index Unicode and legacy case transforms with immutable page directories.
+Retain crossing ranges and compare every supported code point against the
+original transform mapping, including surrogates and out-of-domain values.
+
+Call known always-callable closure targets through their native entry while
+retaining the actual closure environment. Distribute copies of unaliased
+branch-local object literals into their incoming ordinary branch edges so
+existing promotion removes the temporary allocations. Preserve field order,
+source evaluation and exception regions; retain general spread semantics for
+observable sources and unknown layouts.
+
+Validate integer boundaries and coercions, shared character reads, native-call
+environments, conditional spreads and iterator cleanup in optimized/unoptimized
+native, bytecode, and normal/small-C Wasm execution. Existing optimizer, Unicode
+and split-C linking regressions pass. Inspect linked Wasm and native code for
+removed conversion and generic character-read work without claiming runtime
+speedup from static counts.
 ---
- API/hermes/hermes.cpp                       | 379 ++++++++++++++++++++
- API/hermes/hermes.h                         |  50 +++
- include/hermes/AST/Context.h                |   7 +
- include/hermes/Support/MathFunctions.h      |  42 +++
- include/hermes/VM/CellKind.h                |   6 +
- include/hermes/VM/GCCell.h                  |   1 +
- include/hermes/VM/PropertyCache.h           |  19 +
- include/hermes/VM/StringPrimitive.h         |   8 +-
- include/hermes/VM/sh_mirror.h               |  38 ++
- include/hermes/VM/static_h.h                | 202 +++++++++++
- include/hermes/VMLayouts/PropertyCache.h    |  20 ++
- lib/BCGen/SH/PeepholeLowering.cpp           |  98 +++++
- lib/BCGen/SH/SH.cpp                         | 200 +++++++++--
- lib/CompilerDriver/CompilerDriver.cpp       |   7 +
- lib/Optimizer/Scalar/FunctionAnalysis.cpp   |  85 +++++
- lib/Optimizer/Scalar/Inlining.cpp           |  63 +++-
- lib/Optimizer/Scalar/LowerBuiltinCalls.cpp  |  10 +-
- lib/Sema/FlowChecker-expr.cpp               |   2 +-
- lib/VM/JSArray.cpp                          |   9 +
- lib/VM/JSArrayBuffer.cpp                    |   8 +-
- lib/VM/JSLib/Math.cpp                       |  51 +--
- lib/VM/JSLib/MathStdFunctions.def           |   2 +-
- lib/VM/JSLib/String.cpp                     |  15 +-
- lib/VM/JSTypedArray.cpp                     |   7 +
- lib/VM/StaticH.cpp                          | 212 ++++++++++-
- lib/VM/StaticHUnit.cpp                      |   8 +
- lib/VM/StringPrimitive.cpp                  |   4 +
- test/shermes/computed-loads.js              | 147 ++++++++
- test/shermes/ffi/string_write_utf8.js       |  38 ++
- test/shermes/inline-object-reader-growth.js |  16 +
- test/shermes/inline-object-reader-try.js    |  86 +++++
- test/shermes/known-callback-targets.js      | 117 ++++++
- test/shermes/native-literal-builtins.js     |  43 +++
- test/shermes/numeric-math.js                |  98 +++++
- test/shermes/polymorphic-read-cache.js      |  63 ++++
- test/shermes/string-index-comparison.js     | 122 +++++++
- test/shermes/string-method-cache.js         |  36 ++
- tools/shermes/shermes.cpp                   |   8 +
- unittests/API/APITest.cpp                   | 127 +++++++
- unittests/VMRuntime/StaticHUnitTest.cpp     |  50 +++
- unittests/VMRuntime/StringPrimitiveTest.cpp |  15 +
- 41 files changed, 2412 insertions(+), 107 deletions(-)
+ API/hermes/hermes.cpp                         | 379 ++++++++++++++++++
+ API/hermes/hermes.h                           |  50 +++
+ include/hermes/AST/Context.h                  |   7 +
+ include/hermes/Optimizer/Scalar/Utils.h       |  16 +
+ include/hermes/Support/MathFunctions.h        |  42 ++
+ include/hermes/VM/CellKind.h                  |   6 +
+ include/hermes/VM/GCCell.h                    |   1 +
+ include/hermes/VM/PropertyCache.h             |  19 +
+ include/hermes/VM/StringPrimitive.h           |   8 +-
+ include/hermes/VM/sh_mirror.h                 |  38 ++
+ include/hermes/VM/static_h.h                  | 215 ++++++++++
+ include/hermes/VMLayouts/PropertyCache.h      |  20 +
+ lib/BCGen/SH/PeepholeLowering.cpp             | 164 ++++++++
+ lib/BCGen/SH/SH.cpp                           | 252 ++++++++++--
+ lib/CompilerDriver/CompilerDriver.cpp         |   7 +
+ lib/Optimizer/Scalar/FunctionAnalysis.cpp     |  85 ++++
+ lib/Optimizer/Scalar/Inlining.cpp             |  63 ++-
+ lib/Optimizer/Scalar/InstSimplify.cpp         |   6 +
+ lib/Optimizer/Scalar/LowerBuiltinCalls.cpp    |  10 +-
+ lib/Optimizer/Scalar/ObjectStackPromotion.cpp | 102 ++++-
+ lib/Optimizer/Scalar/TypeInference.cpp        |   6 +-
+ lib/Optimizer/Scalar/Utils.cpp                |  65 +++
+ lib/Platform/Unicode/CharacterProperties.cpp  |  42 +-
+ lib/Sema/FlowChecker-expr.cpp                 |   2 +-
+ lib/VM/JSArray.cpp                            |   9 +
+ lib/VM/JSArrayBuffer.cpp                      |   8 +-
+ lib/VM/JSLib/Math.cpp                         |  51 +--
+ lib/VM/JSLib/MathStdFunctions.def             |   2 +-
+ lib/VM/JSLib/String.cpp                       |  15 +-
+ lib/VM/JSTypedArray.cpp                       |   7 +
+ lib/VM/StaticH.cpp                            | 235 ++++++++++-
+ lib/VM/StaticHUnit.cpp                        |   8 +
+ lib/VM/StringPrimitive.cpp                    |   4 +
+ test/shermes/computed-loads.js                | 147 +++++++
+ test/shermes/conditional-object-spread.js     | 123 ++++++
+ test/shermes/ffi/string_write_utf8.js         |  38 ++
+ test/shermes/inline-object-reader-growth.js   |  16 +
+ test/shermes/inline-object-reader-try.js      |  86 ++++
+ test/shermes/integer-value-proofs.js          | 101 +++++
+ test/shermes/known-callback-targets.js        | 117 ++++++
+ test/shermes/known-native-call.js             |  62 +++
+ test/shermes/native-literal-builtins.js       |  43 ++
+ test/shermes/numeric-math.js                  |  98 +++++
+ test/shermes/polymorphic-read-cache.js        |  63 +++
+ test/shermes/string-index-comparison.js       | 183 +++++++++
+ test/shermes/string-method-cache.js           |  36 ++
+ tools/shermes/shermes.cpp                     |   8 +
+ unittests/API/APITest.cpp                     | 127 ++++++
+ .../PlatformUnicode/CharacterPropertyTest.cpp |  26 ++
+ unittests/VMRuntime/StaticHUnitTest.cpp       |  50 +++
+ unittests/VMRuntime/StringPrimitiveTest.cpp   |  15 +
+ 51 files changed, 3162 insertions(+), 121 deletions(-)
  create mode 100644 include/hermes/Support/MathFunctions.h
  create mode 100644 include/hermes/VMLayouts/PropertyCache.h
  create mode 100644 test/shermes/computed-loads.js
+ create mode 100644 test/shermes/conditional-object-spread.js
  create mode 100644 test/shermes/ffi/string_write_utf8.js
  create mode 100644 test/shermes/inline-object-reader-growth.js
  create mode 100644 test/shermes/inline-object-reader-try.js
+ create mode 100644 test/shermes/integer-value-proofs.js
  create mode 100644 test/shermes/known-callback-targets.js
+ create mode 100644 test/shermes/known-native-call.js
  create mode 100644 test/shermes/native-literal-builtins.js
  create mode 100644 test/shermes/numeric-math.js
  create mode 100644 test/shermes/polymorphic-read-cache.js
@@ -652,6 +692,33 @@ index 2d4f58dc62642a932d19c974f12d2cd9a0c76719..f5f8d28c56ad16598cd0f08689b492d0
    /// Attempt to resolve CommonJS require() calls at compile time.
    bool staticRequire{false};
  
+diff --git a/include/hermes/Optimizer/Scalar/Utils.h b/include/hermes/Optimizer/Scalar/Utils.h
+index 30a939e600695f52d2b633d6b9b1c1614221b9f5..79d99b380635281ff439b086dc83c8ddb23817b3 100644
+--- a/include/hermes/Optimizer/Scalar/Utils.h
++++ b/include/hermes/Optimizer/Scalar/Utils.h
+@@ -18,6 +18,22 @@
+ 
+ namespace hermes {
+ 
++/// Proven constraints on a Number value, excluding negative zero. The numeric
++/// IR factories currently erase integer refinements, so conversion lowering
++/// must use the producing operations rather than their Number type alone.
++enum IntegerRange : uint8_t {
++  IntegerRangeUnknown = 0,
++  IntegerRangeInt32 = 1,
++  IntegerRangeUint32 = 2,
++  IntegerRangeInt32OrUint32 = 4,
++};
++
++/// Return the intersection of integer constraints on every input to the value.
++/// Traversal through moves and phis is bounded; an unsupported input makes the
++/// result unknown. Each returned signed/unsigned constraint also includes the
++/// Int32OrUint32 bit.
++uint8_t getKnownIntegerRange(Value *value);
++
+ /// If this is a variable that only has stores of a single value then
+ /// return the value that initializes the variable.
+ ///
 diff --git a/include/hermes/Support/MathFunctions.h b/include/hermes/Support/MathFunctions.h
 new file mode 100644
 index 0000000000000000000000000000000000000000..307c42f10238473e3c33b37b90629fe8e35a069d
@@ -863,7 +930,7 @@ index f763724f14ed57a505f2e93054b9b48afef97983..7098fa10802ae242a34b745849cb7917
  typedef SHCompressedPointerRawType SHGCSmallHermesValue;
  #else
 diff --git a/include/hermes/VM/static_h.h b/include/hermes/VM/static_h.h
-index 13246ec2f260f05df9b71a8810ec1049faf179fd..17c114b28a5108d237e7b071b082bdf76f3a10a8 100644
+index 13246ec2f260f05df9b71a8810ec1049faf179fd..beae0cb852dcc37d94aadb87bda86575d89d32b3 100644
 --- a/include/hermes/VM/static_h.h
 +++ b/include/hermes/VM/static_h.h
 @@ -8,6 +8,7 @@
@@ -953,7 +1020,7 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..17c114b28a5108d237e7b071b082bdf7
  /// Check on the native stack and throw a stack overflow error if it overflows.
  /// When compiled without HERMES_CHECK_NATIVE_STACK, does nothing.
  /// TODO: Inline the fast path to allow for faster execution.
-@@ -881,12 +926,43 @@ static inline SHLegacyValue _sh_ljs_get_by_id_rjs_inline(
+@@ -881,12 +926,50 @@ static inline SHLegacyValue _sh_ljs_get_by_id_rjs_inline(
    return _sh_ljs_get_by_id_rjs(shr, source, symID, propCacheEntry);
  }
  
@@ -994,10 +1061,17 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..17c114b28a5108d237e7b071b082bdf7
 +    uint16_t character,
 +    uint8_t invert);
 +
++/// Read once and return a UTF-16 code unit, or -1 for any other property value.
++/// Used only when all consumers compare strictly against single-character strings.
++SHERMES_EXPORT SHLegacyValue _sh_ljs_get_indexed_char_code(
++    SHRuntime *shr,
++    SHLegacyValue source,
++    SHLegacyValue key);
++
  SHERMES_EXPORT SHLegacyValue _sh_ljs_get_by_val_with_receiver_rjs(
      SHRuntime *shr,
      SHLegacyValue *source,
-@@ -899,6 +975,97 @@ static inline SHLegacyValue _sh_ljs_get_by_val_rjs(
+@@ -899,6 +982,97 @@ static inline SHLegacyValue _sh_ljs_get_by_val_rjs(
    return _sh_ljs_get_by_val_with_receiver_rjs(shr, source, key, source);
  }
  
@@ -1095,7 +1169,7 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..17c114b28a5108d237e7b071b082bdf7
  SHERMES_EXPORT SHLegacyValue _sh_ljs_get_own_private_by_sym(
      SHRuntime *shr,
      const SHLegacyValue *source,
-@@ -910,6 +1077,16 @@ SHERMES_EXPORT SHLegacyValue _sh_ljs_get_own_private_by_sym(
+@@ -910,6 +1084,16 @@ SHERMES_EXPORT SHLegacyValue _sh_ljs_get_own_private_by_sym(
  SHERMES_EXPORT SHLegacyValue
  _sh_ljs_get_by_index_rjs(SHRuntime *shr, SHLegacyValue *source, uint32_t key);
  
@@ -1112,7 +1186,7 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..17c114b28a5108d237e7b071b082bdf7
  /// Put an enumerable property by string id.
  SHERMES_EXPORT void _sh_ljs_define_own_by_id(
      SHRuntime *shr,
-@@ -980,6 +1157,13 @@ _sh_ljs_get_string(SHRuntime *shr, SHSymbolID symID);
+@@ -980,6 +1164,13 @@ _sh_ljs_get_string(SHRuntime *shr, SHSymbolID symID);
  SHERMES_EXPORT SHLegacyValue
  _sh_ljs_create_regexp(SHRuntime *shr, SHSymbolID pattern, SHSymbolID flags);
  
@@ -1126,24 +1200,30 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..17c114b28a5108d237e7b071b082bdf7
  /// \param value the string of the BigInt.
  /// \param size  the size of the string \c value.
  SHERMES_EXPORT SHLegacyValue
-@@ -1616,6 +1800,16 @@ static inline uint32_t _sh_to_uint32_double(double d) {
+@@ -1616,6 +1807,22 @@ static inline uint32_t _sh_to_uint32_double(double d) {
    return (uint32_t)_sh_to_int32_double_slow_path(d);
  }
  
++/// Math.imul after the operands have been converted to their low 32 bits.
++static inline SHLegacyValue _sh_ljs_imul_uint32(uint32_t a, uint32_t b) {
++  uint32_t product = a * b;
++  return _sh_ljs_double(product <= INT32_MAX
++      ? (double)product : (double)product - 4294967296.0);
++}
++
 +/// Math.imul for operands already known to be numbers.
 +static inline SHLegacyValue _sh_ljs_imul_number(
 +    SHLegacyValue a,
 +    SHLegacyValue b) {
-+  uint32_t product = _sh_to_uint32_double(_sh_ljs_get_double(a)) *
-+      _sh_to_uint32_double(_sh_ljs_get_double(b));
-+  return _sh_ljs_double(product <= INT32_MAX
-+      ? (double)product : (double)product - 4294967296.0);
++  return _sh_ljs_imul_uint32(
++      _sh_to_uint32_double(_sh_ljs_get_double(a)),
++      _sh_to_uint32_double(_sh_ljs_get_double(b)));
 +}
 +
  /// Store a property into direct storage.
  SHERMES_EXPORT void _sh_prstore_direct(
      SHRuntime *shr,
-@@ -1877,6 +2071,14 @@ SHERMES_EXPORT int _sh_errno(void);
+@@ -1877,6 +2084,14 @@ SHERMES_EXPORT int _sh_errno(void);
  SHERMES_EXPORT SHLegacyValue
  _sh_asciiz_to_string(SHRuntime *shr, const char *str, ptrdiff_t len);
  
@@ -1185,7 +1265,7 @@ index 0000000000000000000000000000000000000000..60b71e00283bc2709968a3b7426c32cc
 +
 +#endif
 diff --git a/lib/BCGen/SH/PeepholeLowering.cpp b/lib/BCGen/SH/PeepholeLowering.cpp
-index f317df4027e4abfc780886ea7dae80413c43236e..399ebb19e53e54fae4c3e2d2481a4918f99d0f3b 100644
+index f317df4027e4abfc780886ea7dae80413c43236e..10c187ad63c1b226c865c15cb22456a46e1bf664 100644
 --- a/lib/BCGen/SH/PeepholeLowering.cpp
 +++ b/lib/BCGen/SH/PeepholeLowering.cpp
 @@ -6,8 +6,11 @@
@@ -1214,13 +1294,20 @@ index f317df4027e4abfc780886ea7dae80413c43236e..399ebb19e53e54fae4c3e2d2481a4918
          if (Value *replaceVal = peep(&I)) {
            if (replaceVal != &I)
              I.replaceAllUsesWith(replaceVal);
-@@ -34,10 +42,100 @@ class PeepholeLowering {
+@@ -34,10 +42,166 @@ class PeepholeLowering {
          }
        }
      }
 +    // Guard insertion splits blocks. Visit only the original comparisons so
 +    // the retained fallback cannot be specialized repeatedly.
 +    for (auto *comparison : comparisons) {
++      auto *load = llvh::dyn_cast<LoadPropertyInst>(comparison->getLeftHandSide());
++      if (!load)
++        load = llvh::dyn_cast<LoadPropertyInst>(comparison->getRightHandSide());
++      if (load && lowerSharedStringIndexComparisons(load)) {
++        changed = true;
++        continue;
++      }
 +      if (auto *result = lowerStringIndexComparison(comparison)) {
 +        if (result != comparison)
 +          comparison->replaceAllUsesWith(result);
@@ -1231,6 +1318,65 @@ index f317df4027e4abfc780886ea7dae80413c43236e..399ebb19e53e54fae4c3e2d2481a4918
    }
  
   private:
++  bool lowerSharedStringIndexComparisons(LoadPropertyInst *load) {
++    if (!F_->getParent()->getTypeContext().canBeString(load->getObject()->getType()))
++      return false;
++    if (load->hasOneUser() && load->getNextNode() == load->getUsers().front() &&
++        load->getProperty()->getType().isNumberType())
++      return false;
++
++    llvh::SmallVector<std::pair<BinaryOperatorInst *, char16_t>, 4> uses;
++    for (auto *user : load->getUsers()) {
++      if (user->getKind() != ValueKind::BinaryStrictlyEqualInstKind &&
++          user->getKind() != ValueKind::BinaryStrictlyNotEqualInstKind)
++        return false;
++      auto *comparison = llvh::cast<BinaryOperatorInst>(user);
++      auto *literal = llvh::dyn_cast<LiteralString>(
++          comparison->getLeftHandSide() == load
++              ? comparison->getRightHandSide()
++              : comparison->getLeftHandSide());
++      if (!literal)
++        return false;
++      auto text = literal->getValue().str();
++      if (text.size() > 3)
++        return false;
++      std::u16string units;
++      convertUTF8WithSurrogatesToUTF16(
++          std::back_inserter(units), text.data(), text.data() + text.size());
++      if (units.size() != 1)
++        return false;
++      uses.emplace_back(comparison, units[0]);
++    }
++    if (uses.empty())
++      return false;
++
++    // Read exactly once at the original position, before any intervening
++    // effects. A non-character result becomes -1, which cannot equal a UTF-16
++    // code unit. Comparisons can then share a number across blocks and calls.
++    builder_.setInsertionPoint(load);
++    builder_.setLocation(load->getLocation());
++    auto &context = F_->getContext();
++    auto &native = context.getNativeContext();
++    auto *signature = native.getSignature(
++        NativeCType::c_hermes_value,
++        {NativeCType::ptr, NativeCType::c_hermes_value,
++         NativeCType::c_hermes_value});
++    auto *callee = native.getExtern(
++        context.getStringTable().getString("_sh_ljs_get_indexed_char_code"),
++        signature, {}, /* declared */ true, /* include */ nullptr);
++    auto *code = builder_.createNativeCallInst(
++        Type::createNumber(), builder_.getLiteralNativeExtern(callee), signature,
++        {builder_.createGetNativeRuntimeInst(), load->getObject(),
++         load->getProperty()});
++    for (auto [comparison, character] : uses) {
++      comparison->setOperand(code, BinaryOperatorInst::LeftHandSideIdx);
++      comparison->setOperand(
++          builder_.getLiteralNumber(character), BinaryOperatorInst::RightHandSideIdx);
++    }
++    destroyer_.add(load);
++    return true;
++  }
++
 +  Value *lowerStringIndexComparison(BinaryOperatorInst *comparison) {
 +    auto *load = llvh::dyn_cast<LoadPropertyInst>(comparison->getLeftHandSide());
 +    auto *literal =
@@ -1316,10 +1462,15 @@ index f317df4027e4abfc780886ea7dae80413c43236e..399ebb19e53e54fae4c3e2d2481a4918
    /// instructions need to be created and inserted in the correct position by
    /// using the builder. Instructions for deletion should be inserted in the
 diff --git a/lib/BCGen/SH/SH.cpp b/lib/BCGen/SH/SH.cpp
-index e030d709072f96cff72bec9ee8efa3fb820266d6..027f23727e83c97038a1b5e84fbc3498f72c8686 100644
+index e030d709072f96cff72bec9ee8efa3fb820266d6..aa6db54d846aca8cf3bde7f2cc3458fe0e473462 100644
 --- a/lib/BCGen/SH/SH.cpp
 +++ b/lib/BCGen/SH/SH.cpp
-@@ -29,6 +29,7 @@
+@@ -25,10 +25,12 @@
+ #include "hermes/IR/IR.h"
+ #include "hermes/IR/IRVerifier.h"
+ #include "hermes/IR/Instrs.h"
++#include "hermes/Optimizer/Scalar/Utils.h"
+ #include "hermes/Support/BigIntSupport.h"
  #include "hermes/Support/DenseMapInfoSpecializations.h"
  #include "hermes/Support/HashString.h"
  #include "hermes/Support/UTF8.h"
@@ -1327,7 +1478,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..027f23727e83c97038a1b5e84fbc3498
  #include "hermes/VMLayouts/StackFrameLayout.h"
  #include "llvh/ADT/MapVector.h"
  
-@@ -485,6 +486,7 @@ class SHNativeJSFunctionTable {
+@@ -485,6 +487,7 @@ class SHNativeJSFunctionTable {
  };
  
  struct ModuleGen {
@@ -1335,7 +1486,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..027f23727e83c97038a1b5e84fbc3498
    /// Table containing uniqued strings for the current module.
    SHStringTable stringTable{};
  
-@@ -696,9 +698,10 @@ class InstrGen {
+@@ -696,9 +699,10 @@ class InstrGen {
    }
    llvh::raw_ostream &genStringConstReadIC(
        LiteralString *LS,
@@ -1348,7 +1499,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..027f23727e83c97038a1b5e84fbc3498
    }
  
    /// Generate a cache index. This must be used when passing parameters to API
-@@ -712,10 +715,12 @@ class InstrGen {
+@@ -712,10 +716,12 @@ class InstrGen {
        return os_ << "shUnit->write_prop_cache + " << nextWriteCacheIdx_++;
      return os_ << "get_write_prop_cache(shUnit) + " << nextWriteCacheIdx_++;
    }
@@ -1364,7 +1515,63 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..027f23727e83c97038a1b5e84fbc3498
    }
    llvh::raw_ostream &genPrivateNameIC(Value *privateName) {
      if (options_.emitCBundle)
-@@ -1109,6 +1114,54 @@ class InstrGen {
+@@ -865,9 +871,9 @@ class InstrGen {
+     generateRegister(inst);
+     os_ << " = ";
+     if (inst.getSingleOperand()->getType().isNumberType()) {
+-      os_ << "_sh_ljs_double((double)_sh_to_int32_double(_sh_ljs_get_double(";
+-      generateRegister(*inst.getSingleOperand());
+-      os_ << ")));\n";
++      os_ << "_sh_ljs_double((double)";
++      generateNumberToInt32(inst.getSingleOperand(), true);
++      os_ << ");\n";
+     } else {
+       os_
+           << (options_.smallC
+@@ -882,9 +888,9 @@ class InstrGen {
+     generateRegister(inst);
+     os_ << " = ";
+     if (inst.getSingleOperand()->getType().isNumberType()) {
+-      os_ << "_sh_ljs_double((double)_sh_to_uint32_double(_sh_ljs_get_double(";
+-      generateRegister(*inst.getSingleOperand());
+-      os_ << ")));\n";
++      os_ << "_sh_ljs_double((double)";
++      generateNumberToInt32(inst.getSingleOperand(), false);
++      os_ << ");\n";
+     } else {
+       os_
+           << (options_.smallC
+@@ -1083,6 +1089,29 @@ class InstrGen {
+     // Nothing to do here.
+     os_ << "  // PhiInst\n";
+   }
++
++  void generateNumberToInt32(Value *value, bool signedResult) {
++    const uint8_t range = getKnownIntegerRange(value);
++    if (range) {
++      // Cast the double into a type which represents every proved input before
++      // narrowing. In particular, a negative double cannot be cast directly to
++      // uint32_t, even when the final Wasm instruction happens to saturate.
++      os_ << (signedResult ? "(int32_t)" : "(uint32_t)");
++      os_ << (range & IntegerRangeInt32 ? "(int32_t)"
++              : range & IntegerRangeUint32 ? "(uint32_t)"
++                                           : "(int64_t)");
++      os_ << "_sh_ljs_get_double(";
++      generateValue(*value);
++      os_ << ")";
++    } else {
++      os_ << (signedResult ? "_sh_to_int32_double("
++                          : "_sh_to_uint32_double(");
++      os_ << "_sh_ljs_get_double(";
++      generateValue(*value);
++      os_ << "))";
++    }
++  }
++
+   void generateBinaryOperatorInst(BinaryOperatorInst &inst) {
+     os_.indent(2);
+     generateRegister(inst);
+@@ -1109,6 +1138,52 @@ class InstrGen {
      bool bothDouble = inst.getLeftHandSide()->getType().isNumberType() &&
          inst.getRightHandSide()->getType().isNumberType();
  
@@ -1406,20 +1613,18 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..027f23727e83c97038a1b5e84fbc3498
 +      os_ << "_sh_ljs_double((double)";
 +      if (!unsignedResult)
 +        os_ << "(int32_t)";
-+      os_ << "(" << (signedRightShift ? "_sh_to_int32_double("
-+                                     : "_sh_to_uint32_double(")
-+          << "_sh_ljs_get_double(";
-+      generateRegister(*inst.getLeftHandSide());
-+      os_ << ")) " << numberBitOp << " (_sh_to_uint32_double(_sh_ljs_get_double(";
-+      generateRegister(*inst.getRightHandSide());
-+      os_ << "))" << (shift ? " & 31" : "") << ")));\n";
++      os_ << "(";
++      generateNumberToInt32(inst.getLeftHandSide(), signedRightShift);
++      os_ << " " << numberBitOp << " (";
++      generateNumberToInt32(inst.getRightHandSide(), false);
++      os_ << (shift ? " & 31" : "") << ")));\n";
 +      return;
 +    }
 +
      // NOTE: this used to check whether we know that both operands are numbers
      // in the int32 range. We no longer track that information, so for now this
      // is hardcoded to false.
-@@ -1565,29 +1618,46 @@ class InstrGen {
+@@ -1565,29 +1640,46 @@ class InstrGen {
      generateValue(inst);
      os_ << " = ";
      if (auto *LS = llvh::dyn_cast<LiteralString>(inst.getProperty())) {
@@ -1472,7 +1677,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..027f23727e83c97038a1b5e84fbc3498
    }
    void generateLoadPropertyWithReceiverInst(
        LoadPropertyWithReceiverInst &inst) {
-@@ -1881,35 +1951,30 @@ class InstrGen {
+@@ -1881,35 +1973,30 @@ class InstrGen {
      hermes_fatal("DebuggerInst should have been deleted.");
    }
    void generateCreateRegExpInst(CreateRegExpInst &inst) {
@@ -1521,7 +1726,29 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..027f23727e83c97038a1b5e84fbc3498
    }
    void generateTryEndInst(TryEndInst &inst) {
      // Restore the tryState to the state of the Try enclosing the catch.
-@@ -2217,17 +2282,76 @@ class InstrGen {
+@@ -2174,13 +2261,19 @@ class InstrGen {
+     // new.target is set up in LowerCalls.
+   }
+   void generateCallInst(CallInst &inst) {
+-    if (inst.getAttributes(inst.getModule()).isNativeJSFunction) {
++    auto *targetFunc = llvh::dyn_cast<Function>(inst.getTarget());
++    // An analyzed same-unit closure uses the same native entry convention as a
++    // typed function. Retain the actual closure in the outgoing frame: its
++    // environment can differ between invocations of the same function code.
++    // A target with non-callable alternatives still needs the runtime check.
++    if (inst.getAttributes(inst.getModule()).isNativeJSFunction ||
++        (targetFunc && inst.getCalleeIsAlwaysClosure()->getValue())) {
+       // Fast paths for calling NativeJSFunction.
+       setupCallInline(inst);
+       os_.indent(2);
+       generateRegister(inst);
+       os_ << " = ";
+-      if (auto *targetFunc = llvh::dyn_cast<Function>(inst.getTarget())) {
++      if (targetFunc) {
+         // Fast path, avoid all indirection and just call the function.
+         moduleGen_.nativeFunctionTable.generateFunctionLabel(targetFunc, os_);
+         os_ << "(shr);\n";
+@@ -2217,17 +2310,84 @@ class InstrGen {
          << (uint32_t)inst.getBuiltinIndex() << ");\n";
    }
    void generateCallBuiltinInst(CallBuiltinInst &inst) {
@@ -1537,10 +1764,18 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..027f23727e83c97038a1b5e84fbc3498
 +      // Unsigned multiplication provides the specified modulo-2^32 result
 +      // without C signed overflow. Convert the high half without an
 +      // implementation-defined unsigned-to-signed cast.
-+      os_ << " = _sh_ljs_imul_number(";
-+      generateValue(*inst.getArgument(1));
-+      os_ << ", ";
-+      generateValue(*inst.getArgument(2));
++      if (getKnownIntegerRange(inst.getArgument(1)) ||
++          getKnownIntegerRange(inst.getArgument(2))) {
++        os_ << " = _sh_ljs_imul_uint32(";
++        generateNumberToInt32(inst.getArgument(1), false);
++        os_ << ", ";
++        generateNumberToInt32(inst.getArgument(2), false);
++      } else {
++        os_ << " = _sh_ljs_imul_number(";
++        generateValue(*inst.getArgument(1));
++        os_ << ", ";
++        generateValue(*inst.getArgument(2));
++      }
 +      os_ << ");\n";
 +      return;
 +    }
@@ -1602,7 +1837,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..027f23727e83c97038a1b5e84fbc3498
      os_.indent(2);
      generateRegister(inst);
      os_ << " = _sh_ljs_call_builtin(shr, frame, " << inst.getNumArguments() - 1
-@@ -2703,6 +2827,10 @@ class InstrGen {
+@@ -2703,6 +2863,10 @@ class InstrGen {
    }
    /// Convert a JS value to its corresponding native argument type.
    void convertToNativeArg(NativeCType ctype, Value *arg) {
@@ -1613,7 +1848,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..027f23727e83c97038a1b5e84fbc3498
      MachineType mt = nativeContext_.md.mapCType(ctype);
      const MachineDesc::MTD &mtd = nativeContext_.md.getMTD(mt);
      int parens = 1;
-@@ -3213,6 +3341,8 @@ void generateUnitData(
+@@ -3213,6 +3377,8 @@ void generateUnitData(
       << nextReadCacheIdx << "];\n"
       << "  SHPrivateNameCacheEntry private_name_cache_data["
       << nextPrivateNameCacheIdx << "];\n"
@@ -1622,7 +1857,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..027f23727e83c97038a1b5e84fbc3498
       << "  SHCompressedPointer object_literal_class_cache["
       << moduleGen.literalBuffers.objShapeTable.size() << "];\n};\n"
       << "SHUnit *CREATE_THIS_UNIT(void) {\n"
-@@ -3224,11 +3354,15 @@ void generateUnitData(
+@@ -3224,11 +3390,15 @@ void generateUnitData(
    OS << ",.num_symbols =" << moduleGen.stringTable.size()
       << ", .num_write_prop_cache_entries = " << nextWriteCacheIdx
       << ", .num_read_prop_cache_entries = " << nextReadCacheIdx
@@ -1871,6 +2106,30 @@ index 37debd03310953c7277fc78068647588f04fdb4a..670577ebb9a12163729e4bfc12c28309
  
        // Split the block in two and move all instructions following the call
        // to the new block.
+diff --git a/lib/Optimizer/Scalar/InstSimplify.cpp b/lib/Optimizer/Scalar/InstSimplify.cpp
+index 9fb795812592a74513db3bfe41e19d2a5485fc90..b10b32966924e1bbef3dc30311d227f13f54d33c 100644
+--- a/lib/Optimizer/Scalar/InstSimplify.cpp
++++ b/lib/Optimizer/Scalar/InstSimplify.cpp
+@@ -130,6 +130,9 @@ class InstSimplifyImpl {
+   Value *reduceAsInt32(AsInt32Inst *asInt32) {
+     auto *op = asInt32->getSingleOperand();
+ 
++    if (getKnownIntegerRange(op) & IntegerRangeInt32)
++      return op;
++
+     // If operand is a literal, try to evaluate ToNumber(operand).
+     if (auto *lit = llvh::dyn_cast<Literal>(op)) {
+       if (auto *result = evalToInt32(builder_, lit)) {
+@@ -144,6 +147,9 @@ class InstSimplifyImpl {
+   Value *reduceAsUint32(AsUint32Inst *asUint32) {
+     auto *op = asUint32->getSingleOperand();
+ 
++    if (getKnownIntegerRange(op) & IntegerRangeUint32)
++      return op;
++
+     // If operand is a literal, try to evaluate ToNumber(operand) then ToUint32.
+     if (auto *lit = llvh::dyn_cast<Literal>(op)) {
+       if (auto *result = evalToUint32(builder_, lit)) {
 diff --git a/lib/Optimizer/Scalar/LowerBuiltinCalls.cpp b/lib/Optimizer/Scalar/LowerBuiltinCalls.cpp
 index 065e083154ac7b278a2d9fb7879112312d57db45..e9e44477baaf466f12c143d4fae54ae4c7ecaa3f 100644
 --- a/lib/Optimizer/Scalar/LowerBuiltinCalls.cpp
@@ -1893,6 +2152,303 @@ index 065e083154ac7b278a2d9fb7879112312d57db45..e9e44477baaf466f12c143d4fae54ae4
      return false;
    }
  
+diff --git a/lib/Optimizer/Scalar/ObjectStackPromotion.cpp b/lib/Optimizer/Scalar/ObjectStackPromotion.cpp
+index 76c78d7f99cc498a248e8914caa0b9aa20db8bb5..5b6d872c7c6a38db02bc10db20adba820ba4f063 100644
+--- a/lib/Optimizer/Scalar/ObjectStackPromotion.cpp
++++ b/lib/Optimizer/Scalar/ObjectStackPromotion.cpp
+@@ -7,16 +7,116 @@
+ 
+ #define DEBUG_TYPE "objectstackpromotion"
+ 
++#include "hermes/IR/CFG.h"
+ #include "hermes/IR/IRBuilder.h"
+ #include "hermes/IR/Instrs.h"
+ #include "hermes/Optimizer/PassManager/Pass.h"
+ #include "hermes/Support/Statistic.h"
+ 
++#include <memory>
++
+ STATISTIC(ObjsEliminated, "Object allocations eliminated");
+ 
+ namespace hermes {
+ namespace {
+ 
++/// Distribute a copy of branch-local literal objects into their incoming
++/// blocks. Only phis may precede the copy, so each write remains after the
++/// source evaluation and before the same following effects. The destination
++/// must already exist and the source objects must have no observable aliases.
++bool lowerConditionalObjectCopies(Function *F) {
++  std::unique_ptr<DominanceInfo> dominance;
++  IRBuilder builder(F);
++  IRBuilder::InstructionDestroyer destroyer;
++  bool changed = false;
++  for (auto &BB : *F) {
++    auto first = BB.begin();
++    while (first != BB.end() && llvh::isa<PhiInst>(&*first))
++      ++first;
++    if (first == BB.end())
++      continue;
++    auto *copy = llvh::dyn_cast<CallBuiltinInst>(&*first);
++    if (!copy || copy->getBuiltinIndex() !=
++            BuiltinMethod::HermesBuiltin_copyDataProperties ||
++        copy->getNumArguments() != 3)
++      continue;
++    auto *target = llvh::dyn_cast<AllocObjectLiteralInst>(copy->getArgument(1));
++    auto *phi = llvh::dyn_cast<PhiInst>(copy->getArgument(2));
++    if (!target || !phi || phi->getParent() != &BB || !phi->hasOneUser() ||
++        phi->getNumEntries() > 8)
++      continue;
++    if (!dominance)
++      dominance = std::make_unique<DominanceInfo>(F);
++
++    struct Source {
++      BasicBlock *block;
++      llvh::SmallVector<std::pair<Literal *, Value *>, 8> fields;
++    };
++    llvh::SmallVector<Source, 2> sources;
++    bool eligible = true;
++    for (unsigned i = 0; i < phi->getNumEntries(); ++i) {
++      auto [value, block] = phi->getEntry(i);
++      auto *alloc = llvh::dyn_cast<AllocObjectLiteralInst>(value);
++      // Only an ordinary branch may move the definitions to the predecessor;
++      // TryStart/TryEnd terminators would cross an exception-handler boundary.
++      auto *branch = llvh::dyn_cast<BranchInst>(block->getTerminator());
++      if (!alloc || alloc->getParent() != block || !branch ||
++          branch->getBranchDest() != &BB ||
++          !dominance->properlyDominates(target, branch) ||
++          alloc->getKeyValuePairCount() > 8) {
++        eligible = false;
++        break;
++      }
++      for (const auto &source : sources)
++        if (source.block == block)
++          eligible = false;
++      Source source{block, {}};
++      for (unsigned key = 0; key < alloc->getKeyValuePairCount(); ++key) {
++        auto *name = alloc->getKey(key);
++        if (!llvh::isa<LiteralString>(name) &&
++            !llvh::isa<LiteralNumber>(name))
++          eligible = false;
++        source.fields.emplace_back(name, alloc->getValue(key));
++      }
++      for (auto *user : alloc->getUsers()) {
++        if (user == phi)
++          continue;
++        auto *store = llvh::dyn_cast<PrStoreInst>(user);
++        if (!store || store->getParent() != block ||
++            store->getObject() != alloc || store->getStoredValue() == alloc ||
++            store->getPropIndex() >= source.fields.size()) {
++          eligible = false;
++          break;
++        }
++      }
++      if (!eligible)
++        break;
++      // Use the last store to each own data field, in execution order. Calls
++      // producing these values remain at their original positions.
++      for (auto &I : *block)
++        if (auto *store = llvh::dyn_cast<PrStoreInst>(&I))
++          if (store->getObject() == alloc)
++            source.fields[store->getPropIndex()].second = store->getStoredValue();
++      sources.push_back(std::move(source));
++    }
++    if (!eligible)
++      continue;
++    for (const auto &source : sources) {
++      builder.setInsertionPoint(source.block->getTerminator());
++      builder.setLocation(copy->getLocation());
++      for (auto [key, value] : source.fields)
++        builder.createDefineOwnPropertyInst(
++            value, target, key, IRBuilder::PropEnumerable::Yes);
++    }
++    copy->replaceAllUsesWith(target);
++    // Remove the use now, so the phi is dead before the promotion scan below.
++    copy->eraseFromParent();
++    destroyer.add(phi);
++    changed = true;
++  }
++  return changed;
++}
++
+ /// Try to promote the given object to a series of AllocStackInsts if it does
+ /// not escape its enclosing function. If successful, \p alloc and all of its
+ /// users are eliminated and replaced with stack operations. For now, this only
+@@ -239,7 +339,7 @@ bool tryPromoteObject(
+ }
+ 
+ bool runObjectStackPromotion(Function *F) {
+-  bool changed = false;
++  bool changed = lowerConditionalObjectCopies(F);
+   // Iterate over all instructions in the function and try to promote any
+   // BaseAllocObjectLiteralInsts.
+   IRBuilder::InstructionDestroyer destroyer;
+diff --git a/lib/Optimizer/Scalar/TypeInference.cpp b/lib/Optimizer/Scalar/TypeInference.cpp
+index 46a5d8124530df028429ac655bfb16f200e496d1..791f49df3bb733a9070852674f78f12f8f659411 100644
+--- a/lib/Optimizer/Scalar/TypeInference.cpp
++++ b/lib/Optimizer/Scalar/TypeInference.cpp
+@@ -195,12 +195,12 @@ static Type inferBinaryBitwise(TypeContext &tc, BinaryOperatorInst *BOI) {
+   Type LeftTy = BOI->getLeftHandSide()->getType();
+   Type RightTy = BOI->getRightHandSide()->getType();
+ 
+-  Type mayBeBigInt = tc.canBeBigInt(LeftTy) && tc.canBeBigInt(RightTy)
++  Type mayBeBigInt = isBigIntOrObject(tc, LeftTy) && isBigIntOrObject(tc, RightTy)
+       ? Type::createBigInt()
+       : Type::createNoType();
+ 
+-  // ?? - ?? => Int32|?BigInt. BigInt is only possible if both operands can be
+-  // BigInt due to the no automatic BigInt conversion.
++  // Object operands can produce BigInt through ToPrimitive. Number-only
++  // consumers must not bypass that possibility based on the object type.
+   return tc.unionTy(Type::createInt32(), mayBeBigInt);
+ }
+ 
+diff --git a/lib/Optimizer/Scalar/Utils.cpp b/lib/Optimizer/Scalar/Utils.cpp
+index fb9deef455b150ee12c1f859daf0ca304f3a538c..4bfa6c1cdea9c02e1243be759196b5bbc80cb7bb 100644
+--- a/lib/Optimizer/Scalar/Utils.cpp
++++ b/lib/Optimizer/Scalar/Utils.cpp
+@@ -15,9 +15,74 @@
+ #include "hermes/IR/Instrs.h"
+ 
+ #include "llvh/ADT/SetVector.h"
++#include "llvh/ADT/SmallPtrSet.h"
+ 
+ namespace hermes {
+ 
++uint8_t getKnownIntegerRange(Value *value) {
++  constexpr uint8_t all = IntegerRangeInt32 | IntegerRangeUint32 |
++      IntegerRangeInt32OrUint32;
++  uint8_t range = all;
++  bool hasInput = false;
++  llvh::SmallVector<Value *, 8> pending{value};
++  llvh::SmallPtrSet<Value *, 16> visited;
++  while (!pending.empty()) {
++    auto *input = pending.pop_back_val();
++    if (!visited.insert(input).second)
++      continue;
++    if (visited.size() > 64 || !input->getType().isNumberType())
++      return IntegerRangeUnknown;
++
++    uint8_t constraint = IntegerRangeUnknown;
++    if (auto *number = llvh::dyn_cast<LiteralNumber>(input)) {
++      if (number->isInt32Representible())
++        constraint |= IntegerRangeInt32 | IntegerRangeInt32OrUint32;
++      if (number->isUInt32Representible())
++        constraint |= IntegerRangeUint32 | IntegerRangeInt32OrUint32;
++    } else if (auto *phi = llvh::dyn_cast<PhiInst>(input)) {
++      // A cycle is only proved when all of its external inputs are proved.
++      // No constraint is inferred solely from a self-referential phi.
++      for (unsigned i = 0, e = phi->getNumEntries(); i < e; ++i)
++        pending.push_back(phi->getEntry(i).first);
++      continue;
++    } else if (auto *inst = llvh::dyn_cast<Instruction>(input)) {
++      switch (inst->getKind()) {
++        case ValueKind::MovInstKind:
++        case ValueKind::LIRLoadConstInstKind:
++        case ValueKind::LIRSpillMovInstKind:
++        case ValueKind::UnionNarrowTrustedInstKind:
++          pending.push_back(inst->getOperand(0));
++          continue;
++        case ValueKind::AsInt32InstKind:
++        case ValueKind::UnaryTildeInstKind:
++        case ValueKind::BinaryAndInstKind:
++        case ValueKind::BinaryOrInstKind:
++        case ValueKind::BinaryXorInstKind:
++        case ValueKind::BinaryLeftShiftInstKind:
++        case ValueKind::BinaryRightShiftInstKind:
++          constraint = IntegerRangeInt32 | IntegerRangeInt32OrUint32;
++          break;
++        case ValueKind::AsUint32InstKind:
++        case ValueKind::BinaryUnsignedRightShiftInstKind:
++          constraint = IntegerRangeUint32 | IntegerRangeInt32OrUint32;
++          break;
++        case ValueKind::CallBuiltinInstKind:
++          if (llvh::cast<CallBuiltinInst>(inst)->getBuiltinIndex() ==
++              BuiltinMethod::Math_imul)
++            constraint = IntegerRangeInt32 | IntegerRangeInt32OrUint32;
++          break;
++        default:
++          break;
++      }
++    }
++    range &= constraint;
++    if (!range)
++      return IntegerRangeUnknown;
++    hasInput = true;
++  }
++  return hasInput ? range : uint8_t(IntegerRangeUnknown);
++}
++
+ Value *isStoreOnceVariable(Variable *V) {
+   Value *res = nullptr;
+ 
+diff --git a/lib/Platform/Unicode/CharacterProperties.cpp b/lib/Platform/Unicode/CharacterProperties.cpp
+index 436938927766c1632b583b7786c44e6553a694fc..3ddd8ca28d0d2866ab4366a5ae5339c657ade1d9 100644
+--- a/lib/Platform/Unicode/CharacterProperties.cpp
++++ b/lib/Platform/Unicode/CharacterProperties.cpp
+@@ -9,6 +9,7 @@
+ #include "hermes/Platform/Unicode/CodePointSet.h"
+ 
+ #include <algorithm>
++#include <array>
+ #include <climits>
+ #include <iterator>
+ #include <string>
+@@ -166,6 +167,36 @@ static bool operator<(const UnicodeTransformRange &m, uint32_t cp) {
+   return m.start + m.count <= cp;
+ }
+ 
++struct TransformPage {
++  uint16_t begin;
++  uint16_t end;
++};
++
++template <const auto &Ranges>
++static constexpr auto indexTransformPages() {
++  constexpr size_t size = std::size(Ranges);
++  static_assert(size <= UINT16_MAX, "transform indices must fit in a page");
++  constexpr size_t pageCount =
++      (Ranges[size - 1].start + Ranges[size - 1].count + 255) / 256;
++  std::array<TransformPage, pageCount> pages{};
++  size_t begin = 0;
++  for (size_t page = 0; page < pageCount; ++page) {
++    while (begin < size &&
++           Ranges[begin].start + Ranges[begin].count <= page * 256)
++      ++begin;
++    size_t end = begin;
++    while (end < size && Ranges[end].start < (page + 1) * 256)
++      ++end;
++    pages[page] = {static_cast<uint16_t>(begin), static_cast<uint16_t>(end)};
++  }
++  return pages;
++}
++
++// Retain ranges crossing a page boundary in both pages. Empty pages require
++// no search, and supplementary planes after the last transform need no table.
++static constexpr auto unicodeFoldPages = indexTransformPages<UNICODE_FOLDS>();
++static constexpr auto legacyCanonPages = indexTransformPages<LEGACY_CANONS>();
++
+ /// Find all code points which canonicalize to a value in \p range, and add them
+ /// to \p receiver. This is a slow linear search across all ranges.
+ static void addPrecanonicalCharacters(
+@@ -250,9 +281,16 @@ CodePointSet makeCanonicallyEquivalent(const CodePointSet &set, bool unicode) {
+ }
+ 
+ uint32_t canonicalize(uint32_t cp, bool unicode) {
+-  const auto start =
++  const auto table =
+       unicode ? std::begin(UNICODE_FOLDS) : std::begin(LEGACY_CANONS);
+-  const auto end = unicode ? std::end(UNICODE_FOLDS) : std::end(LEGACY_CANONS);
++  const auto *pages = unicode ? unicodeFoldPages.data() : legacyCanonPages.data();
++  const size_t pageCount =
++      unicode ? unicodeFoldPages.size() : legacyCanonPages.size();
++  if ((cp >> 8) >= pageCount)
++    return cp;
++  const auto page = pages[cp >> 8];
++  const auto start = table + page.begin;
++  const auto end = table + page.end;
+   auto where = std::lower_bound(start, end, cp);
+   if (where != end && where->start <= cp && cp < where->start + where->count) {
+     return applyTransform(*where, cp);
 diff --git a/lib/Sema/FlowChecker-expr.cpp b/lib/Sema/FlowChecker-expr.cpp
 index da432ba756ec3e7a3faa4daf4a564e9bfe951fa6..603f366ef682895b4fb2b8fdc005249c5703c22f 100644
 --- a/lib/Sema/FlowChecker-expr.cpp
@@ -2108,7 +2664,7 @@ index 8ec678009b859224058f4efdf333e17e458750bc..df57095cdebcc995be485e86d175bf33
    flags_.fastIndexProperties = true;
  }
 diff --git a/lib/VM/StaticH.cpp b/lib/VM/StaticH.cpp
-index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..35d77fec80bfc155f736aae33da0d7e83f71fac2 100644
+index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..648e6985e5bda204a35e96973b64d86eb1614c08 100644
 --- a/lib/VM/StaticH.cpp
 +++ b/lib/VM/StaticH.cpp
 @@ -7,6 +7,7 @@
@@ -2151,10 +2707,59 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..35d77fec80bfc155f736aae33da0d7e8
  namespace {
  /// Convert the given \p cr to a \c CallResult<HermesValue>.
  template <typename T>
-@@ -209,6 +225,45 @@ extern "C" void _sh_ljs_reify_arguments_strict(
+@@ -209,6 +225,68 @@ extern "C" void _sh_ljs_reify_arguments_strict(
    reifyArguments(shr, frame, lazyReg, true);
  }
  
++static int32_t readIndexedCharacter(
++    SHRuntime *shr,
++    SHLegacyValue source,
++    SHLegacyValue key) {
++  auto value = *toPHV(&source);
++  auto keyValue = *toPHV(&key);
++  uint32_t index;
++  if (value.isString() && keyValue.isNumber() &&
++      sh_tryfast_f64_to_u32(keyValue.getNumber(), index) &&
++      index < value.getString()->getStringLength())
++    return value.getString()->at(index);
++
++  Runtime &runtime = getRuntime(shr);
++  auto result = [&]() -> CallResult<int32_t> {
++    GCScopeMarkerRAII marker{runtime};
++    struct : Locals {
++      PinnedValue<> source;
++      PinnedValue<> key;
++    } lv;
++    LocalsRAII lraii{runtime, &lv};
++    // Native calls pass values by copy. Root both before property-key coercion
++    // or a getter can collect, and leave every RAII scope before throwing to JS.
++    lv.source = value;
++    lv.key = keyValue;
++    auto read = lv.source->isObject()
++        ? JSObject::getComputed_RJS(
++              Handle<JSObject>::vmcast(&lv.source), runtime, lv.key)
++        : Interpreter::getByValTransient_RJS(runtime, lv.source, lv.key);
++    if (LLVM_UNLIKELY(read == ExecutionStatus::EXCEPTION))
++      return ExecutionStatus::EXCEPTION;
++    auto observed = read->getHermesValue();
++    if (observed.isString() && observed.getString()->getStringLength() == 1)
++      return int32_t(observed.getString()->at(0));
++    return -1;
++  }();
++  if (LLVM_UNLIKELY(result == ExecutionStatus::EXCEPTION))
++    _sh_throw_current(shr);
++  return result.getValue();
++}
++
++LLVM_ATTRIBUTE_NOINLINE
++extern "C" SHLegacyValue _sh_ljs_get_indexed_char_code(
++    SHRuntime *shr,
++    SHLegacyValue source,
++    SHLegacyValue key) {
++  return HermesValue::encodeTrustedNumberValue(
++      readIndexedCharacter(shr, source, key));
++}
++
 +LLVM_ATTRIBUTE_NOINLINE
 +extern "C" SHLegacyValue _sh_ljs_string_index_compare(
 +    SHRuntime *shr,
@@ -2162,42 +2767,16 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..35d77fec80bfc155f736aae33da0d7e8
 +    double key,
 +    uint16_t character,
 +    uint8_t invert) {
-+  auto value = *toPHV(&source);
-+  assert(value.isString() && "compiler must prove a primitive string");
-+  uint32_t index;
-+  auto *str = value.getString();
-+  if (sh_tryfast_f64_to_u32(key, index) && index < str->getStringLength())
-+    return HermesValue::encodeBoolValue((str->at(index) == character) != invert);
-+
-+  Runtime &runtime = getRuntime(shr);
-+  auto result = [&]() -> CallResult<bool> {
-+    GCScopeMarkerRAII marker{runtime};
-+    struct : Locals {
-+      PinnedValue<> source;
-+      PinnedValue<> key;
-+    } lv;
-+    LocalsRAII lraii{runtime, &lv};
-+    // Native calls pass values by copy. Root the copies before a prototype
-+    // getter can collect, and leave every RAII scope before throwing to JS.
-+    lv.source = value;
-+    lv.key = HermesValue::encodeTrustedNumberValue(key);
-+    auto read = Interpreter::getByValTransient_RJS(runtime, lv.source, lv.key);
-+    if (LLVM_UNLIKELY(read == ExecutionStatus::EXCEPTION))
-+      return ExecutionStatus::EXCEPTION;
-+    auto observed = read->getHermesValue();
-+    return observed.isString() &&
-+        observed.getString()->getStringLength() == 1 &&
-+        observed.getString()->at(0) == character;
-+  }();
-+  if (LLVM_UNLIKELY(result == ExecutionStatus::EXCEPTION))
-+    _sh_throw_current(shr);
-+  return HermesValue::encodeBoolValue(result.getValue() != invert);
++  assert(toPHV(&source)->isString() && "compiler must prove a primitive string");
++  int32_t code = readIndexedCharacter(
++      shr, source, HermesValue::encodeTrustedNumberValue(key));
++  return HermesValue::encodeBoolValue((code == character) != invert);
 +}
 +
  LLVM_ATTRIBUTE_NOINLINE
  extern "C" SHLegacyValue _sh_ljs_get_by_val_with_receiver_rjs(
      SHRuntime *shr,
-@@ -288,6 +343,64 @@ _sh_ljs_get_by_index_rjs(SHRuntime *shr, SHLegacyValue *source, uint32_t key) {
+@@ -288,6 +366,64 @@ _sh_ljs_get_by_index_rjs(SHRuntime *shr, SHLegacyValue *source, uint32_t key) {
    return res->getHermesValue();
  }
  
@@ -2262,7 +2841,7 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..35d77fec80bfc155f736aae33da0d7e8
  LLVM_ATTRIBUTE_NOINLINE
  extern "C" SHLegacyValue _sh_ljs_get_own_private_by_sym(
      SHRuntime *shr,
-@@ -1264,8 +1377,25 @@ static inline HermesValue getByIdWithReceiver_RJS(
+@@ -1264,8 +1400,25 @@ static inline HermesValue getByIdWithReceiver_RJS(
      CallResult<PseudoHandle<>> resPH{ExecutionStatus::EXCEPTION};
      {
        GCScopeMarkerRAII marker{runtime};
@@ -2290,7 +2869,7 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..35d77fec80bfc155f736aae33da0d7e8
      }
      if (LLVM_UNLIKELY(resPH == ExecutionStatus::EXCEPTION))
        _sh_throw_current(getSHRuntime(runtime));
-@@ -1411,6 +1541,36 @@ extern "C" SHLegacyValue _sh_ljs_get_by_id_rjs(
+@@ -1411,6 +1564,36 @@ extern "C" SHLegacyValue _sh_ljs_get_by_id_rjs(
        reinterpret_cast<ReadPropertyCacheEntry *>(propCacheEntry));
  }
  
@@ -2327,7 +2906,7 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..35d77fec80bfc155f736aae33da0d7e8
  LLVM_ATTRIBUTE_NOINLINE
  extern "C" SHLegacyValue _sh_ljs_get_by_id_with_receiver_rjs(
      SHRuntime *shr,
-@@ -1792,6 +1952,25 @@ _sh_ljs_create_regexp(SHRuntime *shr, SHSymbolID pattern, SHSymbolID flags) {
+@@ -1792,6 +1975,25 @@ _sh_ljs_create_regexp(SHRuntime *shr, SHSymbolID pattern, SHSymbolID flags) {
    return *cr;
  }
  
@@ -2353,7 +2932,7 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..35d77fec80bfc155f736aae33da0d7e8
  LLVM_ATTRIBUTE_NOINLINE
  extern "C" SHLegacyValue
  _sh_ljs_create_bigint(SHRuntime *shr, const uint8_t *value, uint32_t size) {
-@@ -2727,3 +2906,32 @@ _sh_asciiz_to_string(SHRuntime *shr, const char *str, ptrdiff_t len) {
+@@ -2727,3 +2929,32 @@ _sh_asciiz_to_string(SHRuntime *shr, const char *str, ptrdiff_t len) {
      _sh_throw_current(shr);
    return *res;
  }
@@ -2573,6 +3152,135 @@ index 0000000000000000000000000000000000000000..5367c18e5e97cec657763309f555a53f
 +
 +// C: _sh_ljs_get_by_val_cached_rjs_inline
 +// C: _sh_to_uint32_double(_sh_ljs_get_double
+diff --git a/test/shermes/conditional-object-spread.js b/test/shermes/conditional-object-spread.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..bc1bf6d514ea751fa6e2bb53831188da9b74dbcf
+--- /dev/null
++++ b/test/shermes/conditional-object-spread.js
+@@ -0,0 +1,123 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++// RUN: %shermes -O -exec %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -Xsmall-c -exec %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O0 -exec %s | %FileCheck --match-full-lines %s
++// RUN: %hermes -O %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -dump-ir -Xdump-functions=optional %s | %FileCheck --check-prefix=IR %s
++// RUN: %shermes -O -dump-ir -Xdump-functions=inLoop %s | %FileCheck --check-prefix=LOOP %s
++
++function optional(flag, value) {
++  'noinline';
++  return {base: 1, ...(flag ? {item: value} : {}), tail: 2};
++}
++for (var flag of [false, true]) {
++  var result = optional(flag, 7);
++  print(Object.keys(result).join(' '), JSON.stringify(result));
++}
++var order = '';
++function observe(label, value) { order += label; gc(); return value; }
++function sequence(flag) {
++  'noinline';
++  return {a: observe('a', 1),
++          ...(flag ? {b: observe('b', 2), a: observe('c', 3)} : {}),
++          c: observe('d', 4)};
++}
++print(JSON.stringify(sequence(false)), order);
++order = '';
++print(JSON.stringify(sequence(true)), order);
++function alternatives(flag) {
++  'noinline';
++  return {start: 0, ...(flag ? {x: 1, y: 2} : {y: 3, x: 4}), end: 5};
++}
++print(JSON.stringify(alternatives(false)), JSON.stringify(alternatives(true)));
++function keys(flag) {
++  'noinline';
++  return {b: 2, ...(flag ? {2: 'two', 1: 'one', ['__proto__']: 'own'} : {}), a: 1};
++}
++var keyed = keys(true);
++print(Object.keys(keyed).join(' '), keyed.__proto__, Object.getPrototypeOf(keyed) === Object.prototype);
++
++// The source is observable here; mutation, accessors, symbols and proxy traps
++// must remain part of the ordinary CopyDataProperties operation.
++function exposed(flag, change) {
++  'noinline';
++  var source = flag ? {x: 1} : {};
++  change(source);
++  return {start: 0, ...source};
++}
++print(JSON.stringify(exposed(true, value => { value.x = 9; value.y = 3; })));
++var reads = 0;
++print(JSON.stringify(exposed(false, value => Object.defineProperty(value, 'x', {
++  enumerable: true, get() { gc(); ++reads; return 11; }
++}))), reads);
++var symbol = Symbol('key');
++var symbols = exposed(false, value => { value[symbol] = 13; });
++print(symbols[symbol], Object.getOwnPropertySymbols(symbols).length);
++var traps = '';
++var proxy = new Proxy({x: 17}, {
++  ownKeys(target) { traps += 'k'; return Reflect.ownKeys(target); },
++  getOwnPropertyDescriptor(target, key) { traps += 'd'; return Reflect.getOwnPropertyDescriptor(target, key); },
++  get(target, key) { traps += 'g'; return target[key]; }
++});
++function external(flag, source) { 'noinline'; return {...(flag ? source : {})}; }
++print(JSON.stringify(external(true, proxy)), traps);
++
++var marker = {};
++function caught(flag) {
++  'noinline';
++  try { return {a: 1, ...(flag ? {x: observe('t', 1), y: (() => { throw marker; })()} : {}), b: 2}; }
++  catch (error) { gc(); return error === marker; }
++}
++print(JSON.stringify(caught(false)), caught(true));
++function many() {
++  'noinline';
++  var results = [];
++  for (var i = 0; i < 4; ++i) results.push(optional(i & 1, i));
++  return results;
++}
++print(JSON.stringify(many()));
++
++var closed = 0;
++function* values() { try { yield 1; yield 2; yield 3; } finally { ++closed; } }
++function inLoop(flag) {
++  'noinline';
++  var items = [];
++  for (var value of values()) {
++    var item = {base: value, ...(flag ? {item: observe('l', value)} : {})};
++    items.push(item);
++    if (value === 2) throw items;
++  }
++}
++try { inLoop(true); } catch (items) { print(JSON.stringify(items), closed); }
++
++// CHECK: base tail {"base":1,"tail":2}
++// CHECK-NEXT: base item tail {"base":1,"item":7,"tail":2}
++// CHECK-NEXT: {"a":1,"c":4} ad
++// CHECK-NEXT: {"a":3,"b":2,"c":4} abcd
++// CHECK-NEXT: {"start":0,"y":3,"x":4,"end":5} {"start":0,"x":1,"y":2,"end":5}
++// CHECK-NEXT: 1 2 b __proto__ a own true
++// CHECK-NEXT: {"start":0,"x":9,"y":3}
++// CHECK-NEXT: {"start":0,"x":11} 1
++// CHECK-NEXT: 13 1
++// CHECK-NEXT: {"x":17} kdg
++// CHECK-NEXT: {"a":1,"b":2} true
++// CHECK-NEXT: [{"base":1,"tail":2},{"base":1,"item":1,"tail":2},{"base":1,"tail":2},{"base":1,"item":3,"tail":2}]
++// CHECK-NEXT: [{"base":1,"item":1},{"base":2,"item":2}] 1
++// IR-LABEL: function optional(
++// IR: AllocObjectLiteralInst
++// IR-NOT: AllocObjectLiteralInst
++// IR-NOT: copyDataProperties
++// IR: function_end
++// LOOP-LABEL: function inLoop(
++// LOOP: TryStartInst
++// LOOP-NOT: copyDataProperties
++// LOOP: AllocObjectLiteralInst
++// LOOP-NOT: copyDataProperties
++// LOOP-NOT: AllocObjectLiteralInst
++// LOOP: function_end
 diff --git a/test/shermes/ffi/string_write_utf8.js b/test/shermes/ffi/string_write_utf8.js
 new file mode 100644
 index 0000000000000000000000000000000000000000..a9b0fbf317cd44e6d158d1885f766e235d0adbd6
@@ -2731,6 +3439,113 @@ index 0000000000000000000000000000000000000000..7a059ff20c9b43d5a245c22530c01f74
 +// IR-NOT: LoadPropertyInst
 +// IR-NOT: CallInst
 +// IR: function_end
+diff --git a/test/shermes/integer-value-proofs.js b/test/shermes/integer-value-proofs.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..a419b2737f4b3da13222a6fe8f3442a72288d7d4
+--- /dev/null
++++ b/test/shermes/integer-value-proofs.js
+@@ -0,0 +1,101 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++// RUN: %shermes -O -fstatic-math-builtins -exec %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -fstatic-math-builtins -Xsmall-c -exec %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O0 -exec %s | %FileCheck --match-full-lines %s
++// RUN: %hermes -O %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -fstatic-math-builtins -emit-c -o %t.c %s
++// RUN: %FileCheck --check-prefix=C --input-file=%t.c %s
++
++function known(a, b) {
++  "noinline";
++  var x = Math.imul(+a, +b);
++  return (((x << 5) | (x >>> 27)) ^ (x >> 7)) >>> 0;
++}
++// C-LABEL: static SHLegacyValue _{{[0-9]+}}_known(SHRuntime *shr) {
++// C: _sh_ljs_imul_number(
++// C-NOT: _sh_to_uint32_double
++// C-NOT: _sh_to_int32_double
++// C-LABEL: static SHLegacyValue _{{[0-9]+}}_bounded(SHRuntime *shr) {
++
++function bounded(x, y, n) {
++  "noinline";
++  x = x | 0;
++  y = y >>> 0;
++  while (n-- > 0) {
++    x = Math.imul(((x << 13) | (x >>> 19)) ^ y, 0x85ebca6b);
++    y = (y + (x >>> 0)) >>> 0;
++  }
++  return [x, x >>> 0, y, y | 0];
++}
++// C: _sh_ljs_imul_uint32(
++// C: (uint32_t)(int32_t)_sh_ljs_get_double(
++// C-LABEL: static SHLegacyValue _{{[0-9]+}}_mixed(SHRuntime *shr) {
++
++function mixed(a, b, flag) {
++  "noinline";
++  var x = flag ? a | 0 : b >>> 0;
++  return Math.imul(x, 5) >>> 0;
++}
++// C: _sh_ljs_imul_uint32((uint32_t)(int64_t)_sh_ljs_get_double(
++
++function remainder(x, y) {
++  "noinline";
++  var r = +x % +y;
++  return [r, r | 0, r >>> 0, Math.imul(r, 5)];
++}
++function stringify(values) {
++  return values.map(x => Object.is(x, -0) ? '-0' : String(x)).join(' ');
++}
++print(stringify(remainder(3.9, 2)), stringify(remainder(-4, 2)));
++print(stringify(remainder(Infinity, 2)), stringify(remainder(4294967295, 1e20)));
++
++var values = [-Infinity, -1e100, -4294967297, -2147483649, -2147483648,
++              -3.9, -0, 0, 0.9, 1, 2147483647, 2147483648, 4294967295,
++              4294967296, 1e100, Infinity, NaN];
++var digest = 0, comparisons = 0;
++for (var a of values) {
++  for (var b of values) {
++    var results = [known(a, b), ...bounded(a, b, 4),
++                   mixed(a, b, true), mixed(a, b, false)];
++    for (var result of results) {
++      digest = (Math.imul(digest, 31) + result) | 0;
++      ++comparisons;
++    }
++  }
++}
++print(comparisons, digest);
++
++var order = '';
++function operand(label, value) {
++  return {valueOf() { order += label; return value; }};
++}
++print(known(operand('a', -3.9), operand('b', 2.8)), order);
++print(mixed(-1, 0xffffffff, true), mixed(-1, 0xffffffff, false));
++function bigObjects() {
++  "noinline";
++  var left = {valueOf() { return 6n; }};
++  var right = {valueOf() { return 3n; }};
++  return [(left & right) | 1n, (left ^ right) & 7n, (left | right) ^ 1n];
++}
++print(bigObjects().map(String).join(' '));
++function mixedBigInt() {
++  "noinline";
++  var left = {valueOf() { return 6n; }};
++  var right = {valueOf() { return 3n; }};
++  return (left & right) | 0;
++}
++try { mixedBigInt(); } catch (e) { print(e.name); }
++
++// CHECK: 1.9 1 1 5 -0 0 0 0
++// CHECK-NEXT: NaN 0 0 0 4294967295 -1 4294967295 -5
++// CHECK-NEXT: 2023 118213184
++// CHECK-NEXT: 160 ab
++// CHECK-NEXT: 4294967291 4294967291
++// CHECK-NEXT: 3 5 6
++// CHECK-NEXT: TypeError
 diff --git a/test/shermes/known-callback-targets.js b/test/shermes/known-callback-targets.js
 new file mode 100644
 index 0000000000000000000000000000000000000000..fdd106156d1791cf2ae31b4707c5d448f131a474
@@ -2854,6 +3669,74 @@ index 0000000000000000000000000000000000000000..fdd106156d1791cf2ae31b4707c5d448
 +// TARGET: CallInst {{.*}} %callback(): functionCode, true: boolean, empty: any
 +// LOOSE-LABEL: function aliased(
 +// LOOSE: CallInst {{.*}} empty: any, false: boolean, empty: any
+diff --git a/test/shermes/known-native-call.js b/test/shermes/known-native-call.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..0df55fd7a9c584b6a8b746b6ad9ca3aa3f8cc616
+--- /dev/null
++++ b/test/shermes/known-native-call.js
+@@ -0,0 +1,62 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++// RUN: %shermes -O -fno-inline -exec %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -fno-inline -Xsmall-c -exec %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O0 -exec %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -fno-inline -emit-c -o %t.c %s
++// RUN: %FileCheck --check-prefix=C --input-file=%t.c %s
++
++(function () {
++  'use strict';
++  function make(value) {
++    function read(add) { gc(); return value + add; }
++    return function invokeKnown(add) { return read(add); };
++  }
++  var first = make(11), second = make(23);
++  print(first(2), second(3), first(4));
++
++  function choose(flag) {
++    var reader = flag ? function () { return 17; } : undefined;
++    return reader();
++  }
++  print(choose(true));
++  try { choose(false); } catch (e) { print(e.name); }
++
++  function Value(value) { this.value = value; }
++  function construct(value) { return new Value(value); }
++  print(construct(29).value);
++  var arrow = () => 31;
++  try { new arrow(); } catch (e) { print(e.name); }
++  class Item { constructor(value) { this.value = value; } }
++  print(new Item(37).value);
++  try { Item(41); } catch (e) { print(e.name); }
++
++  function nestedThrow() { gc(); throw 'marker'; }
++  function catches() { try { return nestedThrow(); } catch (e) { return e; } }
++  print(catches());
++  function recursive(n) { return n === 0 ? 1 : n * recursive(n - 1); }
++  print(recursive(6));
++  function* sequence(value) { yield value; yield value + 1; }
++  print(Array.from(sequence(43)).join(' '));
++})();
++
++// CHECK: 13 26 15
++// CHECK-NEXT: 17
++// CHECK-NEXT: TypeError
++// CHECK-NEXT: 29
++// CHECK-NEXT: TypeError
++// CHECK-NEXT: 37
++// CHECK-NEXT: TypeError
++// CHECK-NEXT: marker
++// CHECK-NEXT: 720
++// CHECK-NEXT: 43 44
++// C-LABEL: static SHLegacyValue _{{[0-9]+}}_invokeKnown(SHRuntime *shr) {
++// C-NOT: _sh_ljs_call(
++// C: = _{{[0-9]+}}_read(shr);
++// C-NOT: _sh_ljs_call(
++// C: _sh_leave(shr, &locals.head, frame);
 diff --git a/test/shermes/native-literal-builtins.js b/test/shermes/native-literal-builtins.js
 new file mode 100644
 index 0000000000000000000000000000000000000000..52f3e73c2678a0fd83a60eb5c200e8de6fd9d473
@@ -3078,10 +3961,10 @@ index 0000000000000000000000000000000000000000..d680d6a3bd247c9ce391b7cfb419837e
 +// CHECK: named reads passed
 diff --git a/test/shermes/string-index-comparison.js b/test/shermes/string-index-comparison.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..095ca00cdd95b0f0f3207025384838be3627c0bb
+index 0000000000000000000000000000000000000000..343c62aa481ed86a0d2ec7d9d31189d4fb2b85df
 --- /dev/null
 +++ b/test/shermes/string-index-comparison.js
-@@ -0,0 +1,122 @@
+@@ -0,0 +1,183 @@
 +/**
 + * Copyright (c) Meta Platforms, Inc. and affiliates.
 + *
@@ -3203,7 +4086,68 @@ index 0000000000000000000000000000000000000000..095ca00cdd95b0f0f3207025384838be
 +print(matches);
 +// CHECK-NEXT: 100
 +
-+// C: _sh_ljs_string_index_compare(
++// C-DAG: _sh_ljs_string_index_compare(
++// C-DAG: _sh_ljs_get_indexed_char_code(
++
++
++function sharedCharacter(source, key) {
++  "noinline";
++  var c = source[key];
++  return (c === 'x' ? 1 : 0) | (c === 'y' ? 2 : 0) |
++         (c === '\uD800' ? 4 : 0) | (c !== 'x' ? 8 : 0) |
++         (c === '\0' ? 16 : 0) | (c === '\uFFFF' ? 32 : 0);
++}
++print(sharedCharacter('xy', 0), sharedCharacter('xy', 1),
++      sharedCharacter('\uD800\uDC00', 0), sharedCharacter('\uD800\uDC00', 1),
++      sharedCharacter('\0', 0), sharedCharacter('\uFFFF', 0));
++// CHECK-NEXT: 1 10 12 8 24 40
++print(sharedCharacter('', 0), sharedCharacter('x', -1),
++      sharedCharacter('x', 0.5), sharedCharacter('x', NaN),
++      sharedCharacter('x', Infinity), sharedCharacter('x', 4294967296));
++// CHECK-NEXT: 8 8 8 8 8 8
++print(sharedCharacter(['x'], 0), sharedCharacter(['xx'], 0),
++      sharedCharacter([new String('x')], 0), sharedCharacter([120], 0),
++      sharedCharacter([undefined], 0), sharedCharacter([Symbol('x')], 0));
++// CHECK-NEXT: 1 8 8 8 8 8
++
++reads = 0;
++var keyed = new Proxy({}, {
++  get(target, key) { ++reads; gc(); return reads === 1 ? 'x' : 'y'; },
++});
++var key = {toString() { order += 'k'; gc(); return '0'; }};
++order = '';
++print(sharedCharacter(keyed, key), reads, order);
++// CHECK-NEXT: 1 1 k
++reads = 0;
++Object.defineProperty(String.prototype, '-1', {
++  configurable: true,
++  get() { ++reads; gc(); return 'y'; },
++});
++print(sharedCharacter('x', -1), reads);
++// CHECK-NEXT: 10 1
++delete String.prototype['-1'];
++var symbol = Symbol('key');
++print(sharedCharacter({[symbol]: 'x'}, symbol), sharedCharacter({'2': 'y'}, 2n));
++// CHECK-NEXT: 1 10
++
++function readThenMutate(source, key, mutate) {
++  "noinline";
++  var c = source[key];
++  mutate();
++  if (c === 'x') return 1;
++  return c === 'y' ? 2 : 3;
++}
++var observed = {0: 'x'};
++print(readThenMutate(observed, 0, () => { observed[0] = 'y'; gc(); }), observed[0]);
++// CHECK-NEXT: 1 y
++order = '';
++try {
++  readThenMutate({get 0() { order += 'r'; gc(); throw 41; }}, 0,
++                () => { order += 'm'; });
++} catch (e) { print(e, order); }
++// CHECK-NEXT: 41 r
++try { sharedCharacter(null, 0); } catch (e) { print(e.name); }
++// CHECK-NEXT: TypeError
 diff --git a/test/shermes/string-method-cache.js b/test/shermes/string-method-cache.js
 new file mode 100644
 index 0000000000000000000000000000000000000000..b371cb64710cb588e070f0fe66a87cb167179183
@@ -3414,6 +4358,50 @@ index aae9e34229d4d5e4f039d2505f24a718e47687c0..fda43b31818b9dee5e5ede3613b22b66
 +  auto proxy = eval("new Proxy({}, {})").asObject(*rt);
 +  EXPECT_THROW(rt->createOwnPropertyValidator(proxy, keys, false), JSINativeException);
 +}
+diff --git a/unittests/PlatformUnicode/CharacterPropertyTest.cpp b/unittests/PlatformUnicode/CharacterPropertyTest.cpp
+index f911c7a4e08173d622798594d2c93da3cd3db5de..b64a5d423649619764b773d839965d7c2a8c5876 100644
+--- a/unittests/PlatformUnicode/CharacterPropertyTest.cpp
++++ b/unittests/PlatformUnicode/CharacterPropertyTest.cpp
+@@ -13,6 +13,7 @@
+ #include "gtest/gtest.h"
+ 
+ #include <limits>
++#include <numeric>
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <vector>
+@@ -21,6 +22,31 @@ using namespace hermes;
+ 
+ namespace {
+ 
++namespace reference {
++#include "../../lib/Platform/Unicode/UnicodeData.inc"
++}
++
++TEST(UnicodeTest, CanonicalizationEveryCodePoint) {
++  for (bool unicode : {false, true}) {
++    std::vector<uint32_t> expected(UNICODE_MAX_VALUE + 1);
++    std::iota(expected.begin(), expected.end(), 0);
++    const auto *begin = unicode ? std::begin(reference::UNICODE_FOLDS)
++                                : std::begin(reference::LEGACY_CANONS);
++    const auto *end = unicode ? std::end(reference::UNICODE_FOLDS)
++                              : std::end(reference::LEGACY_CANONS);
++    for (auto *range = begin; range != end; ++range) {
++      for (uint32_t offset = 0; offset < range->count; offset += range->modulo)
++        expected[range->start + offset] =
++            int32_t(range->start + offset) + range->delta;
++    }
++    for (uint32_t cp = 0; cp <= UNICODE_MAX_VALUE; ++cp)
++      ASSERT_EQ(expected[cp], canonicalize(cp, unicode))
++          << "code point " << cp << ", unicode " << unicode;
++    EXPECT_EQ(UNICODE_MAX_VALUE + 1, canonicalize(UNICODE_MAX_VALUE + 1, unicode));
++    EXPECT_EQ(UINT32_MAX, canonicalize(UINT32_MAX, unicode));
++  }
++}
++
+ // This might look like a silly test, but it should be useful if we
+ // need to add tricky optimizations to isUnicodeOnlySpace
+ TEST(UnicodeTest, isUnicodeOnlySpace) {
 diff --git a/unittests/VMRuntime/StaticHUnitTest.cpp b/unittests/VMRuntime/StaticHUnitTest.cpp
 index 87be113a8a12acd4320fe516958a9a9846701db2..a0f1bbb39ad3ed8936ebdc981cc7baa4191143a5 100644
 --- a/unittests/VMRuntime/StaticHUnitTest.cpp
