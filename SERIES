@@ -14,3 +14,4 @@
 0013-wasm-define-fast-floating-point-integer-conversions.patch 8bc2cccdcc07ee558e914bea4392d933de89bb76
 0014-vm-fast-path-dense-Array.prototype.map-reads.patch 295577e8cce65e98fe959aebddae5256dd40a3c7
 0015-wasm-optimize-static-execution-and-native-value-boun.patch 9429d85f5b8ffa383468fa4d595f8bd145952bd4
+0016-wasm-add-bounded-object-and-field-optimizations.patch c42612664dd242135865a335329aa72265b52eb9
