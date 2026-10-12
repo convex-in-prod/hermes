@@ -558,6 +558,10 @@ STR(Intl, "Intl")
 STR(compare, "compare")
 STR(format, "format")
 STR(formatToParts, "formatToParts")
+#ifdef HERMES_USE_STATIC_INTL_PROVIDER
+STR(formatRange, "formatRange")
+STR(formatRangeToParts, "formatRangeToParts")
+#endif
 STR(getCanonicalLocales, "getCanonicalLocales")
 STR(resolvedOptions, "resolvedOptions")
 STR(supportedLocalesOf, "supportedLocalesOf")

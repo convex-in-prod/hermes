@@ -430,6 +430,17 @@ _sh_init_with_error(int argc, char **argv, char **errorMessage);
 /// Destroy a runtime instance created by \c _sh_init();
 SHERMES_EXPORT void _sh_done(SHRuntime *shr);
 
+/// Set the application clock used by Date and by Intl operations requesting the
+/// current time. A null provider restores the system clock. The provider returns
+/// true and writes finite Unix milliseconds, or false to raise a JavaScript Error.
+/// It must not throw, re-enter the runtime, or allocate GC-managed objects. The
+/// embedder owns context and must keep it valid until the provider is replaced or
+/// the runtime is destroyed. Call only while the runtime is not executing JS.
+/// Internal runtime clocks and explicit-date operations are unaffected.
+typedef bool (*SHCurrentTimeProvider)(void *context, double *timeMs);
+SHERMES_EXPORT void _sh_set_current_time_provider(
+    SHRuntime *shr, SHCurrentTimeProvider provider, void *context);
+
 /// Cumulative GC counters and current heap occupancy. This reads counters,
 /// without collecting, traversing the heap, or allocating JS values.
 typedef struct SHHeapStatistics {

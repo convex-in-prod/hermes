@@ -80,7 +80,10 @@ Under Emscripten, Hermes relies on a [small amount of JavaScript](../lib/Platfor
 to be executed by the Wasm host (like Node.js or a browser). If you intend to run it under a "pure" Wasm host, consider
 using this flag:
 
-* `-DHERMES_UNICODE_LITE=` if set to ON, provides a minimal mostly stubbed-out Unicode implementation.
+* `-DHERMES_UNICODE_LITE=ON` selects self-contained Unicode casing,
+  normalization, root collation and fixed English date formatting, without host
+  locale selection or JavaScript Unicode imports. Intl can separately use the
+  [bundled static ICU provider](NativeIntl.md).
 
 > Note that running under a "pure" Wasm host is not described here and will likely require more tweaks.
 

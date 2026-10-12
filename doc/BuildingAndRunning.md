@@ -11,7 +11,13 @@ Hermes is a C++17 project. clang, gcc, and Visual C++ are supported. Hermes also
 
 The Hermes REPL will also use libreadline, if available.
 
-ICU is not required for a default build: Unicode case conversion, normalization, collation and date formatting are all self-contained. ICU is needed only for `-DHERMES_ENABLE_INTL=ON` (off by default), and even then only on Linux and Windows, since Apple and Android builds use their platform's own Intl implementation. Install `libicu-dev` (Ubuntu) or `icu` (Arch) if you are enabling Intl.
+ICU is not required for a default build. Apple and Android use their native Intl
+backends when `-DHERMES_ENABLE_INTL=ON` (off by default). Emscripten, Linux and
+Apple builds can instead select the [bundled static ICU provider](NativeIntl.md)
+with both `-DHERMES_ENABLE_INTL=ON` and `-DHERMES_USE_STATIC_INTL_PROVIDER=ON`.
+This provider includes its own headers, code and data; no system ICU package is
+needed. The old system-ICU backend has been removed, and Windows Intl builds
+are unsupported.
 
 To install dependencies on Ubuntu:
 

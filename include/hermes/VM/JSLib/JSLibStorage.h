@@ -29,6 +29,11 @@ struct JSLibStorage {
   std::mt19937_64 randomEngine_;
   bool randomEngineSeeded_ = false;
 
+  /// An optional embedder clock for application Date/Intl observations. Internal
+  /// runtime clocks must remain available even when this provider denies access.
+  bool (*currentTimeProvider)(void *context, double *timeMs) = nullptr;
+  void *currentTimeContext = nullptr;
+
   /// Time zone offset cache used in conversion between UTC and local time.
   LocalTimeOffsetCache localTimeOffsetCache;
 };

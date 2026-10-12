@@ -30,17 +30,18 @@ cmake ~/fbsource/xplat/static_h \
   -DANDROID_ABI=arm64-v8a -G Ninja
 ```
 
-`HERMES_UNICODE_LITE=ON` selects the self-contained no-op Unicode backend.
+`HERMES_UNICODE_LITE=ON` selects self-contained Unicode casing, normalization,
+root collation and fixed English date formatting, without host locale selection.
 Without it, an Android build uses the Java backend, which needs a JVM at
 runtime and so is not usable from a binary pushed with `adb push` and run
 under `adb shell`.
 
-No ICU is needed here, or in any cross-compilation target. Hermes no
-longer depends on ICU at all. The `platform_unicode` layer -- case
-conversion, normalization, collation and date formatting -- is
-self-contained, and the ICU-backed Intl backend has been removed.
-`-DHERMES_ENABLE_INTL=ON` is now supported only on Apple and Android,
-which have their own native Intl implementations.
+No system ICU is needed. Apple and Android provide native Intl backends.
+Emscripten, Linux and Apple targets can also enable the
+[bundled static ICU provider](NativeIntl.md) with `-DHERMES_ENABLE_INTL=ON`
+and `-DHERMES_USE_STATIC_INTL_PROVIDER=ON`. That provider builds its pinned
+ICU code and embeds its locale data for the target; it does not use the removed
+system-ICU integration.
 
 ## Emscripten
 

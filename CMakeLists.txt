@@ -231,7 +231,7 @@ set(HERMES_STATIC_LINK OFF CACHE BOOL
   "Link Hermes statically. May only work on GNU/Linux.")
 
 set(HERMES_UNICODE_LITE OFF CACHE BOOL
-  "Enable to use internal no-op unicode functionality instead of relying on underlying system libraries")
+  "Use self-contained Unicode operations without host locale selection")
 
 set(HERMES_CHECK_NATIVE_STACK ON CACHE BOOL
   "Check the native stack for stack overflow")
@@ -535,6 +535,17 @@ if(HERMESVM_PLATFORM_LOGGING)
 endif()
 if (NOT (ANDROID_LINUX_PERF_PATH STREQUAL ""))
   add_definitions(-DANDROID_LINUX_PERF_PATH="${ANDROID_LINUX_PERF_PATH}")
+endif()
+
+option(HERMES_USE_STATIC_INTL_PROVIDER "Use the bundled ICU Intl provider" OFF)
+if (HERMES_USE_STATIC_INTL_PROVIDER)
+  if (NOT HERMES_ENABLE_INTL)
+    message(FATAL_ERROR "The bundled ICU provider requires Intl")
+  endif()
+  if (NOT EMSCRIPTEN AND NOT APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "The bundled ICU provider supports Emscripten, Linux, and Apple targets")
+  endif()
+  add_definitions(-DHERMES_USE_STATIC_INTL_PROVIDER)
 endif()
 
 if (HERMES_ENABLE_INTL)

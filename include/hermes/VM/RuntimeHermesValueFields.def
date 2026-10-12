@@ -122,6 +122,9 @@ RUNTIME_HV_FIELD(intlDateTimeFormat, NativeConstructor)
 RUNTIME_HV_FIELD(intlDateTimeFormatPrototype, JSObject)
 RUNTIME_HV_FIELD(intlNumberFormat, NativeConstructor)
 RUNTIME_HV_FIELD(intlNumberFormatPrototype, JSObject)
+#ifdef HERMES_USE_STATIC_INTL_PROVIDER
+RUNTIME_HV_FIELD(intlLegacyConstructedSymbol, HermesValue)
+#endif
 #endif
 
 RUNTIME_HV_FIELD(promiseRejectionTrackingHook_, HermesValue)

@@ -16,10 +16,10 @@ focused tests so isolated fixes can be proposed upstream independently.
 
 The `patch-history` orphan branch is the applyable record of the current train.
 It records the exact upstream base, source tip, generated patches, and result
-tree. Use its `scripts/update.sh` before and after a rebase or amended source
-commit, and `scripts/apply.sh` to reconstruct the train on the recorded
-upstream checkout. The source branch remains the authoritative working tree;
-the history branch is generated verification data.
+tree. Follow that branch's README to regenerate the snapshot before and after
+a rebase or amended source commit, and use its `scripts/apply.sh` to reconstruct
+the train on the recorded upstream checkout. The source branch remains the
+authoritative working tree; the history branch is generated verification data.
 
 If you're only interested in using pre-built Hermes in a new or existing React Native app, you do not need to follow this guide or have direct access to the Hermes source. Instead, just follow [these instructions to enable Hermes](https://reactnative.dev/docs/hermes).
 
