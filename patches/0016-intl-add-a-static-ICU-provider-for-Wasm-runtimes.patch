@@ -25,6 +25,12 @@ and changed-corpus builds reuse the ICU archive. Warm allocation tests
 cover 2,226 failures; 383 sampled cold failures also trap immediately.
 These are bounded compatibility and lifetime checks, not complete
 ECMA-402 conformance or integration acceptance for a particular host.
+
+Accept hour-only offset time zones, normalize negative zero to a positive
+zero offset, and parse the Unicode minus sign before named-zone ASCII
+validation. Check UTF-16 digits explicitly. Native Wasm tests cover all
+hours with compact and colon-separated offsets, invalid syntax, retained
+formatters, collection and native descriptor validation.
 ---
  CMakeLists.txt                                |    8 +
  doc/NativeIntl.md                             |   41 +
@@ -1021,12 +1027,12 @@ ECMA-402 conformance or integration acceptance for a particular host.
  lib/Platform/Intl/CMakeLists.txt              |   13 +
  .../impl_icu_provider/IcuProviderStatic.cpp   |   11 +
  .../impl_icu_provider/IcuProviderStatic.h     |    7 +
- .../impl_icu_provider/IcuProviderUtils.cpp    |  906 ++
+ .../impl_icu_provider/IcuProviderUtils.cpp    |  913 ++
  .../Intl/impl_icu_provider/IcuProviderUtils.h |  294 +
  .../PlatformIntlIcuProvider.cpp               | 2397 +++++
  lib/VM/JSLib/BigInt.cpp                       |   10 +-
  lib/VM/JSLib/Intl.cpp                         |  603 +-
- 1000 files changed, 539854 insertions(+), 75 deletions(-)
+ 1000 files changed, 539861 insertions(+), 75 deletions(-)
  create mode 100644 doc/NativeIntl.md
  create mode 100644 external/icu-small/.syncignore
  create mode 100644 external/icu-small/CMakeLists.txt
@@ -760381,10 +760387,10 @@ index 0000000000000000000000000000000000000000..1f50da34425d579bbd5b68b49a47d220
 +}}
 diff --git a/lib/Platform/Intl/impl_icu_provider/IcuProviderUtils.cpp b/lib/Platform/Intl/impl_icu_provider/IcuProviderUtils.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..7e585a432a694a16d264dad6abef3ed10e04fafa
+index 0000000000000000000000000000000000000000..80c991c12d54f797da12df0f06b05122b24f7790
 --- /dev/null
 +++ b/lib/Platform/Intl/impl_icu_provider/IcuProviderUtils.cpp
-@@ -0,0 +1,906 @@
+@@ -0,0 +1,913 @@
 +/*
 + * Copyright (c) Microsoft Corporation.
 + * Licensed under the MIT License.
@@ -760897,7 +760903,7 @@ index 0000000000000000000000000000000000000000..7e585a432a694a16d264dad6abef3ed1
 +}
 +
 +/// Parse an offset timezone string. Returns true and sets the canonical
-+/// offset string if valid. Format: [+-]HH:MM or [+-]HHMM
++/// offset string if valid. Format: [+-]HH, [+-]HH:MM or [+-]HHMM.
 +/// Hours: 00-23, Minutes: 00-59.
 +bool parseOffsetTimeZone(
 +    const std::u16string &tz,
@@ -760913,18 +760919,26 @@ index 0000000000000000000000000000000000000000..7e585a432a694a16d264dad6abef3ed1
 +
 +  size_t remaining = tz.size() - pos;
 +  int hours = -1, minutes = -1;
++  const auto isDigit = [](char16_t value) {
++    return value >= u'0' && value <= u'9';
++  };
 +
-+  if (remaining == 4) {
++  if (remaining == 2) {
++    if (!isDigit(tz[pos]) || !isDigit(tz[pos + 1]))
++      return false;
++    hours = (tz[pos] - u'0') * 10 + (tz[pos + 1] - u'0');
++    minutes = 0;
++  } else if (remaining == 4) {
 +    // +HHMM
-+    if (!std::isdigit(tz[pos]) || !std::isdigit(tz[pos + 1]) ||
-+        !std::isdigit(tz[pos + 2]) || !std::isdigit(tz[pos + 3]))
++    if (!isDigit(tz[pos]) || !isDigit(tz[pos + 1]) ||
++        !isDigit(tz[pos + 2]) || !isDigit(tz[pos + 3]))
 +      return false;
 +    hours = (tz[pos] - u'0') * 10 + (tz[pos + 1] - u'0');
 +    minutes = (tz[pos + 2] - u'0') * 10 + (tz[pos + 3] - u'0');
 +  } else if (remaining == 5 && tz[pos + 2] == u':') {
 +    // +HH:MM
-+    if (!std::isdigit(tz[pos]) || !std::isdigit(tz[pos + 1]) ||
-+        !std::isdigit(tz[pos + 3]) || !std::isdigit(tz[pos + 4]))
++    if (!isDigit(tz[pos]) || !isDigit(tz[pos + 1]) ||
++        !isDigit(tz[pos + 3]) || !isDigit(tz[pos + 4]))
 +      return false;
 +    hours = (tz[pos] - u'0') * 10 + (tz[pos + 1] - u'0');
 +    minutes = (tz[pos + 3] - u'0') * 10 + (tz[pos + 4] - u'0');
@@ -760936,7 +760950,7 @@ index 0000000000000000000000000000000000000000..7e585a432a694a16d264dad6abef3ed1
 +    return false;
 +
 +  // Canonicalize to +HH:MM format
-+  char16_t canonSign = (sign == u'+') ? u'+' : u'-';
++  char16_t canonSign = (sign == u'+' || (hours == 0 && minutes == 0)) ? u'+' : u'-';
 +  canonical = std::u16string(1, canonSign);
 +  canonical += static_cast<char16_t>(u'0' + hours / 10);
 +  canonical += static_cast<char16_t>(u'0' + hours % 10);
@@ -760951,6 +760965,11 @@ index 0000000000000000000000000000000000000000..7e585a432a694a16d264dad6abef3ed1
 +    vm::Runtime &runtime,
 +    const hermes_icu_vtable *icu,
 +    const std::u16string &timeZone) {
++  // Offset grammar also permits U+2212; named zones remain ASCII-only.
++  std::u16string canonicalOffset;
++  if (parseOffsetTimeZone(timeZone, canonicalOffset)) {
++    return canonicalOffset;
++  }
 +  // Reject non-ASCII timezone names.
 +  if (!isAllASCII(timeZone)) {
 +    return runtime.raiseRangeError("Invalid time zone");
@@ -760965,12 +760984,6 @@ index 0000000000000000000000000000000000000000..7e585a432a694a16d264dad6abef3ed1
 +  if (upper == "UTC" || upper == "GMT" || upper == "ETC/UTC" ||
 +      upper == "ETC/GMT") {
 +    return std::u16string(u"UTC");
-+  }
-+
-+  // Try to parse as offset timezone.
-+  std::u16string canonicalOffset;
-+  if (parseOffsetTimeZone(timeZone, canonicalOffset)) {
-+    return canonicalOffset;
 +  }
 +
 +  // Use ICU to validate and canonicalize the timezone.
