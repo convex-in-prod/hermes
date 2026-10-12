@@ -14,3 +14,4 @@
 0013-wasm-define-fast-floating-point-integer-conversions.patch 8bc2cccdcc07ee558e914bea4392d933de89bb76
 0014-vm-fast-path-dense-Array.prototype.map-reads.patch 295577e8cce65e98fe959aebddae5256dd40a3c7
 0015-wasm-optimize-static-execution-and-native-value-boun.patch 4ae2b227fd777b46008e84bf695daeb4586c5f63
+0016-intl-add-a-static-ICU-provider-for-Wasm-runtimes.patch 1ff7e35eadf9a9e0b3bf4b1ada1ba9e441db5117
