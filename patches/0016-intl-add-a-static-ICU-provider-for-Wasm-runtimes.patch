@@ -3,9 +3,9 @@ From: Roman Leventov <leventov.ru@gmail.com>
 Date: Mon, 12 Oct 2026 18:54:11 +0800
 Subject: [PATCH 16/16] intl: add a static ICU provider for Wasm runtimes
 
-Port the Microsoft Hermes ICU adapter to an explicitly selected Emscripten
-provider, with pinned ICU 78.2 sources, CLDR 48 data and retained notices.
-Keep other platform providers unchanged. Link native code and authenticated
+Port the Microsoft Hermes ICU adapter to an explicitly selected static
+provider for Emscripten, Linux and Apple targets, with pinned ICU 78.2 sources, CLDR 48 data and retained notices.
+Keep the default platform providers unchanged. Link native code and authenticated
 locale data as one archive so application edits reuse the dependency.
 
 Use modern ICU number formatting for strings, parts and exact numeric
@@ -31,15 +31,24 @@ zero offset, and parse the Unicode minus sign before named-zone ASCII
 validation. Check UTF-16 digits explicitly. Native Wasm tests cover all
 hours with compact and colon-separated offsets, invalid syntax, retained
 formatters, collection and native descriptor validation.
+
+Build native host validation archives with the same pinned provider and
+data. Select it before platform defaults, emit the data object in the
+target object format and restrict Wasm exception flags to Emscripten.
+Include the C++ memory header explicitly for GCC builds.
+
+Validation: Linux host compiler and runtime archives build; native adapter
+execution passes packed-value, intrinsic-snapshot and retained-chunk tests.
+Apple configuration is supported but has not been executed on this host.
 ---
- CMakeLists.txt                                |    8 +
- doc/NativeIntl.md                             |   41 +
+ CMakeLists.txt                                |   11 +
+ doc/NativeIntl.md                             |   45 +
  external/icu-small/.syncignore                |   14 +
- external/icu-small/CMakeLists.txt             |   40 +
+ external/icu-small/CMakeLists.txt             |   53 +
  external/icu-small/LICENSE                    |  568 ++
  external/icu-small/README-FULL-ICU.txt        |    9 +
  external/icu-small/hermes-icu.def             |    4 +
- external/icu-small/hermes_icu_glue.cpp        |  475 +
+ external/icu-small/hermes_icu_glue.cpp        |  476 +
  external/icu-small/icudata.c.in               |   16 +
  external/icu-small/source/.clang-format       |   11 +
  external/icu-small/source/common/BUILD.bazel  | 1219 +++
@@ -1024,7 +1033,7 @@ formatters, collection and native descriptor validation.
  include/hermes/VM/PredefinedStrings.def       |    4 +
  .../hermes/VM/RuntimeHermesValueFields.def    |    3 +
  lib/Platform/Intl/BCP47Parser.cpp             |    3 +-
- lib/Platform/Intl/CMakeLists.txt              |   13 +
+ lib/Platform/Intl/CMakeLists.txt              |   15 +-
  .../impl_icu_provider/IcuProviderStatic.cpp   |   11 +
  .../impl_icu_provider/IcuProviderStatic.h     |    7 +
  .../impl_icu_provider/IcuProviderUtils.cpp    |  913 ++
@@ -1032,7 +1041,7 @@ formatters, collection and native descriptor validation.
  .../PlatformIntlIcuProvider.cpp               | 2397 +++++
  lib/VM/JSLib/BigInt.cpp                       |   10 +-
  lib/VM/JSLib/Intl.cpp                         |  603 +-
- 1000 files changed, 539861 insertions(+), 75 deletions(-)
+ 1000 files changed, 539883 insertions(+), 76 deletions(-)
  create mode 100644 doc/NativeIntl.md
  create mode 100644 external/icu-small/.syncignore
  create mode 100644 external/icu-small/CMakeLists.txt
@@ -2026,17 +2035,20 @@ formatters, collection and native descriptor validation.
  create mode 100644 lib/Platform/Intl/impl_icu_provider/PlatformIntlIcuProvider.cpp
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index da1218de06fb68d708c4cb72ebc259a6e32b8904..675da3af52c8a832cf814c46264447bce0693ac1 100644
+index da1218de06fb68d708c4cb72ebc259a6e32b8904..0289e62e57e439c891d52e1b0b193418fd2b4a5a 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -544,6 +544,14 @@ if (NOT (ANDROID_LINUX_PERF_PATH STREQUAL ""))
+@@ -544,6 +544,17 @@ if (NOT (ANDROID_LINUX_PERF_PATH STREQUAL ""))
    add_definitions(-DANDROID_LINUX_PERF_PATH="${ANDROID_LINUX_PERF_PATH}")
  endif()
  
-+option(HERMES_USE_STATIC_INTL_PROVIDER "Use the bundled ICU Intl provider in Emscripten builds" OFF)
++option(HERMES_USE_STATIC_INTL_PROVIDER "Use the bundled ICU Intl provider" OFF)
 +if (HERMES_USE_STATIC_INTL_PROVIDER)
-+  if (NOT HERMES_ENABLE_INTL OR NOT EMSCRIPTEN)
-+    message(FATAL_ERROR "The bundled ICU provider requires Intl and an Emscripten target")
++  if (NOT HERMES_ENABLE_INTL)
++    message(FATAL_ERROR "The bundled ICU provider requires Intl")
++  endif()
++  if (NOT EMSCRIPTEN AND NOT APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
++    message(FATAL_ERROR "The bundled ICU provider supports Emscripten, Linux, and Apple targets")
 +  endif()
 +  add_definitions(-DHERMES_USE_STATIC_INTL_PROVIDER)
 +endif()
@@ -2046,16 +2058,18 @@ index da1218de06fb68d708c4cb72ebc259a6e32b8904..675da3af52c8a832cf814c46264447bc
  endif()
 diff --git a/doc/NativeIntl.md b/doc/NativeIntl.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..3e72c95c2439b13231217a33987963ad545384a9
+index 0000000000000000000000000000000000000000..95783fbf7aac30af8713b1ed4fd18ce0bb33cbb8
 --- /dev/null
 +++ b/doc/NativeIntl.md
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,45 @@
 +# Static ICU Intl provider
 +
-+Emscripten builds can select the bundled provider with
-+`HERMES_ENABLE_INTL=ON` and `HERMES_USE_STATIC_INTL_PROVIDER=ON`. Other builds
++Emscripten, Linux and Apple builds can select the bundled provider with
++`HERMES_ENABLE_INTL=ON` and `HERMES_USE_STATIC_INTL_PROVIDER=ON`. Builds without that option
 +retain their existing platform providers. Host compiler executables do not need
 +Intl enabled to compile JavaScript that uses the target's native Intl objects.
++Native runtime validation can enable it to execute the same provider and data as
++the Wasm target, including when the host has a different platform ICU installed.
 +
 +The adapter and ICU source derive from Microsoft's Hermes fork at
 +`680ae7651c2f55cbbacaed0cc11519fe6c253f72`. The static port excludes Windows
@@ -2085,6 +2099,8 @@ index 0000000000000000000000000000000000000000..3e72c95c2439b13231217a33987963ad
 +runtimes may be created and destroyed while ICU caches remain alive. Full
 +`u_cleanup()` is only valid after all runtimes are destroyed and immediately
 +before discarding the instance; reinitialization after cleanup is not supported.
++In native builds, the provider and its caches instead belong to the process;
++the same restriction on cleanup and reinitialization applies.
 +
 +`HERMES_ICU_FAIL_STOP_ALLOCATION` defaults to ON. Failed nonzero ICU allocation,
 +reallocation and overflowing allocation sizes trap immediately. A host must
@@ -2113,10 +2129,10 @@ index 0000000000000000000000000000000000000000..328b0a4181919036818f4efdb8847be8
 +/source/python/icutools/
 diff --git a/external/icu-small/CMakeLists.txt b/external/icu-small/CMakeLists.txt
 new file mode 100644
-index 0000000000000000000000000000000000000000..eeca9a913d8a31bf2a3f18268ea4150fa415c4e4
+index 0000000000000000000000000000000000000000..c611315c7245154f5069413f45510c26b3a8e682
 --- /dev/null
 +++ b/external/icu-small/CMakeLists.txt
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,53 @@
 +# Copyright (c) Microsoft Corporation. Licensed under the MIT License.
 +# Experimental static build of the pinned ICU source and locale dataset.
 +find_package(Python3 REQUIRED COMPONENTS Interpreter)
@@ -2135,8 +2151,17 @@ index 0000000000000000000000000000000000000000..eeca9a913d8a31bf2a3f18268ea4150f
 +# regenerate this assembly or rebuild the data object.
 +set(ICU_DATA_ASSEMBLY "${CMAKE_CURRENT_BINARY_DIR}/hermes_icu_data.s")
 +set(ICU_DATA_OBJECT "${CMAKE_CURRENT_BINARY_DIR}/hermes_icu_data.o")
-+file(GENERATE OUTPUT "${ICU_DATA_ASSEMBLY}" CONTENT
-+  ".section .rodata.icudt78_dat,\"\",@\n.p2align 4\n.globl icudt78_dat\n.type icudt78_dat,@object\nicudt78_dat:\n.incbin \"${ICU_DAT}\"\n.size icudt78_dat, .-icudt78_dat\n")
++if(APPLE)
++  set(ICU_DATA_ASSEMBLY_CONTENT
++    ".section __TEXT,__const\n.p2align 4\n.globl _icudt78_dat\n_icudt78_dat:\n.incbin \"${ICU_DAT}\"\n")
++elseif(EMSCRIPTEN)
++  set(ICU_DATA_ASSEMBLY_CONTENT
++    ".section .rodata.icudt78_dat,\"\",@\n.p2align 4\n.globl icudt78_dat\n.type icudt78_dat,@object\nicudt78_dat:\n.incbin \"${ICU_DAT}\"\n.size icudt78_dat, .-icudt78_dat\n")
++else()
++  set(ICU_DATA_ASSEMBLY_CONTENT
++    ".section .rodata.icudt78_dat,\"a\",@progbits\n.p2align 4\n.globl icudt78_dat\n.type icudt78_dat,@object\nicudt78_dat:\n.incbin \"${ICU_DAT}\"\n.size icudt78_dat, .-icudt78_dat\n.section .note.GNU-stack,\"\",@progbits\n")
++endif()
++file(GENERATE OUTPUT "${ICU_DATA_ASSEMBLY}" CONTENT "${ICU_DATA_ASSEMBLY_CONTENT}")
 +add_custom_command(OUTPUT "${ICU_DATA_OBJECT}"
 +  COMMAND "${CMAKE_C_COMPILER}" -c "${ICU_DATA_ASSEMBLY}" -o "${ICU_DATA_OBJECT}"
 +  DEPENDS "${ICU_DATA_ASSEMBLY}" "${ICU_DAT}"
@@ -2151,7 +2176,11 @@ index 0000000000000000000000000000000000000000..eeca9a913d8a31bf2a3f18268ea4150f
 +  U_ENABLE_DYLOAD=0 UCONFIG_NO_SERVICE=1 U_HAVE_STD_STRING=1 U_ATTRIBUTE_DEPRECATED=)
 +set_property(SOURCE ${ICU_COMMON_SOURCES} APPEND PROPERTY COMPILE_DEFINITIONS U_COMMON_IMPLEMENTATION=1)
 +set_property(SOURCE ${ICU_I18N_SOURCES} APPEND PROPERTY COMPILE_DEFINITIONS U_I18N_IMPLEMENTATION=1)
-+target_compile_options(hermesStaticIcu PRIVATE -fexceptions -frtti -fwasm-exceptions
++target_compile_options(hermesStaticIcu PRIVATE -fexceptions -frtti)
++if(EMSCRIPTEN)
++  target_compile_options(hermesStaticIcu PRIVATE -fwasm-exceptions)
++endif()
++target_compile_options(hermesStaticIcu PRIVATE
 +  -Wno-deprecated-declarations -Wno-sign-compare -Wno-unused-variable)
 +
 +option(HERMES_ICU_FAIL_STOP_ALLOCATION "Trap rather than return null after ICU allocation exhaustion" ON)
@@ -2758,10 +2787,10 @@ index 0000000000000000000000000000000000000000..96855fc0f23eab1d605c3356dab77d84
 +    hermes_icu_get_vtable
 diff --git a/external/icu-small/hermes_icu_glue.cpp b/external/icu-small/hermes_icu_glue.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..281fbc46949693defefaa4a9e047fc3a2efca34c
+index 0000000000000000000000000000000000000000..364834c90e38e302532c783faaa530bfacaf9a44
 --- /dev/null
 +++ b/external/icu-small/hermes_icu_glue.cpp
-@@ -0,0 +1,475 @@
+@@ -0,0 +1,476 @@
 +/*
 + * Copyright (c) Microsoft Corporation.
 + * Licensed under the MIT License.
@@ -2783,6 +2812,7 @@ index 0000000000000000000000000000000000000000..281fbc46949693defefaa4a9e047fc3a
 +
 +// ICU common headers
 +#include <unicode/localebuilder.h>
++#include <cstring>
 +#include "unicode/ubrk.h"
 +#include "unicode/uclean.h"
 +#include "unicode/ucurr.h"
@@ -2881,7 +2911,7 @@ index 0000000000000000000000000000000000000000..281fbc46949693defefaa4a9e047fc3a
 +    *err = U_BUFFER_OVERFLOW_ERROR;
 +    return len + 1;
 +  }
-+  memcpy(result, tagStr.c_str(), len + 1);
++  std::memcpy(result, tagStr.c_str(), len + 1);
 +  return len;
 +}
 +
@@ -760332,14 +760362,15 @@ index ca7bb22f66d3220ef892c4e4265c451f8b263ebb..28683874c41db9c115538c0ed73f7b3d
  bool isUnicodeExtensionAttribute(const std::u16string &subtag) {
    // = alphanum{3,8};
 diff --git a/lib/Platform/Intl/CMakeLists.txt b/lib/Platform/Intl/CMakeLists.txt
-index 0503bc186e24e538dc4eea13991e7479122714ec..6aca99a83bb2200a7c5dcdd123e3ff14b510d2d0 100644
+index 0503bc186e24e538dc4eea13991e7479122714ec..bb017a518b9b4a060199d6d61cc4d312ca75ca9a 100644
 --- a/lib/Platform/Intl/CMakeLists.txt
 +++ b/lib/Platform/Intl/CMakeLists.txt
-@@ -20,6 +20,19 @@ if(HERMES_ENABLE_INTL)
-     # Work around a bug in unity builds where it tries to build Obj-C as C++.
-     set_target_properties(hermesPlatformIntl_obj PROPERTIES UNITY_BUILD false)
-     target_compile_options(hermesPlatformIntl_obj PRIVATE -fobjc-arc)
-+  elseif(HERMES_USE_STATIC_INTL_PROVIDER)
+@@ -6,7 +6,20 @@
+ add_hermes_library(hermesBCP47Parser BCP47Parser.cpp)
+ 
+ if(HERMES_ENABLE_INTL)
+-  if(HERMES_IS_ANDROID)
++  if(HERMES_USE_STATIC_INTL_PROVIDER)
 +    add_subdirectory(${CMAKE_SOURCE_DIR}/external/icu-small ${CMAKE_BINARY_DIR}/external/icu-small)
 +    add_hermes_library(hermesPlatformIntl
 +      impl_icu_provider/PlatformIntlIcuProvider.cpp
@@ -760352,9 +760383,10 @@ index 0503bc186e24e538dc4eea13991e7479122714ec..6aca99a83bb2200a7c5dcdd123e3ff14
 +      ${CMAKE_SOURCE_DIR}/external/icu-small/source/i18n)
 +    target_compile_definitions(hermesPlatformIntl_obj PRIVATE
 +      U_STATIC_IMPLEMENTATION=1 U_DISABLE_RENAMING=1)
-   else()
-     add_hermes_library(hermesPlatformIntl
-         PlatformIntlICU.cpp
++  elseif(HERMES_IS_ANDROID)
+     add_hermes_library(hermesPlatformIntl PlatformIntlAndroid.cpp
+         LINK_LIBS fbjni::fbjni
+         LINK_OBJLIBS hermesPublic
 diff --git a/lib/Platform/Intl/impl_icu_provider/IcuProviderStatic.cpp b/lib/Platform/Intl/impl_icu_provider/IcuProviderStatic.cpp
 new file mode 100644
 index 0000000000000000000000000000000000000000..e9ef215adcab95d81619e667c994399d4767a60e
