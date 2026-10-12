@@ -142,6 +142,22 @@ Validate semantic edges with optimizer, native and Wasm fixtures, including
 closure environments, malformed layout hints, Promise/async conformance,
 collection during callbacks and bounded string-storage retention. Retain
 explicit activation and unsupported-path semantics for experimental passes.
+
+Aggregate guarded dense arrays of native Promises and primitives using shared
+traced state and native reactions. Avoid temporary capabilities, per-element
+closures and descriptors, and discarded chained Promises while preserving
+settlement order, rejection tracking and observable method overrides. Keep
+unsupported inputs on the existing JavaScript implementation and bound array
+admission to 4096 elements.
+
+Keep aggregation entries separate from ordinary Promise dispatch. Return private
+bootstrap hooks positionally and capture the aggregation function directly,
+avoiding extra interned method names and repeated method lookup. Retain the
+existing primitive-resolution behavior, array exposure and freezing semantics,
+and GC safety during queued callbacks and reentrant collection.
+
+Validate native and compiled callers with override, adoption, rejection,
+signed-zero, bounds, array-exposure and GC cases.
 ---
  API/hermes/SynthTrace.cpp                     |    1 +
  API/hermes/SynthTraceParser.cpp               |    4 +
@@ -186,7 +202,7 @@ explicit activation and unsupported-path semantics for experimental passes.
  lib/BCGen/SH/SHRegAlloc.h                     |    9 +-
  lib/CMakeLists.txt                            |    9 +
  lib/CompilerDriver/CompilerDriver.cpp         |   22 +
- lib/InternalJavaScript/01-Promise.js          |   94 +-
+ lib/InternalJavaScript/01-Promise.js          |  107 +-
  lib/InternalJavaScript/02-AsyncFn.js          |   69 +-
  lib/InternalJavaScript/README.md              |   20 +
  lib/Optimizer/PassManager/Pipeline.cpp        |   19 +-
@@ -218,7 +234,7 @@ explicit activation and unsupported-path semantics for experimental passes.
  lib/VM/JSLib/HermesInternal.cpp               |   19 +
  lib/VM/JSLib/Math.cpp                         |   51 +-
  lib/VM/JSLib/MathStdFunctions.def             |    2 +-
- lib/VM/JSLib/NativePromise.cpp                |  652 +++++++++
+ lib/VM/JSLib/NativePromise.cpp                |  987 +++++++++++++
  lib/VM/JSLib/String.cpp                       |   15 +-
  lib/VM/JSObject.cpp                           |   11 +-
  lib/VM/JSPromise.cpp                          |   46 +
@@ -232,6 +248,8 @@ explicit activation and unsupported-path semantics for experimental passes.
  test/Optimizer/func_sig_opts.js               |    3 +-
  .../copyDataProperties-fresh-fast-path.js     |  119 ++
  test/hermes/copyDataProperties-fresh-gc.js    |   48 +
+ test/hermes/native-promise-all-gc.js          |   81 ++
+ test/hermes/native-promise-all.js             |  312 ++++
  test/hermes/native-promise-core.js            |  163 +++
  test/hermes/native-promise-reentrancy.js      |   80 +
  test/shermes/Inputs/check-c-bundle-layout.py  |  650 +++++++++
@@ -267,6 +285,8 @@ explicit activation and unsupported-path semantics for experimental passes.
  test/shermes/native-async-driver.js           |  108 ++
  test/shermes/native-integer-registers.js      |  130 ++
  test/shermes/native-literal-builtins.js       |   43 +
+ test/shermes/native-promise-all-gc.js         |    9 +
+ test/shermes/native-promise-all.js            |    9 +
  test/shermes/native-promise.js                |   18 +
  test/shermes/numeric-math.js                  |   98 ++
  test/shermes/polymorphic-read-cache.js        |   63 +
@@ -293,7 +313,7 @@ explicit activation and unsupported-path semantics for experimental passes.
  .../PlatformUnicode/CharacterPropertyTest.cpp |   26 +
  unittests/VMRuntime/StaticHUnitTest.cpp       |   50 +
  unittests/VMRuntime/StringPrimitiveTest.cpp   |  189 +++
- 150 files changed, 18059 insertions(+), 392 deletions(-)
+ 154 files changed, 18818 insertions(+), 392 deletions(-)
  create mode 100644 include/hermes/Optimizer/Scalar/RecordUseAnalysis.h
  create mode 100644 include/hermes/Support/MathFunctions.h
  create mode 100644 include/hermes/VM/JSPromise.h
@@ -314,6 +334,8 @@ explicit activation and unsupported-path semantics for experimental passes.
  create mode 100644 lib/VM/JSPromise.cpp
  create mode 100644 test/hermes/copyDataProperties-fresh-fast-path.js
  create mode 100644 test/hermes/copyDataProperties-fresh-gc.js
+ create mode 100644 test/hermes/native-promise-all-gc.js
+ create mode 100644 test/hermes/native-promise-all.js
  create mode 100644 test/hermes/native-promise-core.js
  create mode 100644 test/hermes/native-promise-reentrancy.js
  create mode 100644 test/shermes/Inputs/check-c-bundle-layout.py
@@ -348,6 +370,8 @@ explicit activation and unsupported-path semantics for experimental passes.
  create mode 100644 test/shermes/native-async-driver.js
  create mode 100644 test/shermes/native-integer-registers.js
  create mode 100644 test/shermes/native-literal-builtins.js
+ create mode 100644 test/shermes/native-promise-all-gc.js
+ create mode 100644 test/shermes/native-promise-all.js
  create mode 100644 test/shermes/native-promise.js
  create mode 100644 test/shermes/numeric-math.js
  create mode 100644 test/shermes/polymorphic-read-cache.js
@@ -6764,7 +6788,7 @@ index 7cf6e64252b09ce93924136bff7db7add3597dd6..b0f8745d681804fa81ba90244a72fa23
  
    optimizationOpts.useLegacyMem2Reg = cl::LegacyMem2Reg;
 diff --git a/lib/InternalJavaScript/01-Promise.js b/lib/InternalJavaScript/01-Promise.js
-index da64243b8e601e690fbb7abdf646536e6cc7c8d7..6978221fdf19a7519621d8c8fb09209fd90e2910 100644
+index da64243b8e601e690fbb7abdf646536e6cc7c8d7..30208ba3c3e864f9776c3c86fb6d2a3eff914051 100644
 --- a/lib/InternalJavaScript/01-Promise.js
 +++ b/lib/InternalJavaScript/01-Promise.js
 @@ -1,5 +1,9 @@
@@ -6777,15 +6801,16 @@ index da64243b8e601e690fbb7abdf646536e6cc7c8d7..6978221fdf19a7519621d8c8fb09209f
    var useEngineQueue = HermesInternal.useEngineQueue();
    // Captured at startup so per-element checks in Promise.all stay
    // cheap. Spec compliance (§27.2.4.1.2 step 8.e: always Invoke
-@@ -8,6 +12,7 @@
+@@ -8,6 +12,8 @@
    // the input is an already-fulfilled core Promise.
    var test262Enabled = HermesInternal.test262Enabled();
    function noop() {}
 +  var nativeCore = null;
++  var nativeAll = null;
  
    // States:
    //
-@@ -63,7 +68,9 @@
+@@ -63,7 +69,9 @@
    // - every prototype and static method is non-enumerable, configurable,
    //   writable, with NamedEvaluation-derived `.name`, and has no
    //   [[Construct]] (so `new Promise.prototype.then()` throws).
@@ -6796,7 +6821,7 @@ index da64243b8e601e690fbb7abdf646536e6cc7c8d7..6978221fdf19a7519621d8c8fb09209f
      static _B = null;
      static _C = null;
      static _D = noop;
-@@ -95,7 +102,7 @@
+@@ -95,7 +103,7 @@
        // actual promises — reading it on arbitrary thenables/objects
        // would be user-observable and break the thenable resolution
        // path.
@@ -6805,7 +6830,18 @@ index da64243b8e601e690fbb7abdf646536e6cc7c8d7..6978221fdf19a7519621d8c8fb09209f
          return value;
        }
  
-@@ -195,6 +202,10 @@
+@@ -135,6 +143,10 @@
+ 
+     static all(arr) {
+       var C = this;
++      if (nativeCore && !test262Enabled) {
++        var nativeResult = nativeAll(C, arr);
++        if (nativeResult !== undefined) return nativeResult;
++      }
+       // Step 2: NewPromiseCapability(C). Throws synchronously if C is
+       // not a valid constructor or doesn't capture resolve/reject.
+       var capability = newPromiseCapability(C);
+@@ -195,6 +207,10 @@
            // --test262.
            if (test262Enabled) {
              nextPromise.then(resolveElement, capReject);
@@ -6816,7 +6852,7 @@ index da64243b8e601e690fbb7abdf646536e6cc7c8d7..6978221fdf19a7519621d8c8fb09209f
            } else {
              nextPromise._y === 1
                ? resolveElement(nextPromise._z)
-@@ -438,12 +449,12 @@
+@@ -438,12 +454,12 @@
  
      then(onFulfilled, onRejected) {
        // Per spec §27.2.5.4 step 2: If IsPromise(this) is false, throw
@@ -6832,7 +6868,7 @@ index da64243b8e601e690fbb7abdf646536e6cc7c8d7..6978221fdf19a7519621d8c8fb09209f
          throw new TypeError('Promise.prototype.then called on non-Promise');
        }
        // Per spec §27.2.5.4 step 3 + §7.3.22 SpeciesConstructor: when
-@@ -456,7 +467,9 @@
+@@ -456,7 +472,9 @@
          return safeThen(this, onFulfilled, onRejected);
        }
        var res = new Promise(noop);
@@ -6843,13 +6879,15 @@ index da64243b8e601e690fbb7abdf646536e6cc7c8d7..6978221fdf19a7519621d8c8fb09209f
        return res;
      }
  
-@@ -504,6 +517,20 @@
+@@ -504,6 +522,28 @@
        }
        return this.then(thenFinally, catchFinally);
      }
 +  };
 +  if (createNativePromiseCore !== undefined) {
-+    nativeCore = createNativePromiseCore(noop);
++    var nativeHooks = createNativePromiseCore(noop);
++    nativeCore = nativeHooks[0];
++    nativeAll = nativeHooks[2];
 +    var jsPromise = Promise;
 +    Promise = nativeCore.Promise;
 +    ['resolve', 'reject', 'all', 'allSettled', 'race', 'any', 'withResolvers', 'try'].forEach(function (key) {
@@ -6861,10 +6899,16 @@ index da64243b8e601e690fbb7abdf646536e6cc7c8d7..6978221fdf19a7519621d8c8fb09209f
 +    Promise._B = null;
 +    Promise._C = null;
 +    Promise._D = noop;
++    nativeHooks[1](Promise.resolve, Promise.prototype.then,
++      function (values, index, value) {
++        Object.defineProperty(values, index, {
++          value: value, writable: true, enumerable: true, configurable: true,
++        });
++      });
    }
    var core = Promise;
  
-@@ -514,10 +541,14 @@
+@@ -514,10 +554,14 @@
      // Intermediate core Promise that holds the result of running
      // onFulfilled/onRejected when self settles.
      var res = new Promise(noop);
@@ -6882,7 +6926,7 @@ index da64243b8e601e690fbb7abdf646536e6cc7c8d7..6978221fdf19a7519621d8c8fb09209f
      return capability.promise;
    }
  
-@@ -555,6 +586,7 @@
+@@ -555,6 +599,7 @@
      return { promise: promise, resolve: resolve, reject: reject };
    }
    function handle(self, deferred) {
@@ -6890,7 +6934,7 @@ index da64243b8e601e690fbb7abdf646536e6cc7c8d7..6978221fdf19a7519621d8c8fb09209f
      while (self._y === 3) {
        self = self._z;
      }
-@@ -655,11 +687,13 @@
+@@ -655,11 +700,13 @@
    // throw escaping resolve()/reject() (a rejection-tracking hook, say) must
    // not let the caller's error path overwrite an already recorded state.
    function resolveCore(self, value) {
@@ -6904,7 +6948,7 @@ index da64243b8e601e690fbb7abdf646536e6cc7c8d7..6978221fdf19a7519621d8c8fb09209f
      if (self._y !== 0) return;
      reject(self, value);
    }
-@@ -738,6 +772,7 @@
+@@ -738,6 +785,7 @@
    var EMPTYSTRING = valuePromise('');
  
    function valuePromise(value) {
@@ -6912,7 +6956,7 @@ index da64243b8e601e690fbb7abdf646536e6cc7c8d7..6978221fdf19a7519621d8c8fb09209f
      var p = new core(core._D);
      p._y = 1;
      p._z = value;
-@@ -769,6 +804,7 @@
+@@ -769,6 +817,7 @@
      enabled = false;
      core._B = null;
      core._C = null;
@@ -6920,7 +6964,7 @@ index da64243b8e601e690fbb7abdf646536e6cc7c8d7..6978221fdf19a7519621d8c8fb09209f
    }
  
    var enable_1 = enable;
-@@ -779,28 +815,32 @@
+@@ -779,28 +828,32 @@
      var id = 0;
      var displayId = 0;
      var rejections = {};
@@ -6963,7 +7007,7 @@ index da64243b8e601e690fbb7abdf646536e6cc7c8d7..6978221fdf19a7519621d8c8fb09209f
              // For reference errors and type errors, this almost always
              // means the programmer made a mistake, so log them after just
              // 100ms
-@@ -813,6 +853,7 @@
+@@ -813,6 +866,7 @@
          };
        }
      };
@@ -6971,7 +7015,7 @@ index da64243b8e601e690fbb7abdf646536e6cc7c8d7..6978221fdf19a7519621d8c8fb09209f
      function onUnhandled(id) {
        if (
          options.allRejections ||
-@@ -914,6 +955,7 @@
+@@ -914,6 +968,7 @@
      onRejected,
      errorPromise
    ) {
@@ -6979,7 +7023,7 @@ index da64243b8e601e690fbb7abdf646536e6cc7c8d7..6978221fdf19a7519621d8c8fb09209f
      var handler = new Handler(onFulfilled, onRejected, null);
      handler.errorPromise = errorPromise;
      return handler;
-@@ -923,6 +965,13 @@
+@@ -923,6 +978,13 @@
    };
    internalBytecodeResult.resolvePromiseCore = resolveCore;
    internalBytecodeResult.rejectPromiseCore = rejectCore;
@@ -6993,7 +7037,7 @@ index da64243b8e601e690fbb7abdf646536e6cc7c8d7..6978221fdf19a7519621d8c8fb09209f
    // PromiseResolve(%Promise%, value) for a caller that has already ruled out
    // the exact-Promise short-circuit of §27.2.1.6 step 1. Shares
    // Promise.resolve's cached value promises, so the common `await
-@@ -944,9 +993,14 @@
+@@ -944,9 +1006,14 @@
        return valuePromise(value);
      }
      var promise = new Promise(noop);
@@ -12211,10 +12255,10 @@ index d285f9f5ba2e8e09d2d4a52eebe5ea928a129f66..f2fc74ee9aa15bc6d34824ed7e13e2b3
  MATHFUNC_1ARG(sqrt, std::sqrt)
 diff --git a/lib/VM/JSLib/NativePromise.cpp b/lib/VM/JSLib/NativePromise.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..f5f9b002a51100e61a36161f1992e9c9885359c0
+index 0000000000000000000000000000000000000000..f8b5cccbfccb98c0d4b38e116c61b4a274415dea
 --- /dev/null
 +++ b/lib/VM/JSLib/NativePromise.cpp
-@@ -0,0 +1,652 @@
+@@ -0,0 +1,987 @@
 +/*
 + * Copyright (c) Meta Platforms, Inc. and affiliates.
 + *
@@ -12223,6 +12267,7 @@ index 0000000000000000000000000000000000000000..f5f9b002a51100e61a36161f1992e9c9
 + */
 +
 +#include "JSLibInternal.h"
++#include "hermes/VM/JSArray.h"
 +#include "hermes/VM/JSPromise.h"
 +#include "hermes/VM/Operations.h"
 +#include "hermes/VM/SmallHermesValue-inline.h"
@@ -12232,12 +12277,82 @@ index 0000000000000000000000000000000000000000..f5f9b002a51100e61a36161f1992e9c9
 +namespace vm {
 +
 +namespace {
-+enum ConfigSlot { Constructor, Prototype, HandleHook, RejectHook, Noop, ThenKey, ResolveNonExact, ConfigCount };
++CallResult<HermesValue> nativePromiseAllReactionJob(void *, Runtime &);
++
++enum ConfigSlot { Constructor, Prototype, HandleHook, RejectHook, Noop, ThenKey, ResolveNonExact, AllResolve, AllThen, AllDefine, ResolveKey, ConfigCount };
 +enum ReactionSlot { Fulfill, Reject, Target, ErrorTarget, Next, Argument, Rejected, Busy, ReactionCount };
++enum AllSlot { AllResult, AllValues, AllRemaining, AllResolved, AllExposed, AllCount };
 +enum class Operation : uintptr_t {
 +  Pending, Fulfilled, Resolve, Reject, Handle, CreateHandler, IsPromise,
 +  IsRejected, IsHandled, SetHooks, TryFulfilled, ConfigureAsync, FinishAsync,
 +};
++
++enum class PlainProperty { Missing, Data, Unsupported };
++
++// A failed guard must not perform an observable read before the JS fallback.
++PlainProperty plainProperty(
++    Runtime &runtime,
++    Handle<JSObject> initial,
++    SymbolID key,
++    PinnedHermesValue &value) {
++  auto object = runtime.makeMutableHandle(*initial);
++  for (unsigned depth = 0; object && depth < 16; ++depth) {
++    if (object->isProxyObject() || object->isHostObject() || object->isLazy() ||
++        object->getClass(runtime)->isTyped())
++      return PlainProperty::Unsupported;
++    NamedPropertyDescriptor descriptor;
++    if (JSObject::getOwnNamedDescriptor(object, runtime, key, descriptor)) {
++      if (descriptor.flags.accessor)
++        return PlainProperty::Unsupported;
++      value = JSObject::getNamedSlotValueUnsafe(*object, runtime, descriptor)
++                  .unboxToHV(runtime);
++      return PlainProperty::Data;
++    }
++    object = object->getParent(runtime);
++  }
++  return object ? PlainProperty::Unsupported : PlainProperty::Missing;
++}
++
++bool plainPropertyEquals(
++    Runtime &runtime,
++    Handle<JSObject> object,
++    SymbolID key,
++    Handle<> expected) {
++  PinnedHermesValue value;
++  return plainProperty(runtime, object, key, value) == PlainProperty::Data &&
++      value.getRaw() == expected->getRaw();
++}
++
++bool plainNativeMethod(
++    Runtime &runtime,
++    Handle<JSObject> object,
++    Predefined::Str key,
++    NativeFunctionPtr expected) {
++  PinnedHermesValue value;
++  if (plainProperty(runtime, object, Predefined::getSymbolID(key), value) !=
++      PlainProperty::Data)
++    return false;
++  auto *function = dyn_vmcast<NativeFunction>(value);
++  return function && function->getFunctionPtr() == expected &&
++      function->getContext() == nullptr;
++}
++
++bool canDefineAllElement(Runtime &runtime) {
++  if (!plainPropertyEquals(runtime, runtime.getGlobal(),
++          Predefined::getSymbolID(Predefined::Object), runtime.objectConstructor) ||
++      !plainNativeMethod(runtime, runtime.objectConstructor,
++          Predefined::defineProperty, objectDefineProperty))
++    return false;
++  PinnedHermesValue ignored;
++  // The original descriptor literal inherits these two fields. Even an
++  // inherited undefined getter field makes a data descriptor invalid.
++  return plainProperty(runtime, runtime.objectPrototype,
++             Predefined::getSymbolID(Predefined::get), ignored) ==
++          PlainProperty::Missing &&
++      plainProperty(runtime, runtime.objectPrototype,
++          Predefined::getSymbolID(Predefined::set), ignored) ==
++          PlainProperty::Missing;
++}
 +
 +Handle<Environment> currentConfig(Runtime &runtime) {
 +  return runtime.makeHandle(
@@ -12289,6 +12404,219 @@ index 0000000000000000000000000000000000000000..f5f9b002a51100e61a36161f1992e9c9
 +
 +struct NativePromiseCore {
 +  using State = JSPromise::State;
++
++  static ExecutionStatus settleAll(
++      Runtime &runtime,
++      Handle<Environment> aggregate,
++      bool rejected,
++      Handle<> value) {
++    if (aggregate->slot(AllResolved).getBool())
++      return ExecutionStatus::RETURNED;
++    // Resolution may run a thenable while the result is still Pending.
++    // Preserve the capability's AlreadyResolved token independently of state.
++    aggregate->slot(AllResolved).set(
++        HermesValue::encodeBoolValue(true), runtime.getHeap());
++    if (!rejected)
++      aggregate->slot(AllExposed).set(
++          HermesValue::encodeBoolValue(true), runtime.getHeap());
++    auto config = runtime.makeHandle(aggregate->getParentEnvironment(runtime));
++    auto result = runtime.makeHandle<JSPromise>(aggregate->slot(AllResult));
++    return rejected ? reject(runtime, config, result, value)
++                    : resolve(runtime, config, result, value);
++  }
++
++  static ExecutionStatus collectAll(
++      Runtime &runtime,
++      Handle<Environment> aggregate,
++      Handle<> index,
++      Handle<> value,
++      bool directDefinition) {
++    auto values = runtime.makeHandle<JSObject>(aggregate->slot(AllValues));
++    if (directDefinition || canDefineAllElement(runtime)) {
++      if (!aggregate->slot(AllExposed).getBool()) {
++        // Until an observable callback receives it, this is a fresh array
++        // with only our default indexed properties. Keep its visible length
++        // current in case a later override exposes a partially filled result.
++        auto array = Handle<JSArray>::vmcast(values);
++        uint32_t offset = index->getNumber();
++        if (JSArray::setElementAt(array, runtime, offset, value) == ExecutionStatus::EXCEPTION)
++          return ExecutionStatus::EXCEPTION;
++        if (offset >= JSArray::getLength(*array, runtime)) {
++          auto length = SmallHermesValue::encodeNumberValue(offset + 1, runtime);
++          JSArray::putLengthUnsafe(*array, runtime, length);
++        }
++      } else if (JSObject::defineOwnComputed(values, runtime, index,
++              DefinePropertyFlags::getDefaultNewPropertyFlags(), value,
++              PropOpFlags().plusThrowOnError()) == ExecutionStatus::EXCEPTION) {
++        // A previous override may have exposed, frozen or redefined the array.
++        return ExecutionStatus::EXCEPTION;
++      }
++    } else {
++      aggregate->slot(AllExposed).set(
++          HermesValue::encodeBoolValue(true), runtime.getHeap());
++      auto config = runtime.makeHandle(aggregate->getParentEnvironment(runtime));
++      auto callback = runtime.makeHandle<Callable>(config->slot(AllDefine));
++      if (Callable::executeCall3(callback, runtime, Runtime::getUndefinedValue(),
++              values.getHermesValue(), *index, *value) == ExecutionStatus::EXCEPTION)
++        return ExecutionStatus::EXCEPTION;
++    }
++    auto remaining = aggregate->slot(AllRemaining).getNumber() - 1;
++    aggregate->slot(AllRemaining).set(
++        HermesValue::encodeTrustedNumberValue(remaining), runtime.getHeap());
++    return remaining == 0 ? settleAll(runtime, aggregate, false, values)
++                          : ExecutionStatus::RETURNED;
++  }
++
++  static CallResult<HermesValue> allReaction(
++      Runtime &runtime,
++      Handle<Environment> environment) {
++    if (!environment->slot(Busy).getBool() ||
++        !environment->slot(Rejected).isBool())
++      return runtime.raiseTypeError("Promise aggregation has no queued input");
++    auto aggregate = runtime.makeHandle(environment->getParentEnvironment(runtime));
++    auto config = runtime.makeHandle(aggregate->getParentEnvironment(runtime));
++    auto value = runtime.makeHandle(environment->slot(Argument));
++    auto index = runtime.makeHandle(environment->slot(Fulfill));
++    bool rejected = environment->slot(Rejected).getBool();
++    environment->slot(Argument).set(HermesValue::encodeUndefinedValue(), runtime.getHeap());
++    environment->slot(Busy).set(HermesValue::encodeBoolValue(false), runtime.getHeap());
++    auto status = rejected ? settleAll(runtime, aggregate, true, value)
++                           : collectAll(runtime, aggregate, index, value, false);
++    if (status == ExecutionStatus::EXCEPTION) {
++      if (isUncatchableError(runtime.getThrownValue()))
++        return ExecutionStatus::EXCEPTION;
++      // The JS .then result is otherwise unreachable and resolves undefined.
++      // Materialize its rejection only on a throw, including when tracking was
++      // enabled after registration. Never redirect that error to Promise.all.
++      auto error = runtime.makeHandle(runtime.getThrownValue());
++      runtime.clearThrownValue();
++      auto target = pending(runtime, config);
++      if (reject(runtime, config, target, error) == ExecutionStatus::EXCEPTION)
++        return ExecutionStatus::EXCEPTION;
++    }
++    return HermesValue::encodeUndefinedValue();
++  }
++
++  static CallResult<HermesValue> tryAll(
++      Runtime &runtime,
++      Handle<Environment> config,
++      Handle<> receiver,
++      Handle<> input) {
++    auto array = Handle<JSArray>::dyn_vmcast(input);
++    if (!array || JSArray::getLength(*array, runtime) > 4096 ||
++        receiver->getRaw() != config->slot(Constructor).getRaw() ||
++        !config->slot(HandleHook).isNull() || !config->slot(RejectHook).isNull())
++      return HermesValue::encodeUndefinedValue();
++    auto constructor = Handle<JSObject>::vmcast(receiver);
++    auto prototype = runtime.makeHandle<JSObject>(config->slot(Prototype));
++    auto resolveMethod = runtime.makeHandle<JSObject>(config->slot(AllResolve));
++    auto thenMethod = runtime.makeHandle(config->slot(AllThen));
++
++    uint32_t length = JSArray::getLength(*array, runtime);
++    {
++      bool checkedConstructor = false;
++      bool checkedThen = false;
++      GCScopeMarkerRAII marker(runtime);
++      for (uint32_t i = 0; i < length; ++i) {
++        // Indexed storage excludes holes, accessors and named index overrides.
++        auto item = array->at(runtime, i).unboxToHV(runtime);
++        if (item.isEmpty())
++          return HermesValue::encodeUndefinedValue();
++        if (!item.isObject())
++          continue;
++        auto promise = Handle<JSPromise>::dyn_vmcast(runtime.makeHandle(item));
++        if (!promise)
++          return HermesValue::encodeUndefinedValue();
++        if (promise->getParent(runtime) == *prototype &&
++            promise->getClass(runtime)->getNumProperties() == 0) {
++          // No JS runs in this guarded region. Empty native instances share
++          // the same prototype proofs until registration has finished.
++          if (!checkedConstructor) {
++            if (!plainPropertyEquals(runtime, prototype,
++                    Predefined::getSymbolID(Predefined::constructor), constructor))
++              return HermesValue::encodeUndefinedValue();
++            checkedConstructor = true;
++          }
++          if (promise->state_ != State::Fulfilled && !checkedThen) {
++            if (!plainPropertyEquals(runtime, prototype,
++                    config->slot(ThenKey).getSymbol(), thenMethod))
++              return HermesValue::encodeUndefinedValue();
++            checkedThen = true;
++          }
++        } else if (!plainPropertyEquals(runtime, promise,
++                Predefined::getSymbolID(Predefined::constructor), constructor) ||
++            (promise->state_ != State::Fulfilled &&
++             !plainPropertyEquals(runtime, promise, config->slot(ThenKey).getSymbol(), thenMethod)))
++          return HermesValue::encodeUndefinedValue();
++        marker.flush();
++      }
++    }
++
++    if (!plainPropertyEquals(runtime, constructor,
++            config->slot(ResolveKey).getSymbol(), resolveMethod) ||
++        !plainNativeMethod(runtime, resolveMethod, Predefined::call, functionPrototypeCall) ||
++        !plainPropertyEquals(runtime, array,
++            Predefined::getSymbolID(Predefined::SymbolIterator), runtime.arrayPrototypeValues) ||
++        !plainNativeMethod(runtime, runtime.arrayIteratorPrototype,
++            Predefined::next, arrayIteratorPrototypeNext) ||
++        !canDefineAllElement(runtime))
++      return HermesValue::encodeUndefinedValue();
++
++    auto result = pending(runtime, config);
++    auto valuesResult = JSArray::create(runtime, length, 0);
++    if (valuesResult == ExecutionStatus::EXCEPTION)
++      return ExecutionStatus::EXCEPTION;
++    auto values = runtime.makeHandle(std::move(*valuesResult));
++    auto aggregate = runtime.makeHandle<Environment>(
++        Environment::create(runtime, config, AllCount));
++    aggregate->slot(AllResult).set(result.getHermesValue(), runtime.getHeap());
++    aggregate->slot(AllValues).set(values.getHermesValue(), runtime.getHeap());
++    aggregate->slot(AllRemaining).set(
++        HermesValue::encodeTrustedNumberValue(length + 1), runtime.getHeap());
++    aggregate->slot(AllResolved).set(HermesValue::encodeBoolValue(false), runtime.getHeap());
++    aggregate->slot(AllExposed).set(HermesValue::encodeBoolValue(false), runtime.getHeap());
++    GCScopeMarkerRAII marker(runtime);
++    for (uint32_t i = 0; i < length; ++i) {
++      auto item = runtime.makeHandle(array->at(runtime, i).unboxToHV(runtime));
++      auto promise = Handle<JSPromise>::dyn_vmcast(item);
++      auto index = runtime.makeHandle(HermesValue::encodeTrustedNumberValue(i));
++      if (!promise || promise->state_ == State::Fulfilled) {
++        auto value = runtime.makeMutableHandle(
++            promise ? HermesValue(promise->result_) : *item);
++        // The existing Promise.resolve primitive cache maps both zero signs
++        // to +0. A value already stored in a Promise must keep its own sign.
++        if (!promise && value->isNumber() && value->getNumber() == 0)
++          value = HermesValue::encodeTrustedNumberValue(0);
++        // Entry guards prove that these writes cannot call JS. Retain the
++        // existing production-mode synchronous fulfilled shortcut.
++        if (collectAll(runtime, aggregate, index, value, true) == ExecutionStatus::EXCEPTION)
++          return ExecutionStatus::EXCEPTION;
++      } else {
++        auto environment = runtime.makeHandle<Environment>(
++            Environment::create(runtime, aggregate, ReactionCount));
++        auto reaction = makeFunction(runtime, environment, nativePromiseAllReactionJob,
++            0, 0);
++        writeReactionSlot(reaction, runtime, Fulfill, *index);
++        writeReactionSlot(reaction, runtime, Next, HermesValue::encodeNullValue());
++        writeReactionSlot(reaction, runtime, Busy, HermesValue::encodeBoolValue(false));
++        if (handle(runtime, config, promise, reaction) == ExecutionStatus::EXCEPTION)
++          return ExecutionStatus::EXCEPTION;
++      }
++      marker.flush();
++    }
++    auto remaining = aggregate->slot(AllRemaining).getNumber() - 1;
++    aggregate->slot(AllRemaining).set(
++        HermesValue::encodeTrustedNumberValue(remaining), runtime.getHeap());
++    if (remaining == 0 &&
++        settleAll(runtime, aggregate, false, values) == ExecutionStatus::EXCEPTION) {
++      if (isUncatchableError(runtime.getThrownValue()))
++        return ExecutionStatus::EXCEPTION;
++      // The outer JS catch calls the capability reject, whose token has
++      // already been consumed by resolve, even if thenable assimilation threw.
++      runtime.clearThrownValue();
++    }
++    return result.getHermesValue();
++  }
 +
 +  static ExecutionStatus rejectThrown(
 +      Runtime &runtime,
@@ -12612,6 +12940,36 @@ index 0000000000000000000000000000000000000000..f5f9b002a51100e61a36161f1992e9c9
 +  }
 +};
 +
++namespace {
++// Aggregation uses separate native entries to keep its guards out of ordinary
++// Promise and async dispatch.
++CallResult<HermesValue> nativePromiseAllReactionJob(void *, Runtime &runtime) {
++  GCScope scope(runtime);
++  return NativePromiseCore::allReaction(runtime, currentConfig(runtime));
++}
++
++CallResult<HermesValue> nativePromiseConfigureAll(void *, Runtime &runtime) {
++  GCScope scope(runtime);
++  auto args = runtime.getCurrentFrame().getNativeArgs();
++  auto config = currentConfig(runtime);
++  if (!config->slot(AllResolve).isUndefined() ||
++      !args.dyncastArg<Callable>(0) || !args.dyncastArg<Callable>(1) ||
++      !args.dyncastArg<Callable>(2))
++    return runtime.raiseTypeError("Promise aggregation must be initialized once");
++  config->slot(AllResolve).set(args.getArg(0), runtime.getHeap());
++  config->slot(AllThen).set(args.getArg(1), runtime.getHeap());
++  config->slot(AllDefine).set(args.getArg(2), runtime.getHeap());
++  return HermesValue::encodeUndefinedValue();
++}
++
++CallResult<HermesValue> nativePromiseTryAll(void *, Runtime &runtime) {
++  GCScope scope(runtime);
++  auto args = runtime.getCurrentFrame().getNativeArgs();
++  return NativePromiseCore::tryAll(
++      runtime, currentConfig(runtime), args.getArgHandle(0), args.getArgHandle(1));
++}
++} // namespace
++
 +CallResult<HermesValue> nativePromiseConstructor(void *, Runtime &runtime) {
 +  GCScope scope(runtime);
 +  auto args = runtime.getCurrentFrame().getNativeArgs();
@@ -12833,15 +13191,24 @@ index 0000000000000000000000000000000000000000..f5f9b002a51100e61a36161f1992e9c9
 +  config->slot(RejectHook).set(HermesValue::encodeNullValue(), runtime.getHeap());
 +  config->slot(Noop).set(noop.getHermesValue(), runtime.getHeap());
 +  config->slot(ResolveNonExact).set(HermesValue::encodeUndefinedValue(), runtime.getHeap());
++  config->slot(AllResolve).set(HermesValue::encodeUndefinedValue(), runtime.getHeap());
 +  auto thenKey = runtime.getIdentifierTable().getSymbolHandle(runtime, createASCIIRef("then"));
 +  if (thenKey == ExecutionStatus::EXCEPTION)
 +    return ExecutionStatus::EXCEPTION;
 +  config->slot(ThenKey).set(HermesValue::encodeSymbolValue(**thenKey), runtime.getHeap());
++  auto resolveKey = runtime.getIdentifierTable().getSymbolHandle(runtime, createASCIIRef("resolve"));
++  if (resolveKey == ExecutionStatus::EXCEPTION)
++    return ExecutionStatus::EXCEPTION;
++  config->slot(ResolveKey).set(HermesValue::encodeSymbolValue(**resolveKey), runtime.getHeap());
 +  auto result = runtime.makeHandle(JSObject::create(runtime));
 +  if (JSObject::defineNewOwnProperty(result, runtime, **name,
 +          PropertyFlags::defaultNewNamedPropertyFlags(), constructor) == ExecutionStatus::EXCEPTION)
 +    return ExecutionStatus::EXCEPTION;
-+  struct Entry { const char *name; Operation operation; unsigned length; };
++  struct Entry {
++    const char *name;
++    Operation operation;
++    unsigned length;
++  };
 +  const Entry entries[] = {
 +    {"pending", Operation::Pending, 0}, {"fulfilled", Operation::Fulfilled, 1},
 +    {"resolve", Operation::Resolve, 2}, {"reject", Operation::Reject, 2},
@@ -12862,7 +13229,19 @@ index 0000000000000000000000000000000000000000..f5f9b002a51100e61a36161f1992e9c9
 +            PropertyFlags::defaultNewNamedPropertyFlags(), function) == ExecutionStatus::EXCEPTION)
 +      return ExecutionStatus::EXCEPTION;
 +  }
-+  return result.getHermesValue();
++  // Keep the new bootstrap hooks positional and capture them in JS closures.
++  // Named methods would add identifiers to every runtime and require a
++  // property lookup at each aggregation call.
++  auto hooksResult = JSArray::create(runtime, 3, 3);
++  if (hooksResult == ExecutionStatus::EXCEPTION)
++    return ExecutionStatus::EXCEPTION;
++  auto hooks = runtime.makeHandle(std::move(*hooksResult));
++  auto configureAll = makeFunction(runtime, config, nativePromiseConfigureAll, 3, 0);
++  auto tryAll = makeFunction(runtime, config, nativePromiseTryAll, 2, 0);
++  JSArray::setElementAt(hooks, runtime, 0, result);
++  JSArray::setElementAt(hooks, runtime, 1, configureAll);
++  JSArray::setElementAt(hooks, runtime, 2, tryAll);
++  return hooks.getHermesValue();
 +}
 +
 +} // namespace vm
@@ -14195,6 +14574,411 @@ index 0000000000000000000000000000000000000000..f5c53d104096f43e2614f7a6d6396462
 +// CHECK-NEXT: copied 15
 +// CHECK-NEXT: copied 16
 +// CHECK-NEXT: copied 17
+diff --git a/test/hermes/native-promise-all-gc.js b/test/hermes/native-promise-all-gc.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..19e524393f600f82b430e14469b3274f53f59bd2
+--- /dev/null
++++ b/test/hermes/native-promise-all-gc.js
+@@ -0,0 +1,81 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++// RUN: %hermes -O -Xnative-promise -Xhermes-internal-test-methods -gc-init-heap=4M -gc-max-heap=32M %s | %FileCheck --match-full-lines %s
++// REQUIRES: gc_hades
++
++function check(value, message) {
++  if (!value) throw new Error(message);
++}
++function collect() {
++  HermesInternal.drainJobs();
++  gc();
++}
++function sample() {
++  collect();
++  var stats = HermesInternal.getInstrumentedStats();
++  return {liveBytes: stats.js_allocatedBytes, heapBytes: stats.js_heapSize,
++    totalAllocatedBytes: stats.js_totalAllocatedBytes, collections: stats.js_numGCs};
++}
++function aggregate(size, rejectFirst) {
++  var inputs = [], resolvers = [], values = [];
++  for (var i = 0; i < size; ++i) {
++    var value = {index: i, payload: 'value-' + i};
++    values.push(value);
++    if (i % 2 === 0) inputs.push(Promise.resolve(value));
++    else inputs.push(new Promise(function (resolve, reject) {
++      resolvers.push({resolve: resolve, reject: reject, index: i});
++    }));
++  }
++  var completed = false;
++  var result = Promise.all(inputs);
++  result.then(function (items) {
++    check(!rejectFirst, 'unexpected fulfillment');
++    check(items.length === size, 'wrong result length');
++    for (var i = 0; i < size; ++i) check(items[i] === values[i], 'lost result identity');
++    completed = true;
++  }, function (error) {
++    check(rejectFirst && error === 'expected', 'wrong rejection');
++    completed = true;
++  });
++  inputs = null;
++  result = null;
++  gc();
++  if (rejectFirst) {
++    resolvers[0].reject('expected');
++    collect();
++    check(completed, 'aggregate did not reject');
++  }
++  for (var i = 0; i < resolvers.length; ++i) {
++    if (!rejectFirst || i !== 0) resolvers[i].resolve(values[resolvers[i].index]);
++    if (i % 128 === 0) gc();
++  }
++  collect();
++  check(completed, 'aggregate did not complete');
++}
++// Exercise both sides of the bounded native path and collections while the
++// aggregate is reachable only through pending reactions and the job queue.
++for (var size of [0, 1, 4096, 4097]) aggregate(size, false);
++aggregate(4096, true);
++var measurements = [];
++for (var epoch = 0; epoch < 6; ++epoch) {
++  for (var iteration = 0; iteration < 16; ++iteration) {
++    aggregate(128, iteration % 2 === 0);
++  }
++  measurements.push(sample());
++}
++var minimum = measurements[0].liveBytes;
++var maximum = minimum;
++for (var measurement of measurements) {
++  minimum = Math.min(minimum, measurement.liveBytes);
++  maximum = Math.max(maximum, measurement.liveBytes);
++}
++// Allow the small measurement records and runtime housekeeping, but reject
++// retaining even one complete result per iteration after all reactions drain.
++check(maximum - minimum < 65536, 'completed aggregates retain their values');
++print('native Promise.all GC passed');
++// CHECK: native Promise.all GC passed
+diff --git a/test/hermes/native-promise-all.js b/test/hermes/native-promise-all.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..bbcffdbbf9759faa947879434d0272c85266472d
+--- /dev/null
++++ b/test/hermes/native-promise-all.js
+@@ -0,0 +1,312 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++// RUN: %hermes -Xnative-promise -Xhermes-internal-test-methods %s | %FileCheck --match-full-lines %s
++// RUN: %hermes -O -Xnative-promise -Xhermes-internal-test-methods %s | %FileCheck --match-full-lines %s
++
++function check(value, message) {
++  if (!value) throw new Error(message);
++}
++function drain() {
++  if (typeof gc === 'function') gc();
++  HermesInternal.drainJobs();
++}
++function outcome(promise) {
++  var result = {state: 'pending'};
++  promise.then(function (value) {
++    result.state = 'fulfilled';
++    result.value = value;
++  }, function (error) {
++    result.state = 'rejected';
++    result.value = error;
++  });
++  return result;
++}
++function fulfilled(result, expected) {
++  drain();
++  check(result.state === 'fulfilled', 'expected fulfillment');
++  check(JSON.stringify(result.value) === JSON.stringify(expected), 'wrong values');
++}
++
++fulfilled(outcome(Promise.all([])), []);
++fulfilled(outcome(Promise.all([Promise.resolve(1), Promise.resolve(2)])), [1, 2]);
++fulfilled(outcome(Promise.all([Promise.resolve(3), 4])), [3, 4]);
++fulfilled(outcome(Promise.all([, Promise.resolve(5)])), [undefined, 5]);
++var primitiveValues = [undefined, null, true, false, 0, -0, NaN,
++  Infinity, -Infinity, '', 'text', Symbol('marker'), 123n];
++var primitiveResult = outcome(Promise.all(primitiveValues));
++drain();
++check(primitiveResult.state === 'fulfilled', 'primitive aggregation failed');
++for (var i = 0; i < primitiveValues.length; ++i) {
++  check(Object.is(primitiveResult.value[i], i === 5 ? 0 : primitiveValues[i]),
++        'primitive resolution changed');
++}
++var negativeZero = new Promise(function (resolve) { resolve(-0); });
++var zeroResult = outcome(Promise.all([negativeZero, -0]));
++drain();
++check(Object.is(zeroResult.value[0], -0) && Object.is(zeroResult.value[1], 0),
++      'Promise and primitive zero signs were conflated');
++fulfilled(outcome(Promise.all([{then: function (resolve) { resolve(22); }}])), [22]);
++
++var resolveFirst, resolveSecond, rejectThird;
++var first = new Promise(function (r) { resolveFirst = r; });
++var second = new Promise(function (r) { resolveSecond = r; });
++var third = new Promise(function (r, j) { rejectThird = j; });
++var mixed = outcome(Promise.all([first, Promise.resolve(6), second, first]));
++resolveSecond(7);
++drain();
++check(mixed.state === 'pending', 'completed before all inputs');
++resolveFirst(8);
++fulfilled(mixed, [8, 6, 7, 8]);
++var rejected = outcome(Promise.all([Promise.resolve(9), third]));
++rejectThird('reason');
++drain();
++check(rejected.state === 'rejected' && rejected.value === 'reason', 'lost rejection');
++
++var resolveSource, resolveAdopter;
++var source = new Promise(function (r) { resolveSource = r; });
++var adopter = new Promise(function (r) { resolveAdopter = r; });
++resolveAdopter(source);
++var adopted = outcome(Promise.all([adopter]));
++resolveSource(10);
++fulfilled(adopted, [10]);
++
++// Already-fulfilled inputs retain the existing synchronous shortcut. Adopted
++// promises still schedule a job, even when their target is already fulfilled.
++var syncOrder = [];
++Promise.all([Promise.resolve(11)]).then(function () { syncOrder.push('all'); });
++Promise.resolve().then(function () { syncOrder.push('other'); });
++drain();
++check(syncOrder.join(',') === 'all,other', 'fulfilled timing changed');
++
++var originalResolve = Promise.resolve;
++var resolveReads = 0;
++Object.defineProperty(Promise, 'resolve', {configurable: true, get: function () {
++  ++resolveReads;
++  return originalResolve;
++}});
++var getterResult = outcome(Promise.all([first, second]));
++Object.defineProperty(Promise, 'resolve', {value: originalResolve, writable: true, configurable: true});
++fulfilled(getterResult, [8, 7]);
++check(resolveReads === 1, 'resolve getter was duplicated');
++
++var callCount = 0;
++originalResolve.call = function (receiver, value) {
++  ++callCount;
++  return Reflect.apply(originalResolve, receiver, [value]);
++};
++var customCall = outcome(Promise.all([first, second]));
++delete originalResolve.call;
++fulfilled(customCall, [8, 7]);
++check(callCount === 2, 'resolve.call override skipped');
++
++var constructorReads = 0;
++var constructorGetter = Promise.resolve(12);
++Object.defineProperty(constructorGetter, 'constructor', {get: function () {
++  ++constructorReads;
++  return Promise;
++}});
++fulfilled(outcome(Promise.all([constructorGetter])), [12]);
++check(constructorReads === 1, 'constructor getter was duplicated');
++
++var prototypeInputs = [Promise.resolve(23), Promise.resolve(24)];
++var prototypeConstructor = Object.getOwnPropertyDescriptor(Promise.prototype, 'constructor');
++var prototypeReads = 0;
++Object.defineProperty(Promise.prototype, 'constructor', {configurable: true, get: function () {
++  ++prototypeReads;
++  return Promise;
++}});
++var prototypeResult = Promise.all(prototypeInputs);
++Object.defineProperty(Promise.prototype, 'constructor', prototypeConstructor);
++fulfilled(outcome(prototypeResult), [23, 24]);
++check(prototypeReads === 2, 'prototype constructor getter was skipped or duplicated');
++
++var resolvePrototypeA, resolvePrototypeB;
++var prototypeA = new Promise(function (r) { resolvePrototypeA = r; });
++var prototypeB = new Promise(function (r) { resolvePrototypeB = r; });
++var prototypeThen = Object.getOwnPropertyDescriptor(Promise.prototype, 'then');
++var thenReads = 0;
++Object.defineProperty(Promise.prototype, 'then', {configurable: true, get: function () {
++  ++thenReads;
++  return prototypeThen.value;
++}});
++var prototypePending = Promise.all([prototypeA, prototypeB]);
++Object.defineProperty(Promise.prototype, 'then', prototypeThen);
++var prototypePendingResult = outcome(prototypePending);
++resolvePrototypeA(25);
++resolvePrototypeB(26);
++fulfilled(prototypePendingResult, [25, 26]);
++check(thenReads === 2, 'prototype then getter was skipped or duplicated');
++
++var resolveThenInput;
++var thenInput = new Promise(function (r) { resolveThenInput = r; });
++var thenCalls = 0;
++thenInput.then = function (resolve, reject) {
++  ++thenCalls;
++  resolve(13);
++  resolve(99);
++};
++fulfilled(outcome(Promise.all([thenInput])), [13]);
++check(thenCalls === 1, 'custom then was skipped');
++
++var iteratorCalls = 0;
++var iterable = [first, second];
++iterable[Symbol.iterator] = function* () {
++  ++iteratorCalls;
++  yield second;
++  yield first;
++};
++fulfilled(outcome(Promise.all(iterable)), [7, 8]);
++check(iteratorCalls === 1, 'custom iterator was duplicated');
++
++var accessors = [first];
++var elementReads = 0;
++Object.defineProperty(accessors, 0, {get: function () {
++  ++elementReads;
++  return second;
++}});
++fulfilled(outcome(Promise.all(accessors)), [7]);
++check(elementReads === 1, 'element getter was duplicated');
++
++class OtherPromise extends Promise {}
++var subclass = OtherPromise.all([first]);
++check(subclass instanceof OtherPromise, 'subclass result lost');
++fulfilled(outcome(subclass), [8]);
++
++var originalDefine = Object.defineProperty;
++var resolveLate;
++var late = new Promise(function (r) { resolveLate = r; });
++var lateResult = outcome(Promise.all([late]));
++var definitions = 0;
++Object.defineProperty = function (object, key, descriptor) {
++  ++definitions;
++  check(descriptor.value === 14 && descriptor.writable &&
++        descriptor.enumerable && descriptor.configurable, 'descriptor changed');
++  return originalDefine(object, key, descriptor);
++};
++resolveLate(14);
++drain();
++Object.defineProperty = originalDefine;
++fulfilled(lateResult, [14]);
++check(definitions === 1, 'late defineProperty override skipped');
++
++var resolveMiddle;
++var middle = new Promise(function (r) { resolveMiddle = r; });
++var partial = outcome(Promise.all([Promise.resolve(27), middle, Promise.resolve(29)]));
++var partialObserved = false;
++Object.defineProperty = function (object, key, descriptor) {
++  check(object.length === 3 && Object.keys(object).join(',') === '0,2',
++        'private result length or holes changed');
++  var firstDescriptor = Object.getOwnPropertyDescriptor(object, '0');
++  check(firstDescriptor.value === 27 && firstDescriptor.writable &&
++        firstDescriptor.enumerable && firstDescriptor.configurable,
++        'private result descriptor changed');
++  partialObserved = true;
++  return originalDefine(object, key, descriptor);
++};
++resolveMiddle(28);
++drain();
++Object.defineProperty = originalDefine;
++fulfilled(partial, [27, 28, 29]);
++check(partialObserved, 'partial result was not exposed');
++
++// Rejection does not suppress later resolve-element callbacks.
++var rejectEarly, resolveAfter;
++var early = new Promise(function (r, j) { rejectEarly = j; });
++var after = new Promise(function (r) { resolveAfter = r; });
++var earlyResult = outcome(Promise.all([early, after]));
++rejectEarly('early');
++drain();
++definitions = 0;
++Object.defineProperty = function (object, key, descriptor) {
++  ++definitions;
++  return originalDefine(object, key, descriptor);
++};
++resolveAfter(15);
++drain();
++Object.defineProperty = originalDefine;
++check(earlyResult.state === 'rejected' && earlyResult.value === 'early', 'rejection changed');
++check(definitions === 1, 'write after rejection was skipped');
++
++// A late descriptor-prototype getter must run. Its exception rejects the
++// discarded .then result, leaving the aggregate pending.
++var resolveDescriptor;
++var descriptorInput = new Promise(function (r) { resolveDescriptor = r; });
++var descriptorResult = outcome(Promise.all([descriptorInput]));
++var inheritedReads = 0;
++originalDefine(Object.prototype, 'get', {configurable: true, get: function () {
++  ++inheritedReads;
++  throw new Error('descriptor getter');
++}});
++resolveDescriptor(16);
++drain();
++delete Object.prototype.get;
++check(inheritedReads === 1 && descriptorResult.state === 'pending', 'descriptor prototype bypassed');
++
++// Exposing and freezing the result during one callback must affect the next.
++var resolveA, resolveB;
++var a = new Promise(function (r) { resolveA = r; });
++var b = new Promise(function (r) { resolveB = r; });
++var frozenResult = outcome(Promise.all([a, b]));
++Object.defineProperty = function (object, key, descriptor) {
++  originalDefine(object, key, descriptor);
++  Object.freeze(object);
++};
++resolveA(17);
++drain();
++Object.defineProperty = originalDefine;
++resolveB(18);
++drain();
++check(frozenResult.state === 'pending', 'frozen result array was overwritten');
++
++// Recursive job draining must retain aggregate state and each active value.
++var resolveOuter, resolveInner;
++var outer = new Promise(function (r) { resolveOuter = r; });
++var inner = new Promise(function (r) { resolveInner = r; });
++var recursive = outcome(Promise.all([outer, inner]));
++Object.defineProperty = function (object, key, descriptor) {
++  if (key === 0) {
++    resolveInner(20);
++    drain();
++  }
++  return originalDefine(object, key, descriptor);
++};
++resolveOuter(19);
++drain();
++Object.defineProperty = originalDefine;
++fulfilled(recursive, [19, 20]);
++
++// A tracker installed after registration observes the otherwise discarded
++// reaction result when the resolve-element callback throws.
++var resolveTracked;
++var trackedInput = new Promise(function (r) { resolveTracked = r; });
++var trackedPromise = Promise.all([trackedInput]);
++var trackedResult = outcome(trackedPromise);
++var timers = [];
++globalThis.setTimeout = function (callback) {
++  timers.push(callback);
++  return timers.length;
++};
++globalThis.clearTimeout = function (id) { timers[id - 1] = null; };
++var unhandled = [];
++HermesInternal.enablePromiseRejectionTracker({
++  allRejections: true,
++  onUnhandled: function (id, error, promise) {
++    unhandled.push({error: error, promise: promise});
++  },
++});
++var trackedError = new Error('late definition');
++Object.defineProperty = function () { throw trackedError; };
++resolveTracked(21);
++drain();
++Object.defineProperty = originalDefine;
++for (var timer of timers) if (timer !== null) timer();
++check(trackedResult.state === 'pending', 'callback error rejected aggregate');
++check(unhandled.length === 1 && unhandled[0].error === trackedError &&
++      unhandled[0].promise !== trackedPromise, 'discarded rejection not tracked');
++print('native Promise.all passed');
++// CHECK: native Promise.all passed
 diff --git a/test/hermes/native-promise-core.js b/test/hermes/native-promise-core.js
 new file mode 100644
 index 0000000000000000000000000000000000000000..917e8c0c0204c04cd200637c24f3a337c11a4320
@@ -18894,6 +19678,36 @@ index 0000000000000000000000000000000000000000..52f3e73c2678a0fd83a60eb5c200e8de
 +// CHECK-NEXT: 0.25 123
 +// C: _sh_ljs_create_regexp_precompiled
 +// C: _sh_ljs_imul_number
+diff --git a/test/shermes/native-promise-all-gc.js b/test/shermes/native-promise-all-gc.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..70a91a449d1ecce48d8414a6e66e6d8dbcf7fcee
+--- /dev/null
++++ b/test/shermes/native-promise-all-gc.js
+@@ -0,0 +1,9 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++// RUN: %shermes -O -exec -Wx,-Xnative-promise,-Xhermes-internal-test-methods,-gc-init-heap=4M,-gc-max-heap=32M %S/../hermes/native-promise-all-gc.js | %FileCheck --match-full-lines %S/../hermes/native-promise-all-gc.js
++// REQUIRES: gc_hades
+diff --git a/test/shermes/native-promise-all.js b/test/shermes/native-promise-all.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..dfae0e23d8f89ffe2403adb1c5b8f5c833b42e4d
+--- /dev/null
++++ b/test/shermes/native-promise-all.js
+@@ -0,0 +1,9 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++// RUN: %shermes -O -exec -Wx,-Xnative-promise,-Xhermes-internal-test-methods %S/../hermes/native-promise-all.js | %FileCheck --match-full-lines %S/../hermes/native-promise-all.js
++// RUN: %shermes -O -Xsmall-c -exec -Wx,-Xnative-promise,-Xhermes-internal-test-methods %S/../hermes/native-promise-all.js | %FileCheck --match-full-lines %S/../hermes/native-promise-all.js
 diff --git a/test/shermes/native-promise.js b/test/shermes/native-promise.js
 new file mode 100644
 index 0000000000000000000000000000000000000000..a4a0f24753225b596774c7d7c77b54e4e97e1123
