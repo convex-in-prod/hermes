@@ -421,7 +421,11 @@ CallResult<HermesValue> dateConstructor_RJS(void *, Runtime &runtime) {
   NativeArgs args = runtime.getCurrentFrame().getNativeArgs();
   if (!args.isConstructorCall()) {
     llvh::SmallString<32> str{};
-    double t = curTime();
+    auto now = dateNow(nullptr, runtime);
+    if (LLVM_UNLIKELY(now == ExecutionStatus::EXCEPTION)) {
+      return ExecutionStatus::EXCEPTION;
+    }
+    double t = now->getNumber();
     double local =
         localTime(t, runtime.getJSLibStorage()->localTimeOffsetCache);
     dateTimeString(local, local - t, str);
@@ -439,7 +443,11 @@ CallResult<HermesValue> dateConstructor_RJS(void *, Runtime &runtime) {
   double finalDate;
   if (argCount == 0) {
     // No arguments, just set it to the current time.
-    finalDate = curTime();
+    auto now = dateNow(nullptr, runtime);
+    if (LLVM_UNLIKELY(now == ExecutionStatus::EXCEPTION)) {
+      return ExecutionStatus::EXCEPTION;
+    }
+    finalDate = now->getNumber();
   } else if (argCount == 1) {
     if (auto *dateArg = dyn_vmcast<JSDate>(args.getArg(0))) {
       // No handle needed here because we just retrieve a double.
@@ -542,7 +550,18 @@ CallResult<HermesValue> dateUTC_RJS(void *, Runtime &runtime) {
 }
 
 CallResult<HermesValue> dateNow(void *, Runtime &runtime) {
-  return HermesValue::encodeTrustedNumberValue(curTime());
+  auto *storage = runtime.getJSLibStorage();
+  if (!storage->currentTimeProvider) {
+    return HermesValue::encodeTrustedNumberValue(curTime());
+  }
+  double timeMs;
+  if (!storage->currentTimeProvider(storage->currentTimeContext, &timeMs)) {
+    return runtime.raiseError("Current time is unavailable");
+  }
+  if (!std::isfinite(timeMs)) {
+    return runtime.raiseRangeError("Current time provider returned a non-finite value");
+  }
+  return HermesValue::encodeTrustedNumberValue(timeMs);
 }
 
 CallResult<HermesValue> datePrototypeToStringHelper(

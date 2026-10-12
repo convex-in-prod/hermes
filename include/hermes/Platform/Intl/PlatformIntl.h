@@ -16,20 +16,35 @@
 #include "hermes/VM/JSObject.h"
 #include "hermes/VM/StringPrimitive.h"
 
+#include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
+#include <variant>
 
 namespace hermes {
 namespace platform_intl {
 
 class Option {
  public:
-  enum Kind { Bool, Number, String };
+  enum Kind { Bool, Number, String, BoolOrString
+#ifdef HERMES_USE_STATIC_INTL_PROVIDER
+    , DeferredNumber
+#endif
+  };
 
   Option(bool b) : kind_(Kind::Bool), num_(b ? 1.0 : 0.0) {}
   Option(double n) : kind_(Kind::Number), num_(n) {}
   Option(std::u16string s) : kind_(Kind::String), str_(std::move(s)) {}
+#ifdef HERMES_USE_STATIC_INTL_PROVIDER
+  explicit Option(vm::Handle<> raw) : kind_(Kind::DeferredNumber), raw_(raw) {}
+  bool isDeferredNumber() const { return kind_ == Kind::DeferredNumber; }
+  vm::Handle<> getDeferredNumber() const {
+    assert(isDeferredNumber());
+    return *raw_;
+  }
+#endif
   bool isBool() const {
     return kind_ == Kind::Bool;
   }
@@ -62,24 +77,29 @@ class Option {
   // I am too lazy to make this a union.
   double num_;
   std::u16string str_;
+#ifdef HERMES_USE_STATIC_INTL_PROVIDER
+  // Borrowed root in the option reader's scope; never retain input options in
+  // the constructed formatter. Deferred conversion can execute arbitrary JS.
+  std::optional<vm::Handle<>> raw_;
+#endif
 };
 
 using Options = std::unordered_map<std::u16string, Option>;
 using Part = std::unordered_map<std::u16string, std::u16string>;
 
-/// For functions which take locales, most of
-/// https://tc39.es/ecma402/#sec-canonicalizelocalelist has been done
-/// already.  All that remains is for each method to iterate the array
-/// and do steps 7.c.v-vii for each element.
-///
-/// For functions which take options, it has been canonicalized into a
-/// C++ map.
-///
-/// Formally, doing this canonicalization up front create an
-/// observable difference between the order of operations in ECMA 402
-/// and the actual operations, if the locals or options involve
-/// getters or Proxies.  For now, we will ignore this inconsistency,
-/// as anybody depending on it is trying too hard.
+#ifdef HERMES_USE_STATIC_INTL_PROVIDER
+class OptionReader {
+ public:
+  virtual ~OptionReader() = default;
+  virtual vm::CallResult<std::optional<Option>> read(
+      vm::Runtime &runtime, const std::u16string &name, Option::Kind kind) = 0;
+};
+#endif
+
+/// The static ICU provider receives canonical locales and reads constructor
+/// options through OptionReader, preserving observable reads and conversions.
+/// Its deferred numeric inputs borrow GC roots only during initialization.
+/// Other platform adapters still use the legacy normalized Options interface.
 
 vm::CallResult<std::vector<std::u16string>> getCanonicalLocales(
     vm::Runtime &runtime,
@@ -119,6 +139,12 @@ class Collator : public vm::DecoratedObject::Decoration {
       vm::Runtime &runtime,
       const std::vector<std::u16string> &locales,
       const Options &options) noexcept;
+#ifdef HERMES_USE_STATIC_INTL_PROVIDER
+  static vm::CallResult<std::unique_ptr<Collator>> create(
+      vm::Runtime &runtime,
+      const std::vector<std::u16string> &locales,
+      OptionReader &reader) noexcept;
+#endif
   Options resolvedOptions() noexcept;
 
   double compare(const std::u16string &x, const std::u16string &y) noexcept;
@@ -144,11 +170,30 @@ class DateTimeFormat : public vm::DecoratedObject::Decoration {
       vm::Runtime &runtime,
       const std::vector<std::u16string> &locales,
       const Options &options) noexcept;
+#ifdef HERMES_USE_STATIC_INTL_PROVIDER
+  static vm::CallResult<std::unique_ptr<DateTimeFormat>> create(
+      vm::Runtime &runtime,
+      const std::vector<std::u16string> &locales,
+      OptionReader &reader,
+      std::u16string_view required = u"any",
+      std::u16string_view defaults = u"date") noexcept;
+#endif
   Options resolvedOptions() noexcept;
 
+#ifdef HERMES_USE_STATIC_INTL_PROVIDER
+  vm::CallResult<std::u16string> format(vm::Runtime &runtime, double jsTimeValue) noexcept;
+  vm::CallResult<std::vector<Part>> formatToParts(vm::Runtime &runtime, double jsTimeValue) noexcept;
+  vm::CallResult<std::u16string> formatRange(vm::Runtime &runtime, double start, double end) noexcept;
+  vm::CallResult<std::vector<Part>> formatRangeToParts(vm::Runtime &runtime, double start, double end) noexcept;
+#else
   std::u16string format(double jsTimeValue) noexcept;
   std::vector<Part> formatToParts(double jsTimeValue) noexcept;
+#endif
 };
+
+#ifdef HERMES_USE_STATIC_INTL_PROVIDER
+using NumberFormatValue = std::variant<double, std::string>;
+#endif
 
 class NumberFormat : public vm::DecoratedObject::Decoration {
  protected:
@@ -170,10 +215,23 @@ class NumberFormat : public vm::DecoratedObject::Decoration {
       vm::Runtime &runtime,
       const std::vector<std::u16string> &locales,
       const Options &options) noexcept;
+#ifdef HERMES_USE_STATIC_INTL_PROVIDER
+  static vm::CallResult<std::unique_ptr<NumberFormat>> create(
+      vm::Runtime &runtime,
+      const std::vector<std::u16string> &locales,
+      OptionReader &reader) noexcept;
+#endif
   Options resolvedOptions() noexcept;
 
+#ifdef HERMES_USE_STATIC_INTL_PROVIDER
+  vm::CallResult<std::u16string> format(vm::Runtime &runtime, const NumberFormatValue &value) noexcept;
+  vm::CallResult<std::vector<Part>> formatToParts(vm::Runtime &runtime, const NumberFormatValue &value) noexcept;
+  vm::CallResult<std::u16string> formatRange(vm::Runtime &runtime, const NumberFormatValue &start, const NumberFormatValue &end) noexcept;
+  vm::CallResult<std::vector<Part>> formatRangeToParts(vm::Runtime &runtime, const NumberFormatValue &start, const NumberFormatValue &end) noexcept;
+#else
   std::u16string format(double jsTimeValue) noexcept;
   std::vector<Part> formatToParts(double jsTimeValue) noexcept;
+#endif
 };
 
 } // namespace platform_intl

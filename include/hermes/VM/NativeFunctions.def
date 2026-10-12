@@ -446,6 +446,9 @@ NATIVE_FUNCTION(intlDateTimeFormatFormat)
 NATIVE_FUNCTION(intlDateTimeFormatSupportedLocalesOf)
 NATIVE_FUNCTION(intlDateTimeFormatPrototypeFormatGetter)
 NATIVE_FUNCTION(intlDateTimeFormatPrototypeFormatToParts)
+#ifdef HERMES_USE_STATIC_INTL_PROVIDER
+NATIVE_FUNCTION(intlDateTimeFormatPrototypeFormatRange)
+#endif
 NATIVE_FUNCTION(intlDateTimeFormatPrototypeResolvedOptions)
 
 NATIVE_FUNCTION(intlNumberFormatConstructor)
@@ -453,6 +456,9 @@ NATIVE_FUNCTION(intlNumberFormatFormat)
 NATIVE_FUNCTION(intlNumberFormatSupportedLocalesOf)
 NATIVE_FUNCTION(intlNumberFormatPrototypeFormatGetter)
 NATIVE_FUNCTION(intlNumberFormatPrototypeFormatToParts)
+#ifdef HERMES_USE_STATIC_INTL_PROVIDER
+NATIVE_FUNCTION(intlNumberFormatPrototypeFormatRange)
+#endif
 NATIVE_FUNCTION(intlNumberFormatPrototypeResolvedOptions)
 
 NATIVE_FUNCTION(intlDatePrototypeToLocaleDateString)

@@ -13,6 +13,7 @@
 #include "hermes/VM/FastArray.h"
 #include "hermes/VM/Interpreter.h"
 #include "hermes/VM/JIT/Config.h"
+#include "hermes/VM/JSLib/JSLibStorage.h"
 #include "hermes/VM/JSArray.h"
 #include "hermes/VM/JSCallableProxy.h"
 #include "hermes/VM/JSGeneratorObject.h"
@@ -40,6 +41,13 @@ using namespace hermes;
 using namespace hermes::vm;
 
 extern "C" void _SH_MODEL(void) {}
+
+extern "C" void _sh_set_current_time_provider(
+    SHRuntime *shr, SHCurrentTimeProvider provider, void *context) {
+  auto *storage = getRuntime(shr).getJSLibStorage();
+  storage->currentTimeProvider = provider;
+  storage->currentTimeContext = context;
+}
 
 extern "C" void _sh_get_heap_statistics(
     SHRuntime *shr, SHHeapStatistics *statistics) {

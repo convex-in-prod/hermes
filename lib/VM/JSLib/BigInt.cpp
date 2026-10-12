@@ -18,6 +18,10 @@
 namespace hermes {
 namespace vm {
 
+#ifdef HERMES_USE_STATIC_INTL_PROVIDER
+CallResult<HermesValue> intlBigIntPrototypeToLocaleString(Runtime &runtime);
+#endif
+
 void createBigIntConstructor(Runtime &runtime) {
   Handle<JSObject> bigintPrototype{runtime.bigintPrototype};
 
@@ -57,7 +61,7 @@ void createBigIntConstructor(Runtime &runtime) {
       Predefined::getSymbolID(Predefined::toLocaleString),
       ctx,
       bigintPrototypeToLocaleString,
-      1);
+      0);
 
   // BigInt.xxx() methods.
   // https://tc39.es/ecma262/#sec-properties-of-the-bigint-constructor
@@ -117,6 +121,9 @@ CallResult<HermesValue> bigintConstructor(void *, Runtime &runtime) {
 CallResult<HermesValue> bigintPrototypeToLocaleString(
     void *ctx,
     Runtime &runtime) {
+#ifdef HERMES_USE_STATIC_INTL_PROVIDER
+  return intlBigIntPrototypeToLocaleString(runtime);
+#else
   NativeArgs args = runtime.getCurrentFrame().getNativeArgs();
   auto bigint = thisBigIntValue(runtime, args.getThisHandle());
   if (LLVM_UNLIKELY(bigint == ExecutionStatus::EXCEPTION)) {
@@ -137,6 +144,7 @@ CallResult<HermesValue> bigintPrototypeToLocaleString(
   }
 
   return res->getHermesValue();
+#endif
 }
 
 CallResult<HermesValue> bigintPrototypeToString(void *, Runtime &runtime) {
