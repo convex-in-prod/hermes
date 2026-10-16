@@ -40,8 +40,15 @@ Include the C++ memory header explicitly for GCC builds.
 Validation: Linux host compiler and runtime archives build; native adapter
 execution passes packed-value, intrinsic-snapshot and retained-chunk tests.
 Apple configuration is supported but has not been executed on this host.
+
+Expose an embedder-owned application clock provider for Date and Intl
+operations that request the current time. Keep explicit-date operations and
+internal runtime clocks unchanged. Reject a denied provider request and
+non-finite results before exposing time to JavaScript. The embedding host
+owns the provider context and replaces it only outside JavaScript execution.
 ---
  CMakeLists.txt                                |   11 +
+ README.md                                     |    8 +-
  doc/NativeIntl.md                             |   45 +
  external/icu-small/.syncignore                |   14 +
  external/icu-small/CMakeLists.txt             |   53 +
@@ -1029,9 +1036,11 @@ Apple configuration is supported but has not been executed on this host.
  include/hermes/Platform/Intl/PlatformIntl.h   |   86 +-
  include/hermes/Platform/Intl/hermes_icu.h     | 1355 +++
  include/hermes/Platform/Intl/icu_types.h      |  179 +
+ include/hermes/VM/JSLib/JSLibStorage.h        |    5 +
  include/hermes/VM/NativeFunctions.def         |    6 +
  include/hermes/VM/PredefinedStrings.def       |    4 +
  .../hermes/VM/RuntimeHermesValueFields.def    |    3 +
+ include/hermes/VM/static_h.h                  |   11 +
  lib/Platform/Intl/BCP47Parser.cpp             |    3 +-
  lib/Platform/Intl/CMakeLists.txt              |   15 +-
  .../impl_icu_provider/IcuProviderStatic.cpp   |   11 +
@@ -1040,8 +1049,10 @@ Apple configuration is supported but has not been executed on this host.
  .../Intl/impl_icu_provider/IcuProviderUtils.h |  294 +
  .../PlatformIntlIcuProvider.cpp               | 2397 +++++
  lib/VM/JSLib/BigInt.cpp                       |   10 +-
+ lib/VM/JSLib/Date.cpp                         |   25 +-
  lib/VM/JSLib/Intl.cpp                         |  603 +-
- 1000 files changed, 539883 insertions(+), 76 deletions(-)
+ lib/VM/StaticH.cpp                            |    8 +
+ 1005 files changed, 539933 insertions(+), 83 deletions(-)
  create mode 100644 doc/NativeIntl.md
  create mode 100644 external/icu-small/.syncignore
  create mode 100644 external/icu-small/CMakeLists.txt
@@ -2056,6 +2067,25 @@ index da1218de06fb68d708c4cb72ebc259a6e32b8904..0289e62e57e439c891d52e1b0b193418
  if (HERMES_ENABLE_INTL)
    add_definitions(-DHERMES_ENABLE_INTL)
  endif()
+diff --git a/README.md b/README.md
+index 1e33f194c24d5c1f8dd3b538620d281f464d4dca..143915fc833454fa27f294402b2ae742037a812a 100644
+--- a/README.md
++++ b/README.md
+@@ -16,10 +16,10 @@ focused tests so isolated fixes can be proposed upstream independently.
+ 
+ The `patch-history` orphan branch is the applyable record of the current train.
+ It records the exact upstream base, source tip, generated patches, and result
+-tree. Use its `scripts/update.sh` before and after a rebase or amended source
+-commit, and `scripts/apply.sh` to reconstruct the train on the recorded
+-upstream checkout. The source branch remains the authoritative working tree;
+-the history branch is generated verification data.
++tree. Follow that branch's README to regenerate the snapshot before and after
++a rebase or amended source commit, and use its `scripts/apply.sh` to reconstruct
++the train on the recorded upstream checkout. The source branch remains the
++authoritative working tree; the history branch is generated verification data.
+ 
+ If you're only interested in using pre-built Hermes in a new or existing React Native app, you do not need to follow this guide or have direct access to the Hermes source. Instead, just follow [these instructions to enable Hermes](https://reactnative.dev/docs/hermes).
+ 
 diff --git a/doc/NativeIntl.md b/doc/NativeIntl.md
 new file mode 100644
 index 0000000000000000000000000000000000000000..95783fbf7aac30af8713b1ed4fd18ce0bb33cbb8
@@ -760294,6 +760324,22 @@ index 0000000000000000000000000000000000000000..985474fb2084dbe8cddbf1413d745b5a
 +#endif
 +
 +#endif /* HERMES_ICU_TYPES_H */
+diff --git a/include/hermes/VM/JSLib/JSLibStorage.h b/include/hermes/VM/JSLib/JSLibStorage.h
+index 0bdd5173066c44998b510cd82d2b6668c26fd461..ad53d57b34f22c6fdb3d2343e75164b794bc25f6 100644
+--- a/include/hermes/VM/JSLib/JSLibStorage.h
++++ b/include/hermes/VM/JSLib/JSLibStorage.h
+@@ -29,6 +29,11 @@ struct JSLibStorage {
+   std::mt19937_64 randomEngine_;
+   bool randomEngineSeeded_ = false;
+ 
++  /// An optional embedder clock for application Date/Intl observations. Internal
++  /// runtime clocks must remain available even when this provider denies access.
++  bool (*currentTimeProvider)(void *context, double *timeMs) = nullptr;
++  void *currentTimeContext = nullptr;
++
+   /// Time zone offset cache used in conversion between UTC and local time.
+   LocalTimeOffsetCache localTimeOffsetCache;
+ };
 diff --git a/include/hermes/VM/NativeFunctions.def b/include/hermes/VM/NativeFunctions.def
 index 5f252960bef367b16ac090baaa44c53e6df0c5da..4ac8eae07e9d76c18049b1a6c8d35b0b734ebdbd 100644
 --- a/include/hermes/VM/NativeFunctions.def
@@ -760347,6 +760393,28 @@ index 42ca00073903029d96198bba0a56b3cdd54f7a06..ebbfcc1b4cf2d3422925d7d24aa9f574
  #endif
  
  RUNTIME_HV_FIELD(promiseRejectionTrackingHook_, HermesValue)
+diff --git a/include/hermes/VM/static_h.h b/include/hermes/VM/static_h.h
+index 4dd18186b7e072d193f56243b2b2c9285be2a029..bdeb4c2b5ca299d25ee83c2ae95fc34cc3b50455 100644
+--- a/include/hermes/VM/static_h.h
++++ b/include/hermes/VM/static_h.h
+@@ -375,6 +375,17 @@ _sh_init_with_error(int argc, char **argv, char **errorMessage);
+ /// Destroy a runtime instance created by \c _sh_init();
+ SHERMES_EXPORT void _sh_done(SHRuntime *shr);
+ 
++/// Set the application clock used by Date and by Intl operations requesting the
++/// current time. A null provider restores the system clock. The provider returns
++/// true and writes finite Unix milliseconds, or false to raise a JavaScript Error.
++/// It must not throw, re-enter the runtime, or allocate GC-managed objects. The
++/// embedder owns context and must keep it valid until the provider is replaced or
++/// the runtime is destroyed. Call only while the runtime is not executing JS.
++/// Internal runtime clocks and explicit-date operations are unaffected.
++typedef bool (*SHCurrentTimeProvider)(void *context, double *timeMs);
++SHERMES_EXPORT void _sh_set_current_time_provider(
++    SHRuntime *shr, SHCurrentTimeProvider provider, void *context);
++
+ /// Cumulative GC counters and current heap occupancy. This reads counters,
+ /// without collecting, traversing the heap, or allocating JS values.
+ typedef struct SHHeapStatistics {
 diff --git a/lib/Platform/Intl/BCP47Parser.cpp b/lib/Platform/Intl/BCP47Parser.cpp
 index ca7bb22f66d3220ef892c4e4265c451f8b263ebb..28683874c41db9c115538c0ed73f7b3df56f6660 100644
 --- a/lib/Platform/Intl/BCP47Parser.cpp
@@ -764081,6 +764149,56 @@ index 0313e2d31adbddbba7fd3dcc0b7dcab9764896b6..6b4ab9b0b29542b643ed325b41a60b59
  }
  
  CallResult<HermesValue> bigintPrototypeToString(void *, Runtime &runtime) {
+diff --git a/lib/VM/JSLib/Date.cpp b/lib/VM/JSLib/Date.cpp
+index 67d18cfa713fc184e1a0437a31dd526d622a5c63..9cf0d908bde00bfd783a4ecd3de5ad725380def8 100644
+--- a/lib/VM/JSLib/Date.cpp
++++ b/lib/VM/JSLib/Date.cpp
+@@ -421,7 +421,11 @@ CallResult<HermesValue> dateConstructor_RJS(void *, Runtime &runtime) {
+   NativeArgs args = runtime.getCurrentFrame().getNativeArgs();
+   if (!args.isConstructorCall()) {
+     llvh::SmallString<32> str{};
+-    double t = curTime();
++    auto now = dateNow(nullptr, runtime);
++    if (LLVM_UNLIKELY(now == ExecutionStatus::EXCEPTION)) {
++      return ExecutionStatus::EXCEPTION;
++    }
++    double t = now->getNumber();
+     double local =
+         localTime(t, runtime.getJSLibStorage()->localTimeOffsetCache);
+     dateTimeString(local, local - t, str);
+@@ -439,7 +443,11 @@ CallResult<HermesValue> dateConstructor_RJS(void *, Runtime &runtime) {
+   double finalDate;
+   if (argCount == 0) {
+     // No arguments, just set it to the current time.
+-    finalDate = curTime();
++    auto now = dateNow(nullptr, runtime);
++    if (LLVM_UNLIKELY(now == ExecutionStatus::EXCEPTION)) {
++      return ExecutionStatus::EXCEPTION;
++    }
++    finalDate = now->getNumber();
+   } else if (argCount == 1) {
+     if (auto *dateArg = dyn_vmcast<JSDate>(args.getArg(0))) {
+       // No handle needed here because we just retrieve a double.
+@@ -542,7 +550,18 @@ CallResult<HermesValue> dateUTC_RJS(void *, Runtime &runtime) {
+ }
+ 
+ CallResult<HermesValue> dateNow(void *, Runtime &runtime) {
+-  return HermesValue::encodeTrustedNumberValue(curTime());
++  auto *storage = runtime.getJSLibStorage();
++  if (!storage->currentTimeProvider) {
++    return HermesValue::encodeTrustedNumberValue(curTime());
++  }
++  double timeMs;
++  if (!storage->currentTimeProvider(storage->currentTimeContext, &timeMs)) {
++    return runtime.raiseError("Current time is unavailable");
++  }
++  if (!std::isfinite(timeMs)) {
++    return runtime.raiseRangeError("Current time provider returned a non-finite value");
++  }
++  return HermesValue::encodeTrustedNumberValue(timeMs);
+ }
+ 
+ CallResult<HermesValue> datePrototypeToStringHelper(
 diff --git a/lib/VM/JSLib/Intl.cpp b/lib/VM/JSLib/Intl.cpp
 index d936f56e36c08c123af91754dc2e69aa790710a0..3c7de3b30489c8d127746301404c6695a84e443e 100644
 --- a/lib/VM/JSLib/Intl.cpp
@@ -765030,3 +765148,29 @@ index d936f56e36c08c123af91754dc2e69aa790710a0..3c7de3b30489c8d127746301404c6695
    vm::defineIntlCollator(runtime, lv.intl);
    vm::defineIntlDateTimeFormat(runtime, lv.intl);
    vm::defineIntlNumberFormat(runtime, lv.intl);
+diff --git a/lib/VM/StaticH.cpp b/lib/VM/StaticH.cpp
+index be4b578bb318d4816f5705467277f043a2f6101a..e53113aa7fd305e835149f0483f528d33b5259dd 100644
+--- a/lib/VM/StaticH.cpp
++++ b/lib/VM/StaticH.cpp
+@@ -13,6 +13,7 @@
+ #include "hermes/VM/FastArray.h"
+ #include "hermes/VM/Interpreter.h"
+ #include "hermes/VM/JIT/Config.h"
++#include "hermes/VM/JSLib/JSLibStorage.h"
+ #include "hermes/VM/JSArray.h"
+ #include "hermes/VM/JSCallableProxy.h"
+ #include "hermes/VM/JSGeneratorObject.h"
+@@ -41,6 +42,13 @@ using namespace hermes::vm;
+ 
+ extern "C" void _SH_MODEL(void) {}
+ 
++extern "C" void _sh_set_current_time_provider(
++    SHRuntime *shr, SHCurrentTimeProvider provider, void *context) {
++  auto *storage = getRuntime(shr).getJSLibStorage();
++  storage->currentTimeProvider = provider;
++  storage->currentTimeContext = context;
++}
++
+ extern "C" void _sh_get_heap_statistics(
+     SHRuntime *shr, SHHeapStatistics *statistics) {
+   GCBase::HeapInfo info;
