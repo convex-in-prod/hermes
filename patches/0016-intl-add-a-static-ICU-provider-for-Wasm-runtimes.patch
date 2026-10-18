@@ -760394,10 +760394,10 @@ index 42ca00073903029d96198bba0a56b3cdd54f7a06..ebbfcc1b4cf2d3422925d7d24aa9f574
  
  RUNTIME_HV_FIELD(promiseRejectionTrackingHook_, HermesValue)
 diff --git a/include/hermes/VM/static_h.h b/include/hermes/VM/static_h.h
-index 4dd18186b7e072d193f56243b2b2c9285be2a029..bdeb4c2b5ca299d25ee83c2ae95fc34cc3b50455 100644
+index 7e7c541b26ad14764ee806435961c9bf92b08eee..82bf5bc68d67320d3f39d6a8d86fb9705164b88b 100644
 --- a/include/hermes/VM/static_h.h
 +++ b/include/hermes/VM/static_h.h
-@@ -375,6 +375,17 @@ _sh_init_with_error(int argc, char **argv, char **errorMessage);
+@@ -402,6 +402,17 @@ _sh_init_with_error(int argc, char **argv, char **errorMessage);
  /// Destroy a runtime instance created by \c _sh_init();
  SHERMES_EXPORT void _sh_done(SHRuntime *shr);
  
@@ -765149,7 +765149,7 @@ index d936f56e36c08c123af91754dc2e69aa790710a0..3c7de3b30489c8d127746301404c6695
    vm::defineIntlDateTimeFormat(runtime, lv.intl);
    vm::defineIntlNumberFormat(runtime, lv.intl);
 diff --git a/lib/VM/StaticH.cpp b/lib/VM/StaticH.cpp
-index be4b578bb318d4816f5705467277f043a2f6101a..e53113aa7fd305e835149f0483f528d33b5259dd 100644
+index 8378adbaa2348149888b3a63811056f638096a25..e8d86c50ae77a82527a7c203b98a7f7c278c7aad 100644
 --- a/lib/VM/StaticH.cpp
 +++ b/lib/VM/StaticH.cpp
 @@ -13,6 +13,7 @@
@@ -765160,7 +765160,7 @@ index be4b578bb318d4816f5705467277f043a2f6101a..e53113aa7fd305e835149f0483f528d3
  #include "hermes/VM/JSArray.h"
  #include "hermes/VM/JSCallableProxy.h"
  #include "hermes/VM/JSGeneratorObject.h"
-@@ -41,6 +42,13 @@ using namespace hermes::vm;
+@@ -42,6 +43,13 @@ using namespace hermes::vm;
  
  extern "C" void _SH_MODEL(void) {}
  

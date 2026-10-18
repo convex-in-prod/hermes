@@ -158,6 +158,21 @@ and GC safety during queued callbacks and reentrant collection.
 
 Validate native and compiled callers with override, adoption, rejection,
 signed-zero, bounds, array-exposure and GC cases.
+
+Prepare compiler-described ordinary literal layouts before initialized-image
+capture. Root each unit's prepared classes in long-lived GC-managed storage,
+populate descendant maps before parent maps, and preserve prepared parent
+lookup storage when constructing descendants. Ordinary, typed and private
+layouts retain distinct eligibility and existing allocation semantics.
+
+Expose runtime-owned preparation and young-reclamation boundaries. Perform
+full collection for preparation, return only verified empty nursery payload,
+and defer young-only maintenance when old-generation progress is required.
+Keep survivor tracing, finalizers and ordinary GC authority intact.
+
+Validate prepared parent/child maps across units and collection, deferred young
+reclamation, 115 compiler layout cases and 37 native executions. Build both
+host and Wasm runtime archives without claiming complete embedding acceptance.
 ---
  API/hermes/SynthTrace.cpp                     |    1 +
  API/hermes/SynthTraceParser.cpp               |    4 +
@@ -177,6 +192,7 @@ signed-zero, bounds, array-exposure and GC cases.
  include/hermes/VM/CellKind.h                  |    6 +
  include/hermes/VM/CellKinds.def               |    1 +
  include/hermes/VM/GCCell.h                    |    1 +
+ include/hermes/VM/HadesGC.h                   |   23 +-
  include/hermes/VM/HermesValueTraits.h         |    1 +
  include/hermes/VM/JSLib.h                     |    1 +
  include/hermes/VM/JSObject.h                  |   20 +-
@@ -189,7 +205,7 @@ signed-zero, bounds, array-exposure and GC cases.
  include/hermes/VM/ScopedStringReuse.h         |  241 +++
  include/hermes/VM/StringPrimitive.h           |    8 +-
  include/hermes/VM/sh_mirror.h                 |   44 +
- include/hermes/VM/static_h.h                  |  346 +++++
+ include/hermes/VM/static_h.h                  |  399 +++++
  include/hermes/VMLayouts/PropertyCache.h      |   24 +
  lib/BCGen/LiteralBufferBuilder.cpp            |  143 +-
  lib/BCGen/SH/CBundleLayout.cpp                |  782 ++++++++++
@@ -197,7 +213,7 @@ signed-zero, bounds, array-exposure and GC cases.
  lib/BCGen/SH/CMakeLists.txt                   |    1 +
  lib/BCGen/SH/LowerCalls.cpp                   |   11 +
  lib/BCGen/SH/PeepholeLowering.cpp             |  483 +++++-
- lib/BCGen/SH/SH.cpp                           | 1293 ++++++++++++++---
+ lib/BCGen/SH/SH.cpp                           | 1319 ++++++++++++++---
  lib/BCGen/SH/SHRegAlloc.cpp                   |   16 +-
  lib/BCGen/SH/SHRegAlloc.h                     |    9 +-
  lib/CMakeLists.txt                            |    9 +
@@ -234,25 +250,27 @@ signed-zero, bounds, array-exposure and GC cases.
  lib/VM/JSLib/HermesInternal.cpp               |   19 +
  lib/VM/JSLib/Math.cpp                         |   51 +-
  lib/VM/JSLib/MathStdFunctions.def             |    2 +-
- lib/VM/JSLib/NativePromise.cpp                |  987 +++++++++++++
+ lib/VM/JSLib/NativePromise.cpp                |  987 ++++++++++++
  lib/VM/JSLib/String.cpp                       |   15 +-
  lib/VM/JSObject.cpp                           |   11 +-
  lib/VM/JSPromise.cpp                          |   46 +
  lib/VM/JSTypedArray.cpp                       |    7 +
  lib/VM/Runtime.cpp                            |   14 +-
  lib/VM/RuntimeFlags.cpp                       |    1 +
- lib/VM/StaticH.cpp                            |  750 +++++++++-
- lib/VM/StaticHUnit.cpp                        |   18 +
+ lib/VM/SHUnitExt.h                            |    6 +
+ lib/VM/StaticH.cpp                            |  863 ++++++++++-
+ lib/VM/StaticHUnit.cpp                        |   21 +
  lib/VM/StringPrimitive.cpp                    |    4 +
+ lib/VM/gcs/HadesGC.cpp                        |   39 +-
  public/hermes/Public/RuntimeConfig.h          |    3 +
  test/Optimizer/func_sig_opts.js               |    3 +-
  .../copyDataProperties-fresh-fast-path.js     |  119 ++
  test/hermes/copyDataProperties-fresh-gc.js    |   48 +
- test/hermes/native-promise-all-gc.js          |   81 ++
+ test/hermes/native-promise-all-gc.js          |   81 +
  test/hermes/native-promise-all.js             |  312 ++++
- test/hermes/native-promise-core.js            |  163 +++
+ test/hermes/native-promise-core.js            |  163 ++
  test/hermes/native-promise-reentrancy.js      |   80 +
- test/shermes/Inputs/check-c-bundle-layout.py  |  650 +++++++++
+ test/shermes/Inputs/check-c-bundle-layout.py  |  658 ++++++++
  .../Inputs/check-scoped-normalization.py      |   44 +
  .../Inputs/scoped-normalization-main.cpp      |  165 +++
  .../array-callback-lowering-exceptions.js     |   77 +
@@ -309,11 +327,12 @@ signed-zero, bounds, array-exposure and GC cases.
  unittests/API/SynthTraceParserTest.cpp        |    3 +
  unittests/API/SynthTraceSerializationTest.cpp |    3 +
  unittests/Optimizer/CMakeLists.txt            |    1 +
- .../Scalar/RecordUseAnalysisTest.cpp          |  487 +++++++
+ .../Scalar/RecordUseAnalysisTest.cpp          |  487 ++++++
  .../PlatformUnicode/CharacterPropertyTest.cpp |   26 +
- unittests/VMRuntime/StaticHUnitTest.cpp       |   50 +
+ unittests/VMRuntime/GCBasicsTest.cpp          |   39 +
+ unittests/VMRuntime/StaticHUnitTest.cpp       |  122 ++
  unittests/VMRuntime/StringPrimitiveTest.cpp   |  189 +++
- 154 files changed, 18818 insertions(+), 392 deletions(-)
+ 158 files changed, 19197 insertions(+), 395 deletions(-)
  create mode 100644 include/hermes/Optimizer/Scalar/RecordUseAnalysis.h
  create mode 100644 include/hermes/Support/MathFunctions.h
  create mode 100644 include/hermes/VM/JSPromise.h
@@ -1884,6 +1903,47 @@ index e0113c612137bb4eacb3fa4a11b7184be6eabce8..0dfc40acbd3fe168bcc8a75b71f5ec25
    static_assert(
        kNumCellKinds < 256,
        "More cell kinds than available kind bits.");
+diff --git a/include/hermes/VM/HadesGC.h b/include/hermes/VM/HadesGC.h
+index bd03c3a93922221f0bb68f9a9277c797ff10340c..2659198f96aefc23c6fc56d7547ad9045b017086 100644
+--- a/include/hermes/VM/HadesGC.h
++++ b/include/hermes/VM/HadesGC.h
+@@ -225,6 +225,21 @@ class HadesGC final : public GCBase {
+   /// (Part of general GC API defined in GCBase.h).
+   void collect(std::string cause, bool canEffectiveOOM = false) override;
+ 
++  enum class YoungReclaimStatus : uint32_t { Deferred = 0, Reclaimed = 1 };
++  struct YoungReclaimResult {
++    YoungReclaimStatus status;
++    char *payloadBegin;
++    char *payloadEnd;
++  };
++
++  /// Reclaim the young generation at a mutator-owned quiescent boundary.
++  /// Survivors, weak references and native finalizers follow ordinary GC rules.
++  /// The returned payload contains no live objects until allocation resumes.
++  /// Defer for promotion, pending old-generation work or worst-case survivor
++  /// pressure that would reach the old-generation collection threshold.
++  /// This has ordinary young-GC cost, not a fixed work or latency bound.
++  YoungReclaimResult tryReclaimYoungGeneration();
++
+   /// Run the finalizers for all heap objects.
+   void finalizeAll() override;
+ 
+@@ -1341,7 +1356,13 @@ class HadesGC final : public GCBase {
+   ///   if one is not already active.
+   /// \post The YG is completely empty, and all bytes are available for new
+   ///   allocations.
+-  void youngGenCollection(std::string cause, bool forceOldGenCollection);
++  /// \param allowOldGenStart If false, the caller must establish that no old
++  ///   cycle, pending compaction or nursery promotion can run. Allocation-pressure
++  ///   collections retain the normal policy; explicit reclamation may defer it.
++  void youngGenCollection(
++      std::string cause,
++      bool forceOldGenCollection,
++      bool allowOldGenStart = true);
+ 
+   /// Implementation to actually do the YG collection. Mark roots, scan dirty
+   /// cards, and evacuate reachable objects.
 diff --git a/include/hermes/VM/HermesValueTraits.h b/include/hermes/VM/HermesValueTraits.h
 index f5ba95c4475d6a7c42f7e7d62dd246739651da0f..4220dd9077e836d7617b0f05813fab44313ee732 100644
 --- a/include/hermes/VM/HermesValueTraits.h
@@ -2489,7 +2549,7 @@ index f763724f14ed57a505f2e93054b9b48afef97983..5e7b0c9e2a03ed89c0e6df003acc6fb2
  typedef SHCompressedPointerRawType SHGCSmallHermesValue;
  #else
 diff --git a/include/hermes/VM/static_h.h b/include/hermes/VM/static_h.h
-index 13246ec2f260f05df9b71a8810ec1049faf179fd..4dd18186b7e072d193f56243b2b2c9285be2a029 100644
+index 13246ec2f260f05df9b71a8810ec1049faf179fd..7e7c541b26ad14764ee806435961c9bf92b08eee 100644
 --- a/include/hermes/VM/static_h.h
 +++ b/include/hermes/VM/static_h.h
 @@ -8,6 +8,7 @@
@@ -2541,7 +2601,39 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..4dd18186b7e072d193f56243b2b2c928
  
    /// Object key buffer.
    const unsigned char *obj_key_buffer;
-@@ -219,6 +240,42 @@ typedef struct SHLocals {
+@@ -142,6 +163,12 @@ typedef struct SHUnit {
+   /// barrier is needed to safely read out the value.
+   SHCompressedPointer *object_literal_class_cache;
+ 
++  /// Sorted shape indexes used by ordinary object-literal instructions in this
++  /// unit. Typed layouts and unused retained table slots are excluded by the
++  /// compiler; the key buffer alone does not establish allocation semantics.
++  const uint32_t *ordinary_literal_shapes;
++  uint32_t ordinary_literal_shape_count;
++
+   /// The module exports cache: a map from non-negative integer module indexes
+   /// to the export of the module.  An empty value indicates that the module has
+   /// not yet been initialized.
+@@ -173,6 +200,18 @@ typedef struct SHLocals {
+   SHLegacyValue locals[0];
+ } SHLocals;
+ 
++typedef enum SHYoungReclaimStatus {
++  SHYoungReclaimDeferred = 0,
++  SHYoungReclaimReclaimed = 1,
++  SHYoungReclaimUnsupported = 2,
++} SHYoungReclaimStatus;
++
++typedef struct SHYoungReclaimResult {
++  uint32_t status;
++  uintptr_t payload_begin;
++  uintptr_t payload_end;
++} SHYoungReclaimResult;
++
+ /// Version for Static Hermes ABI contracts that are not represented by C
+ /// structure layout. Increment this when changing value encodings, calling
+ /// conventions, or other shared semantics without changing a field below.
+@@ -219,6 +258,42 @@ typedef struct SHLocals {
      offsetof(SHUnit, num_write_prop_cache_entries))                          \
    V(unit_num_private_cache_offset,                                           \
      offsetof(SHUnit, num_private_name_cache_entries))                        \
@@ -2584,7 +2676,7 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..4dd18186b7e072d193f56243b2b2c928
    V(unit_ascii_pool_offset, offsetof(SHUnit, ascii_pool))                    \
    V(unit_u16_pool_offset, offsetof(SHUnit, u16_pool))                        \
    V(unit_strings_offset, offsetof(SHUnit, strings))                          \
-@@ -226,6 +283,8 @@ typedef struct SHLocals {
+@@ -226,6 +301,8 @@ typedef struct SHLocals {
    V(unit_write_cache_offset, offsetof(SHUnit, write_prop_cache))             \
    V(unit_read_cache_offset, offsetof(SHUnit, read_prop_cache))               \
    V(unit_private_cache_offset, offsetof(SHUnit, private_name_cache))         \
@@ -2593,7 +2685,30 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..4dd18186b7e072d193f56243b2b2c928
    V(unit_object_key_buffer_offset, offsetof(SHUnit, obj_key_buffer))         \
    V(unit_object_key_buffer_size_offset,                                      \
      offsetof(SHUnit, obj_key_buffer_size))                                   \
-@@ -316,6 +375,18 @@ _sh_init_with_error(int argc, char **argv, char **errorMessage);
+@@ -237,6 +314,10 @@ typedef struct SHLocals {
+   V(unit_shape_table_count_offset, offsetof(SHUnit, obj_shape_table_count))  \
+   V(unit_object_class_cache_offset,                                          \
+     offsetof(SHUnit, object_literal_class_cache))                            \
++  V(unit_ordinary_literal_shapes_offset,                                    \
++    offsetof(SHUnit, ordinary_literal_shapes))                              \
++  V(unit_ordinary_literal_shape_count_offset,                               \
++    offsetof(SHUnit, ordinary_literal_shape_count))                         \
+   V(unit_module_exports_offset, offsetof(SHUnit, moduleExports))             \
+   V(unit_source_locations_offset, offsetof(SHUnit, source_locations))        \
+   V(unit_source_locations_size_offset,                                       \
+@@ -245,6 +326,11 @@ typedef struct SHLocals {
+   V(unit_main_info_offset, offsetof(SHUnit, unit_main_info))                 \
+   V(unit_name_offset, offsetof(SHUnit, unit_name))                           \
+   V(unit_runtime_extension_offset, offsetof(SHUnit, runtime_ext))            \
++  V(young_reclaim_result_size, sizeof(SHYoungReclaimResult))                 \
++  V(young_reclaim_status_offset, offsetof(SHYoungReclaimResult, status))      \
++  V(young_reclaim_begin_offset,                                            \
++    offsetof(SHYoungReclaimResult, payload_begin))                          \
++  V(young_reclaim_end_offset, offsetof(SHYoungReclaimResult, payload_end))   \
+   V(locals_size, sizeof(SHLocals))                                           \
+   V(locals_prev_offset, offsetof(SHLocals, prev))                            \
+   V(locals_count_offset, offsetof(SHLocals, count))                          \
+@@ -316,6 +402,44 @@ _sh_init_with_error(int argc, char **argv, char **errorMessage);
  /// Destroy a runtime instance created by \c _sh_init();
  SHERMES_EXPORT void _sh_done(SHRuntime *shr);
  
@@ -2609,10 +2724,36 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..4dd18186b7e072d193f56243b2b2c928
 +SHERMES_EXPORT void _sh_get_heap_statistics(
 +    SHRuntime *shr, SHHeapStatistics *statistics);
 +
++/// Prepare and retain eligible ordinary literal layouts for registered units,
++/// without executing application functions. Call during request-independent
++/// preparation, with exclusive runtime access. Repeated successful calls are
++/// safe, including after additional units have initialized. Classes remain
++/// ordinary GC-managed objects; full collection and compaction still trace them.
++/// On failure, write the exception and return false. The caller must discard the
++/// partially prepared runtime. On success, write undefined and return true.
++SHERMES_EXPORT bool _sh_prepare_literal_layouts(
++    SHRuntime *shr, SHLegacyValue *resultOrException);
++
++/// Run ordinary young-generation survivor, weak-reference and finalizer
++/// processing without starting an old-generation cycle. Pending old-generation
++/// work, promotion or worst-case survivor pressure at the old-generation start
++/// threshold defers reclamation. Other collectors report unsupported.
++/// Call only with exclusive runtime access outside execution and collection.
++/// A reclaimed range contains no live objects or collector metadata, but is not
++/// necessarily page aligned. Its authority expires when guest allocation or
++/// collection resumes. The embedder must preserve that quiescence until discard
++/// finishes and retain any host resources that finalizers can still reference.
++/// Deferred calls make no collector progress; permit ordinary collection or
++/// restore/dispose instead of retrying in a loop. Work has ordinary young-GC
++/// cost, including native finalizers, with no fixed latency bound.
++/// Non-reclaimed outcomes always return an empty range.
++SHERMES_EXPORT void _sh_try_reclaim_young_generation(
++    SHRuntime *shr, SHYoungReclaimResult *result);
++
  /// Check on the native stack and throw a stack overflow error if it overflows.
  /// When compiled without HERMES_CHECK_NATIVE_STACK, does nothing.
  /// TODO: Inline the fast path to allow for faster execution.
-@@ -615,6 +686,50 @@ SHERMES_EXPORT SHLegacyValue _sh_ljs_callRequire(
+@@ -615,6 +739,50 @@ SHERMES_EXPORT SHLegacyValue _sh_ljs_callRequire(
      SHLegacyValue *requireFunc,
      uint32_t modIndex);
  
@@ -2663,7 +2804,7 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..4dd18186b7e072d193f56243b2b2c928
  /// Create a new environment with the specified \p size and \p parentEnv (which
  /// may be null if this is a top level environment).
  SHERMES_EXPORT SHLegacyValue _sh_ljs_create_environment(
-@@ -739,6 +854,20 @@ SHERMES_EXPORT void _sh_ljs_put_by_val_strict_rjs(
+@@ -739,6 +907,20 @@ SHERMES_EXPORT void _sh_ljs_put_by_val_strict_rjs(
      SHLegacyValue *target,
      SHLegacyValue *key,
      SHLegacyValue *value);
@@ -2684,7 +2825,7 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..4dd18186b7e072d193f56243b2b2c928
  SHERMES_EXPORT void _sh_ljs_put_by_val_with_receiver_rjs(
      SHRuntime *shr,
      SHLegacyValue *target,
-@@ -881,12 +1010,50 @@ static inline SHLegacyValue _sh_ljs_get_by_id_rjs_inline(
+@@ -881,12 +1063,50 @@ static inline SHLegacyValue _sh_ljs_get_by_id_rjs_inline(
    return _sh_ljs_get_by_id_rjs(shr, source, symID, propCacheEntry);
  }
  
@@ -2735,7 +2876,7 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..4dd18186b7e072d193f56243b2b2c928
  SHERMES_EXPORT SHLegacyValue _sh_ljs_get_by_val_with_receiver_rjs(
      SHRuntime *shr,
      SHLegacyValue *source,
-@@ -899,6 +1066,136 @@ static inline SHLegacyValue _sh_ljs_get_by_val_rjs(
+@@ -899,6 +1119,136 @@ static inline SHLegacyValue _sh_ljs_get_by_val_rjs(
    return _sh_ljs_get_by_val_with_receiver_rjs(shr, source, key, source);
  }
  
@@ -2872,7 +3013,7 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..4dd18186b7e072d193f56243b2b2c928
  SHERMES_EXPORT SHLegacyValue _sh_ljs_get_own_private_by_sym(
      SHRuntime *shr,
      const SHLegacyValue *source,
-@@ -910,6 +1207,16 @@ SHERMES_EXPORT SHLegacyValue _sh_ljs_get_own_private_by_sym(
+@@ -910,6 +1260,16 @@ SHERMES_EXPORT SHLegacyValue _sh_ljs_get_own_private_by_sym(
  SHERMES_EXPORT SHLegacyValue
  _sh_ljs_get_by_index_rjs(SHRuntime *shr, SHLegacyValue *source, uint32_t key);
  
@@ -2889,7 +3030,7 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..4dd18186b7e072d193f56243b2b2c928
  /// Put an enumerable property by string id.
  SHERMES_EXPORT void _sh_ljs_define_own_by_id(
      SHRuntime *shr,
-@@ -917,6 +1224,14 @@ SHERMES_EXPORT void _sh_ljs_define_own_by_id(
+@@ -917,6 +1277,14 @@ SHERMES_EXPORT void _sh_ljs_define_own_by_id(
      SHSymbolID key,
      SHLegacyValue *value,
      SHWritePropertyCacheEntry *cacheEntry);
@@ -2904,7 +3045,7 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..4dd18186b7e072d193f56243b2b2c928
  /// Put an enumerable property.
  SHERMES_EXPORT void _sh_ljs_define_own_by_val(
      SHRuntime *shr,
-@@ -980,6 +1295,13 @@ _sh_ljs_get_string(SHRuntime *shr, SHSymbolID symID);
+@@ -980,6 +1348,13 @@ _sh_ljs_get_string(SHRuntime *shr, SHSymbolID symID);
  SHERMES_EXPORT SHLegacyValue
  _sh_ljs_create_regexp(SHRuntime *shr, SHSymbolID pattern, SHSymbolID flags);
  
@@ -2918,7 +3059,7 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..4dd18186b7e072d193f56243b2b2c928
  /// \param value the string of the BigInt.
  /// \param size  the size of the string \c value.
  SHERMES_EXPORT SHLegacyValue
-@@ -1616,6 +1938,22 @@ static inline uint32_t _sh_to_uint32_double(double d) {
+@@ -1616,6 +1991,22 @@ static inline uint32_t _sh_to_uint32_double(double d) {
    return (uint32_t)_sh_to_int32_double_slow_path(d);
  }
  
@@ -2941,7 +3082,7 @@ index 13246ec2f260f05df9b71a8810ec1049faf179fd..4dd18186b7e072d193f56243b2b2c928
  /// Store a property into direct storage.
  SHERMES_EXPORT void _sh_prstore_direct(
      SHRuntime *shr,
-@@ -1877,6 +2215,14 @@ SHERMES_EXPORT int _sh_errno(void);
+@@ -1877,6 +2268,14 @@ SHERMES_EXPORT int _sh_errno(void);
  SHERMES_EXPORT SHLegacyValue
  _sh_asciiz_to_string(SHRuntime *shr, const char *str, ptrdiff_t len);
  
@@ -4702,7 +4843,7 @@ index f317df4027e4abfc780886ea7dae80413c43236e..52cc4e253a71e3b47cff89896c089064
        }
        case ValueKind::DebuggerInstKind:
 diff --git a/lib/BCGen/SH/SH.cpp b/lib/BCGen/SH/SH.cpp
-index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85df54ed2a 100644
+index e030d709072f96cff72bec9ee8efa3fb820266d6..9e69f02e7066646f58741f5593ee3eb78420ff8a 100644
 --- a/lib/BCGen/SH/SH.cpp
 +++ b/lib/BCGen/SH/SH.cpp
 @@ -7,6 +7,7 @@
@@ -4945,7 +5086,18 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
    }
  
    /// Turn the table of strings into the SH C data structures that are necessary
-@@ -196,13 +387,16 @@ class SHLiteralBuffers {
+@@ -189,6 +380,10 @@ class SHLiteralBuffers {
+   /// Table of object literal shapes.
+   std::vector<ShapeTableEntry> objShapeTable{};
+ 
++  /// Only live ordinary allocations authorize eager class preparation. Retained
++  /// literal tables can also contain unused slots or typed object shapes.
++  std::vector<uint32_t> ordinaryLiteralShapes{};
++
+   /// A map from instruction to literal offset in the corresponding buffers.
+   /// \c arrayBuffer, \c objKeyBuffer, \c objliteralValBuffer.
+   LiteralBufferBuilder::LiteralOffsetMapTy literalOffsetMap{};
+@@ -196,17 +391,35 @@ class SHLiteralBuffers {
    explicit SHLiteralBuffers(
        Module *M,
        SHStringTable &table,
@@ -4964,7 +5116,37 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
      literalValueBuffer = std::move(bufs.literalValBuffer);
      objKeyBuffer = std::move(bufs.keyBuffer);
      objShapeTable = std::move(bufs.shapeTable);
-@@ -362,16 +556,19 @@ class SHNativeJSFunctionTable {
+     literalOffsetMap = std::move(bufs.offsetMap);
++    llvh::BitVector ordinary(objShapeTable.size());
++    llvh::BitVector other(objShapeTable.size());
++    for (const auto &entry : literalOffsetMap) {
++      const auto shape = entry.second.shapeTableIdx;
++      if (shape == UINT32_MAX)
++        continue; // Array literals have no object shape.
++      if (llvh::isa<LIRAllocObjectFromBufferInst>(entry.first))
++        ordinary.set(shape);
++      else
++        other.set(shape);
++    }
++    for (uint32_t shape = 0; shape < objShapeTable.size(); ++shape) {
++      if (ordinary.test(shape) && !other.test(shape))
++        ordinaryLiteralShapes.push_back(shape);
++    }
+   }
+ 
+   /// For a given instruction \p inst that has an associated serialized literal,
+@@ -232,6 +445,10 @@ class SHLiteralBuffers {
+          << ", .num_props = " << entry.numProps << " },\n";
+     }
+     os << "};\n";
++    os << "static const uint32_t s_ordinary_literal_shapes[] = {";
++    for (const auto shape : ordinaryLiteralShapes)
++      os << shape << ",";
++    os << "};\n";
+   }
+ 
+  private:
+@@ -362,16 +579,19 @@ class SHNativeJSFunctionTable {
    SHStringTable &stringTable_;
    /// Prefix used to give cross-translation-unit symbols unique linkage.
    std::string bundlePrefix_;
@@ -4986,7 +5168,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
      // Ensure that the top level function has an id of 0.
      auto topLevelFunc = M->getTopLevelFunction();
      funcMap_[topLevelFunc] = 0;
-@@ -385,11 +582,17 @@ class SHNativeJSFunctionTable {
+@@ -385,11 +605,17 @@ class SHNativeJSFunctionTable {
      }
    }
  
@@ -5004,7 +5186,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
    /// \return size of the function table.
    size_t size() const {
      return funcMap_.size();
-@@ -408,7 +611,10 @@ class SHNativeJSFunctionTable {
+@@ -408,7 +634,10 @@ class SHNativeJSFunctionTable {
    void generateFunctionLabel(Function *F, llvh::raw_ostream &OS) const {
      if (!bundlePrefix_.empty())
        OS << bundlePrefix_ << 'f';
@@ -5016,7 +5198,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
  
      auto name = F->getInternalNameStr();
      for (auto c : name) {
-@@ -440,7 +646,7 @@ class SHNativeJSFunctionTable {
+@@ -440,7 +669,7 @@ class SHNativeJSFunctionTable {
        Function *F,
        llvh::raw_ostream &OS) const {
      assert(isBundle() && "outlined state requires bundle labels");
@@ -5025,7 +5207,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
    }
  
    void generateOutlinedPartLabel(
-@@ -448,7 +654,7 @@ class SHNativeJSFunctionTable {
+@@ -448,7 +677,7 @@ class SHNativeJSFunctionTable {
        uint32_t part,
        llvh::raw_ostream &OS) const {
      assert(isBundle() && "outlined part requires bundle labels");
@@ -5034,7 +5216,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
         << llvh::format("%05u", part);
    }
  
-@@ -456,21 +662,62 @@ class SHNativeJSFunctionTable {
+@@ -456,21 +685,62 @@ class SHNativeJSFunctionTable {
      return !bundlePrefix_.empty();
    }
  
@@ -5101,7 +5283,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
        uint32_t nameIdx = stringTable_.add(F->getOriginalOrInferredName().str());
        uint32_t argCount = F->getExpectedParamCountIncludingThis() - 1;
        auto kindVal = F->getKind();
-@@ -485,6 +732,9 @@ class SHNativeJSFunctionTable {
+@@ -485,6 +755,9 @@ class SHNativeJSFunctionTable {
  };
  
  struct ModuleGen {
@@ -5111,7 +5293,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
    /// Table containing uniqued strings for the current module.
    SHStringTable stringTable{};
  
-@@ -501,10 +751,14 @@ struct ModuleGen {
+@@ -501,10 +774,14 @@ struct ModuleGen {
    explicit ModuleGen(
        Module *M,
        bool optimizationEnabled,
@@ -5129,7 +5311,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
  };
  
  /// \return true if the SHLegacyValue representations of values \p a and \p b
-@@ -569,12 +823,26 @@ class InstrGen {
+@@ -569,12 +846,26 @@ class InstrGen {
          tryIDs_(tryIDs),
          enclosingTrys_(enclosingTrys),
          registerStorage_(registerStorage) {
@@ -5156,7 +5338,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
      switch (I.getKind()) {
  #define DEF_VALUE(CLASS, PARENT) \
    case ValueKind::CLASS##Kind:   \
-@@ -630,6 +898,210 @@ class InstrGen {
+@@ -630,6 +921,210 @@ class InstrGen {
    /// Where LocalPtr and LocalNonPtr registers are stored in generated C.
    RegisterStorage registerStorage_;
  
@@ -5367,7 +5549,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
    void unimplemented(Instruction &inst) {
      std::string err{"Unimplemented "};
      err += inst.getName();
-@@ -696,9 +1168,10 @@ class InstrGen {
+@@ -696,9 +1191,10 @@ class InstrGen {
    }
    llvh::raw_ostream &genStringConstReadIC(
        LiteralString *LS,
@@ -5380,7 +5562,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
    }
  
    /// Generate a cache index. This must be used when passing parameters to API
-@@ -708,16 +1181,30 @@ class InstrGen {
+@@ -708,16 +1204,30 @@ class InstrGen {
    /// different instructions accessing the same property probably are for
    /// objects of the same hidden class, and should get the same offset.
    llvh::raw_ostream &genWriteIC(LiteralString *LS) {
@@ -5414,7 +5596,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
      if (options_.emitCBundle)
        return os_ << "shUnit->private_name_cache + "
                   << nextPrivateNameCacheIdx_++;
-@@ -744,6 +1231,10 @@ class InstrGen {
+@@ -744,6 +1254,10 @@ class InstrGen {
          os_ << "np" << reg.getIndex();
          break;
  
@@ -5425,7 +5607,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
        case sh::RegClass::RegStack:
          os_ << "frame[" << (hbc::StackFrameLayout::FirstLocal + reg.getIndex())
              << ']';
-@@ -757,6 +1248,16 @@ class InstrGen {
+@@ -757,6 +1271,16 @@ class InstrGen {
    /// Helper to generate a value that must always have an allocated register,
    /// for instance because we need to assign to it or take its address.
    void generateRegister(Value &val) {
@@ -5442,7 +5624,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
      generateRegister(ra_.getRegister(&val));
    }
  
-@@ -766,6 +1267,12 @@ class InstrGen {
+@@ -766,6 +1290,12 @@ class InstrGen {
    /// The pointer can be used to pass to API functions that will use it
    /// as a PinnedHermesValue.
    void generateRegisterPtr(Value &val) {
@@ -5455,7 +5637,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
      os_ << "&";
      generateRegister(val);
    }
-@@ -865,9 +1372,9 @@ class InstrGen {
+@@ -865,9 +1395,9 @@ class InstrGen {
      generateRegister(inst);
      os_ << " = ";
      if (inst.getSingleOperand()->getType().isNumberType()) {
@@ -5468,7 +5650,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
      } else {
        os_
            << (options_.smallC
-@@ -882,9 +1389,9 @@ class InstrGen {
+@@ -882,9 +1412,9 @@ class InstrGen {
      generateRegister(inst);
      os_ << " = ";
      if (inst.getSingleOperand()->getType().isNumberType()) {
@@ -5481,7 +5663,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
      } else {
        os_
            << (options_.smallC
-@@ -1006,7 +1513,12 @@ class InstrGen {
+@@ -1006,7 +1536,12 @@ class InstrGen {
      generateValue(inst);
      os_ << " = _sh_ljs_load_from_env(";
      generateValue(*inst.getScope());
@@ -5495,7 +5677,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
    }
    void generateLIRLoadConstInst(LIRLoadConstInst &inst) {
      os_.indent(2);
-@@ -1083,6 +1595,34 @@ class InstrGen {
+@@ -1083,6 +1618,34 @@ class InstrGen {
      // Nothing to do here.
      os_ << "  // PhiInst\n";
    }
@@ -5530,7 +5712,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
    void generateBinaryOperatorInst(BinaryOperatorInst &inst) {
      os_.indent(2);
      generateRegister(inst);
-@@ -1109,6 +1649,52 @@ class InstrGen {
+@@ -1109,6 +1672,52 @@ class InstrGen {
      bool bothDouble = inst.getLeftHandSide()->getType().isNumberType() &&
          inst.getRightHandSide()->getType().isNumberType();
  
@@ -5583,7 +5765,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
      // NOTE: this used to check whether we know that both operands are numbers
      // in the int32 range. We no longer track that information, so for now this
      // is hardcoded to false.
-@@ -1322,10 +1908,10 @@ class InstrGen {
+@@ -1322,10 +1931,10 @@ class InstrGen {
        os_ << ".raw";
      } else {
        assert(funcUntypedOp);
@@ -5598,7 +5780,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
        os_ << ")";
      }
      if (boolConv)
-@@ -1394,16 +1980,21 @@ class InstrGen {
+@@ -1394,16 +2003,21 @@ class InstrGen {
      }
  
      if (strictMode)
@@ -5624,7 +5806,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
    }
    void generateStorePropertyLooseInst(StorePropertyLooseInst &inst) {
      generateStorePropertyInstImpl(inst, false);
-@@ -1465,7 +2056,7 @@ class InstrGen {
+@@ -1465,7 +2079,7 @@ class InstrGen {
        assert(
            inst.getIsEnumerable() &&
            "Non-enumerable properties with literal keys should be handled by LoadConstants");
@@ -5633,7 +5815,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
        generateRegister(*inst.getObject());
        os_ << ", ";
        genStringConstWriteIC(LS, inst.getStoredValue()) << ");\n";
-@@ -1565,29 +2156,49 @@ class InstrGen {
+@@ -1565,29 +2179,49 @@ class InstrGen {
      generateValue(inst);
      os_ << " = ";
      if (auto *LS = llvh::dyn_cast<LiteralString>(inst.getProperty())) {
@@ -5689,7 +5871,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
    }
    void generateLoadPropertyWithReceiverInst(
        LoadPropertyWithReceiverInst &inst) {
-@@ -1763,7 +2374,11 @@ class InstrGen {
+@@ -1763,7 +2397,11 @@ class InstrGen {
      generateValue(*inst.getScope());
      os_ << ",";
      generateValue(*inst.getValue());
@@ -5702,7 +5884,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
    }
    void generateAllocStackInst(AllocStackInst &inst) {
      // This is a no-op.
-@@ -1872,7 +2487,7 @@ class InstrGen {
+@@ -1872,7 +2510,7 @@ class InstrGen {
      // Restore the tryState to the state of the Try enclosing this block.
      TryStartInst *enclosing = enclosingTrys_.at(inst.getParent());
      uint32_t stateToRestore = enclosing ? tryIDs_.at(enclosing) : 0;
@@ -5711,7 +5893,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
      os_.indent(2);
      generateRegister(inst);
      os_ << " = _sh_get_clear_thrown_value(shr);\n";
-@@ -1881,41 +2496,36 @@ class InstrGen {
+@@ -1881,41 +2519,36 @@ class InstrGen {
      hermes_fatal("DebuggerInst should have been deleted.");
    }
    void generateCreateRegExpInst(CreateRegExpInst &inst) {
@@ -5767,7 +5949,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
      os_ << "  goto ";
      generateBasicBlockLabel(inst.getBranchDest(), os_, bbMap_);
      os_ << ";\n";
-@@ -1977,7 +2587,7 @@ class InstrGen {
+@@ -1977,7 +2610,7 @@ class InstrGen {
      os_ << '&';
      moduleGen_.nativeFunctionTable.generateFunctionInfoTableLabel(os_);
      os_ << '['
@@ -5776,7 +5958,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
          << "]" << ", shUnit);\n";
    }
    void generateCreateGeneratorInst(CreateGeneratorInst &inst) {
-@@ -1995,7 +2605,7 @@ class InstrGen {
+@@ -1995,7 +2628,7 @@ class InstrGen {
      os_ << '&';
      moduleGen_.nativeFunctionTable.generateFunctionInfoTableLabel(os_);
      os_ << '['
@@ -5785,7 +5967,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
          << "]" << ", shUnit);\n";
    }
    void generateCreateClassInst(CreateClassInst &inst) {
-@@ -2014,7 +2624,7 @@ class InstrGen {
+@@ -2014,7 +2647,7 @@ class InstrGen {
      os_ << '&';
      moduleGen_.nativeFunctionTable.generateFunctionInfoTableLabel(os_);
      os_ << '['
@@ -5794,7 +5976,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
          << "]";
      os_ << ", (SHUnit *)shUnit, ";
      generateRegisterPtr(*inst.getHomeObjectOutput());
-@@ -2033,7 +2643,7 @@ class InstrGen {
+@@ -2033,7 +2666,7 @@ class InstrGen {
    }
    void generateReturnInst(ReturnInst &inst) {
      if (!tryIDs_.empty()) {
@@ -5803,7 +5985,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
      }
      os_ << "  _sh_leave(shr, &";
      if (registerStorage_ == RegisterStorage::LocalsAndNonPtrVariables)
-@@ -2119,7 +2729,7 @@ class InstrGen {
+@@ -2119,7 +2752,7 @@ class InstrGen {
    }
    void generateTryStartInst(TryStartInst &inst) {
      uint32_t stateToEnter = tryIDs_.at(&inst);
@@ -5812,7 +5994,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
      os_ << "  goto ";
      generateBasicBlockLabel(inst.getTryBody(), os_, bbMap_);
      os_ << ";\n";
-@@ -2174,13 +2784,19 @@ class InstrGen {
+@@ -2174,13 +2807,19 @@ class InstrGen {
      // new.target is set up in LowerCalls.
    }
    void generateCallInst(CallInst &inst) {
@@ -5834,7 +6016,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
          // Fast path, avoid all indirection and just call the function.
          moduleGen_.nativeFunctionTable.generateFunctionLabel(targetFunc, os_);
          os_ << "(shr);\n";
-@@ -2217,17 +2833,84 @@ class InstrGen {
+@@ -2217,17 +2856,84 @@ class InstrGen {
          << (uint32_t)inst.getBuiltinIndex() << ");\n";
    }
    void generateCallBuiltinInst(CallBuiltinInst &inst) {
@@ -5923,7 +6105,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
      os_.indent(2);
      generateRegister(inst);
      os_ << " = _sh_ljs_call_builtin(shr, frame, " << inst.getNumArguments() - 1
-@@ -2255,7 +2938,11 @@ class InstrGen {
+@@ -2255,7 +2961,11 @@ class InstrGen {
        os_ << "NULL";
      else
        generateRegisterPtr(*inst.getParentScope());
@@ -5936,7 +6118,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
    }
    void generateHBCCreateFunctionEnvironmentInst(
        HBCCreateFunctionEnvironmentInst &inst) {
-@@ -2703,6 +3390,10 @@ class InstrGen {
+@@ -2703,6 +3413,10 @@ class InstrGen {
    }
    /// Convert a JS value to its corresponding native argument type.
    void convertToNativeArg(NativeCType ctype, Value *arg) {
@@ -5947,7 +6129,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
      MachineType mt = nativeContext_.md.mapCType(ctype);
      const MachineDesc::MTD &mtd = nativeContext_.md.getMTD(mt);
      int parens = 1;
-@@ -2819,7 +3510,8 @@ void generateFunction(
+@@ -2819,7 +3533,8 @@ void generateFunction(
  
    llvh::SmallVector<BasicBlock *, 16> order(PO.rbegin(), PO.rend());
  
@@ -5957,7 +6139,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
    RA.allocate(order);
  
    if (options.format == DumpRA) {
-@@ -2869,9 +3561,12 @@ void generateFunction(
+@@ -2869,9 +3584,12 @@ void generateFunction(
    }
  
    auto &srcMgr = F.getContext().getSourceErrorManager();
@@ -5973,7 +6155,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
  
    llvh::DenseMap<BasicBlock *, TryStartInst *> enclosingTrys;
    if (!tryIDs.empty())
-@@ -2968,6 +3663,20 @@ void generateFunction(
+@@ -2968,6 +3686,20 @@ void generateFunction(
         ++i) {
      OS << "  SHLegacyValue np" << i << " = _sh_ljs_undefined();\n";
    }
@@ -5994,7 +6176,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
  
    switch (F.getProhibitInvoke()) {
      case Function::ProhibitInvoke::ProhibitNone:
-@@ -2975,14 +3684,14 @@ void generateFunction(
+@@ -2975,14 +3707,14 @@ void generateFunction(
      case Function::ProhibitInvoke::ProhibitConstruct:
        OS << "  if (!_sh_ljs_is_undefined(frame["
           << hbc::StackFrameLayout::NewTarget << "]))\n"
@@ -6013,7 +6195,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
        break;
    }
  
-@@ -3185,16 +3894,23 @@ void generateUnitData(
+@@ -3185,16 +3917,23 @@ void generateUnitData(
      uint32_t nextReadCacheIdx,
      uint32_t nextPrivateNameCacheIdx,
      const BytecodeGenerationOptions &options) {
@@ -6038,7 +6220,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
    // String table must be generated last because the other tables may add
    // strings while they are emitted.
    moduleGen.stringTable.generate(OS);
-@@ -3213,6 +3929,10 @@ void generateUnitData(
+@@ -3213,6 +3952,10 @@ void generateUnitData(
       << nextReadCacheIdx << "];\n"
       << "  SHPrivateNameCacheEntry private_name_cache_data["
       << nextPrivateNameCacheIdx << "];\n"
@@ -6049,7 +6231,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
       << "  SHCompressedPointer object_literal_class_cache["
       << moduleGen.literalBuffers.objShapeTable.size() << "];\n};\n"
       << "SHUnit *CREATE_THIS_UNIT(void) {\n"
-@@ -3224,11 +3944,18 @@ void generateUnitData(
+@@ -3224,11 +3967,18 @@ void generateUnitData(
    OS << ",.num_symbols =" << moduleGen.stringTable.size()
       << ", .num_write_prop_cache_entries = " << nextWriteCacheIdx
       << ", .num_read_prop_cache_entries = " << nextReadCacheIdx
@@ -6068,7 +6250,17 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
       << ".obj_key_buffer = s_obj_key_buffer, .obj_key_buffer_size = "
       << moduleGen.literalBuffers.objKeyBuffer.size() << ", "
       << ".literal_val_buffer = s_literal_val_buffer, .literal_val_buffer_size = "
-@@ -3535,6 +4262,24 @@ void generateOutlinedPartDeclaration(
+@@ -3237,6 +3987,9 @@ void generateUnitData(
+      << ".obj_shape_table_count = "
+      << moduleGen.literalBuffers.objShapeTable.size() << ", "
+      << ".object_literal_class_cache = unit_data->object_literal_class_cache, "
++     << ".ordinary_literal_shapes = s_ordinary_literal_shapes, "
++     << ".ordinary_literal_shape_count = "
++     << moduleGen.literalBuffers.ordinaryLiteralShapes.size() << ", "
+      << ".source_locations = s_source_locations, "
+      << ".source_locations_size = " << moduleGen.srcLocationTable.size()
+      << ", " << ".unit_main = ";
+@@ -3535,6 +4288,24 @@ void generateOutlinedPartDeclaration(
    OS << " *state, SHLegacyValue *frame, SHUnit *shUnit)";
  }
  
@@ -6093,7 +6285,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
  void emitOutlinedInstructions(
      sh::LineDirectiveEmitter &OS,
      llvh::ArrayRef<BufferedOutlinedInstruction> instructions,
-@@ -3586,9 +4331,9 @@ void generateBundleFunctionDeclaration(
+@@ -3586,9 +4357,9 @@ void generateBundleFunctionDeclaration(
  }
  
  /// Generate an independently compilable wrapper and zero or more C helpers.
@@ -6106,7 +6298,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
  std::vector<BufferedBundleFunction> generateOutlinedBundleFunction(
      Function &F,
      ModuleGen &moduleGen,
-@@ -3685,13 +4430,11 @@ std::vector<BufferedBundleFunction> generateOutlinedBundleFunction(
+@@ -3685,13 +4456,11 @@ std::vector<BufferedBundleFunction> generateOutlinedBundleFunction(
    // Keep a helper body below a fraction of its containing translation-unit
    // target. The remaining space holds declarations for function references,
    // the shared-state definition, and the C file prologue. A single generated
@@ -6124,7 +6316,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
    std::string stateDefinition;
    llvh::raw_string_ostream stateOS(stateDefinition);
    generateOutlinedStateDefinition(
-@@ -3715,6 +4458,8 @@ std::vector<BufferedBundleFunction> generateOutlinedBundleFunction(
+@@ -3715,6 +4484,8 @@ std::vector<BufferedBundleFunction> generateOutlinedBundleFunction(
    const bool structuralO0 =
        cOptimizationLevel == sh::SHCBundleCOptimizationLevel::O0;
    const bool needsOutlining = structuralO0 || outlineableBytes >= instructionTarget;
@@ -6133,7 +6325,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
    std::vector<OutlinedPart> parts;
    if (needsOutlining) {
      for (uint32_t blockIndex = 0; blockIndex < blocks.size(); ++blockIndex) {
-@@ -3771,6 +4516,17 @@ std::vector<BufferedBundleFunction> generateOutlinedBundleFunction(
+@@ -3771,6 +4542,17 @@ std::vector<BufferedBundleFunction> generateOutlinedBundleFunction(
      sh::LineDirectiveEmitter OS(wrapperSourceOS);
      generateOutlinedStateDefinition(
          OS, &F, moduleGen.nativeFunctionTable, localsSize, nonPtrSize);
@@ -6151,7 +6343,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
      if (outline) {
        for (uint32_t part = 0; part < parts.size(); ++part) {
          generateOutlinedPartDeclaration(
-@@ -3780,9 +4536,13 @@ std::vector<BufferedBundleFunction> generateOutlinedBundleFunction(
+@@ -3780,9 +4562,13 @@ std::vector<BufferedBundleFunction> generateOutlinedBundleFunction(
        OS << '\n';
      }
  
@@ -6168,7 +6360,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
      moduleGen.nativeFunctionTable.generateFunctionLabel(&F, OS);
      OS << "(SHRuntime *shr) {\n";
      OS.setDirectiveInfo(F.getSourceRange().Start, srcMgr);
-@@ -3835,17 +4595,51 @@ std::vector<BufferedBundleFunction> generateOutlinedBundleFunction(
+@@ -3835,17 +4621,51 @@ std::vector<BufferedBundleFunction> generateOutlinedBundleFunction(
        case Function::ProhibitInvoke::ProhibitConstruct:
          OS << "  if (!_sh_ljs_is_undefined(frame["
             << hbc::StackFrameLayout::NewTarget << "]))\n"
@@ -6225,7 +6417,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
        OS << R"(
    SHJmpBuf jmpBuf;
    volatile uint32_t tryState = 0;
-@@ -3857,6 +4651,18 @@ std::vector<BufferedBundleFunction> generateOutlinedBundleFunction(
+@@ -3857,6 +4677,18 @@ std::vector<BufferedBundleFunction> generateOutlinedBundleFunction(
           << " = _sh_ljs_native_pointer(&state->head);\n";
      }
  
@@ -6244,7 +6436,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
      uint32_t nextPart = 0;
      for (uint32_t blockIndex = 0; blockIndex < blocks.size(); ++blockIndex) {
        auto &block = blocks[blockIndex];
-@@ -3895,7 +4701,7 @@ std::vector<BufferedBundleFunction> generateOutlinedBundleFunction(
+@@ -3895,7 +4727,7 @@ std::vector<BufferedBundleFunction> generateOutlinedBundleFunction(
        }
      }
      assert(nextPart == parts.size() && "not all outlined parts were called");
@@ -6253,7 +6445,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
        OS << R"(
  L_catch:
    if (tryState == 0) {
-@@ -3925,8 +4731,8 @@ L_catch:
+@@ -3925,8 +4757,8 @@ L_catch:
    }
    wrapperSourceOS.flush();
  
@@ -6264,7 +6456,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
    size_t wrapperInstructionCount = 0;
    uint32_t nextWrapperPart = 0;
    for (uint32_t blockIndex = 0; blockIndex < blocks.size(); ++blockIndex) {
-@@ -4089,6 +4895,14 @@ void generateBundleHeader(
+@@ -4089,6 +4921,14 @@ void generateBundleHeader(
       << "#else\n"
       << "#define SH_BUNDLE_HIDDEN __attribute__((visibility(\"hidden\")))\n"
       << "#endif\n\n"
@@ -6279,7 +6471,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
       << "extern SH_BUNDLE_HIDDEN uint32_t ";
    moduleGen.nativeFunctionTable.generateUnitIndexLabel(OS);
    OS << ";\nextern SH_BUNDLE_HIDDEN SHNativeFuncInfo ";
-@@ -4116,12 +4930,19 @@ bool generateBundleFunctionShard(
+@@ -4116,12 +4956,19 @@ bool generateBundleFunctionShard(
      const std::vector<BufferedBundleFunction> &functions,
      uint64_t bodyBytes,
      uint32_t shardIndex,
@@ -6301,7 +6493,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
    pathOS.flush();
  
    llvh::BitVector declarations(moduleGen.nativeFunctionTable.size());
-@@ -4176,10 +4997,21 @@ bool generateBundleFunctionShard(
+@@ -4176,10 +5023,21 @@ bool generateBundleFunctionShard(
          OS << "#include \"" << headerPath << "\"\n\n";
          generateExternCIncludes(M, OS, *usedExterns);
          generateExternC(M, OS, *usedExterns);
@@ -6325,7 +6517,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
          }
          OS << '\n';
          for (const auto &function : functions)
-@@ -4191,8 +5023,8 @@ bool generateBundleFunctionShard(
+@@ -4191,8 +5049,8 @@ bool generateBundleFunctionShard(
    file = {
        path,
        sh::SHCBundleFileRole::Function,
@@ -6336,7 +6528,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
        static_cast<uint32_t>(functions.size()),
        targetBytes,
        oversize,
-@@ -4216,6 +5048,10 @@ bool generateModuleBundle(
+@@ -4216,6 +5074,10 @@ bool generateModuleBundle(
    assert(
        (options.format == DumpBytecode || options.format == EmitBundle) &&
        "bundle generation requires C output");
@@ -6347,7 +6539,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
    if (!lowerModuleIR(M, options.optimizationEnabled))
      return false;
  
-@@ -4232,10 +5068,18 @@ bool generateModuleBundle(
+@@ -4232,10 +5094,18 @@ bool generateModuleBundle(
    uint32_t nextReadCacheIdx = 0;
    uint32_t nextPrivateNameCacheIdx = 0;
    ModuleGen moduleGen{
@@ -6367,7 +6559,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
  
    const std::string headerPath =
        bundleFilePath(options.unitName, "_internal.h");
-@@ -4249,107 +5093,152 @@ bool generateModuleBundle(
+@@ -4249,107 +5119,152 @@ bool generateModuleBundle(
    std::vector<BufferedBundleFunction> bufferedFunctions;
    uint64_t bufferedBytes = 0;
    uint32_t shardIndex = 0;
@@ -6606,7 +6798,7 @@ index e030d709072f96cff72bec9ee8efa3fb820266d6..3ea0a3e17c736660e5dfa30fd9c17b85
  
    // The metadata tables must be emitted after every body has allocated its
    // shared indexes.
-@@ -4372,6 +5261,16 @@ bool generateModuleBundle(
+@@ -4372,6 +5287,16 @@ bool generateModuleBundle(
      return false;
    }
  
@@ -13448,8 +13640,32 @@ index 0364c528c28f8f5ea6bb3ce1ddcccad435bd6703..e66d3fdea97c57f3b65e6bf8b75ebfaa
        .withEnableSampleProfiling(
            flags.SampleProfiling != ExecuteOptions::SampleProfilingMode::None)
        .withRandomizeMemoryLayout(flags.RandomizeMemoryLayout)
+diff --git a/lib/VM/SHUnitExt.h b/lib/VM/SHUnitExt.h
+index ec164b3bc3eacf68cfd555b48480a9209e8037a7..098f2851058b5e405f0cc7c6ad548657fb877c21 100644
+--- a/lib/VM/SHUnitExt.h
++++ b/lib/VM/SHUnitExt.h
+@@ -8,6 +8,7 @@
+ #pragma once
+ 
+ #include "hermes/ADT/TransparentConservativeVector.h"
++#include "hermes/VM/ArrayStorage.h"
+ #include "hermes/VM/PropertyCache.h"
+ #include "hermes/VM/static_h.h"
+ 
+@@ -20,6 +21,11 @@ struct SHUnitExt {
+   /// A map from template object ids to template objects.
+   llvh::DenseMap<uint32_t, hermes::vm::JSObject *> templateMap{};
+ 
++  /// Strong root for prepared literal classes. Old GC-managed storage avoids
++  /// enumerating every stable class on each young collection. Writes must use
++  /// ArrayStorage barriers; full collection may move both storage and classes.
++  hermes::vm::ArrayStorage *preparedLiteralLayouts{nullptr};
++
+   /// Vector of AddPropertyCacheEntry, where each element is lazily allocated
+   /// whenever a CodeBlock needs a new entry.
+   /// Stored in a central location here for easier marking of roots.
 diff --git a/lib/VM/StaticH.cpp b/lib/VM/StaticH.cpp
-index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..be4b578bb318d4816f5705467277f043a2f6101a 100644
+index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..8378adbaa2348149888b3a63811056f638096a25 100644
 --- a/lib/VM/StaticH.cpp
 +++ b/lib/VM/StaticH.cpp
 @@ -7,6 +7,7 @@
@@ -13460,7 +13676,7 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..be4b578bb318d4816f5705467277f043
  #include "hermes/VM/ArrayStorage.h"
  #include "hermes/VM/Callable.h"
  #include "hermes/VM/FastArray.h"
-@@ -20,21 +21,38 @@
+@@ -20,21 +21,151 @@
  #include "hermes/VM/JSRegExp.h"
  #include "hermes/VM/JSTypedArray.h"
  #include "hermes/VM/ModuleExportsCache-inline.h"
@@ -13478,6 +13694,7 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..be4b578bb318d4816f5705467277f043
 +#include <algorithm>
  #include <cstdarg>
 +#include <limits>
++#include <vector>
  
  using namespace hermes;
  using namespace hermes::vm;
@@ -13496,10 +13713,122 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..be4b578bb318d4816f5705467277f043
 +      static_cast<uint64_t>(info.generalStats.gcCPUTime.sum() * 1e9)};
 +}
 +
++extern "C" void _sh_try_reclaim_young_generation(
++    SHRuntime *shr, SHYoungReclaimResult *result) {
++#if HERMESVM_GCKIND == _HERMESVM_GCVALUE_HADES
++  const auto reclaimed = getRuntime(shr).getHeap().tryReclaimYoungGeneration();
++  *result = {
++      reclaimed.status == HadesGC::YoungReclaimStatus::Reclaimed
++          ? SHYoungReclaimReclaimed
++          : SHYoungReclaimDeferred,
++      reinterpret_cast<uintptr_t>(reclaimed.payloadBegin),
++      reinterpret_cast<uintptr_t>(reclaimed.payloadEnd)};
++#else
++  *result = {SHYoungReclaimUnsupported, 0, 0};
++#endif
++}
++
++extern "C" bool _sh_prepare_literal_layouts(
++    SHRuntime *shr, SHLegacyValue *resultOrException) {
++  Runtime &runtime = getRuntime(shr);
++  GCScope scope{runtime};
++  const auto marker = scope.createMarker();
++  for (auto *unit : runtime.units) {
++    if (!unit || !unit->ordinary_literal_shape_count ||
++        unit->runtime_ext->preparedLiteralLayouts)
++      continue;
++    if (!unit->ordinary_literal_shapes ||
++        unit->ordinary_literal_shape_count > unit->obj_shape_table_count)
++      hermes_fatal("Invalid ordinary literal shape table");
++    auto storageResult = ArrayStorage::createLongLived(
++        runtime, unit->ordinary_literal_shape_count);
++    if (LLVM_UNLIKELY(storageResult == ExecutionStatus::EXCEPTION)) {
++      *resultOrException = _sh_get_clear_thrown_value(shr);
++      return false;
++    }
++    auto storage = runtime.makeHandle<ArrayStorage>(*storageResult);
++    ArrayStorage::resizeWithinCapacity(
++        *storage, runtime, unit->ordinary_literal_shape_count);
++    // Publish the root before creating classes, which may collect. Unsupported
++    // dictionary-sized shapes leave an empty slot in the initialized storage.
++    unit->runtime_ext->preparedLiteralLayouts = *storage;
++    const auto classMarker = scope.createMarker();
++    for (uint32_t i = 0; i < unit->ordinary_literal_shape_count; ++i) {
++      scope.flushToMarker(classMarker);
++      const auto shapeIndex = unit->ordinary_literal_shapes[i];
++      if (shapeIndex >= unit->obj_shape_table_count ||
++          (i && shapeIndex <= unit->ordinary_literal_shapes[i - 1]))
++        hermes_fatal("Invalid ordinary literal shape index");
++      const auto &shape = unit->obj_shape_table[shapeIndex];
++      if (shape.num_props > HiddenClass::kDictionaryThreshold)
++        continue;
++      if (shape.key_buffer_offset > unit->obj_key_buffer_size)
++        hermes_fatal("Invalid ordinary literal key buffer");
++      auto *entry = reinterpret_cast<WeakRoot<HiddenClass> *>(
++          &unit->object_literal_class_cache[shapeIndex]);
++      auto clazz = runtime.makeMutableHandle<HiddenClass>(nullptr);
++      if (*entry) {
++        clazz = entry->getNonNull(runtime, runtime.getHeap());
++      } else {
++        const llvh::ArrayRef<uint8_t> keys{
++            unit->obj_key_buffer, unit->obj_key_buffer_size};
++        // Ordinary buffer allocations use this same root even with an explicit
++        // prototype: getHiddenClassForPrototype depends only on reserved slots.
++        clazz = addBufferPropertiesToHiddenClass(
++            runtime,
++            keys.slice(shape.key_buffer_offset),
++            shape.num_props,
++            *runtime.getHiddenClassForPrototype(
++                nullptr, JSObject::numOverlapSlots<JSObject>()),
++            [unit](StringID id) {
++              if (id >= unit->num_symbols)
++                hermes_fatal("Invalid ordinary literal symbol");
++              return SymbolID::unsafeCreate(unit->symbols[id]);
++            });
++      }
++      if (clazz->isDictionary() || clazz->isTyped() ||
++          clazz->getNumProperties() != shape.num_props)
++        hermes_fatal("Incompatible ordinary literal class");
++      entry->set(runtime, *clazz);
++      storage->set(i, HermesValue::encodeObjectValue(*clazz), runtime.getHeap());
++    }
++    scope.flushToMarker(marker);
++  }
++  // Even initializing an existing child's map can steal its parent's map.
++  // Prepare descendants before parents across all units, including on repeated
++  // calls after initialization has transferred maps out of prepared classes.
++  // Temporary handles also protect completed maps from MallocGC's debug clearing
++  // while another map allocation collects. Only the array roots persist.
++  GCScope mapScope{
++      runtime, "prepareLiteralMaps", std::numeric_limits<unsigned>::max()};
++  std::vector<Handle<HiddenClass>> layouts;
++  for (auto *unit : runtime.units) {
++    if (!unit || !unit->runtime_ext->preparedLiteralLayouts)
++      continue;
++    auto *storage = unit->runtime_ext->preparedLiteralLayouts;
++    for (uint32_t i = 0; i < storage->size(); ++i) {
++      if (storage->at(i).isObject())
++        layouts.push_back(runtime.makeHandle<HiddenClass>(storage->at(i)));
++    }
++  }
++  std::stable_sort(layouts.begin(), layouts.end(), [](auto left, auto right) {
++    return left->getNumProperties() > right->getNumProperties();
++  });
++  const auto mapMarker = mapScope.createMarker();
++  for (auto clazz : layouts) {
++    HiddenClass::forEachPropertyWhile(
++        clazz, runtime,
++        [](Runtime &, SymbolID, NamedPropertyDescriptor) { return false; });
++    mapScope.flushToMarker(mapMarker);
++  }
++  *resultOrException = HermesValue::encodeUndefinedValue();
++  return true;
++}
++
  namespace {
  /// Convert the given \p cr to a \c CallResult<HermesValue>.
  template <typename T>
-@@ -209,6 +227,349 @@ extern "C" void _sh_ljs_reify_arguments_strict(
+@@ -209,6 +340,349 @@ extern "C" void _sh_ljs_reify_arguments_strict(
    reifyArguments(shr, frame, lazyReg, true);
  }
  
@@ -13849,7 +14178,7 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..be4b578bb318d4816f5705467277f043
  LLVM_ATTRIBUTE_NOINLINE
  extern "C" SHLegacyValue _sh_ljs_get_by_val_with_receiver_rjs(
      SHRuntime *shr,
-@@ -288,6 +649,64 @@ _sh_ljs_get_by_index_rjs(SHRuntime *shr, SHLegacyValue *source, uint32_t key) {
+@@ -288,6 +762,64 @@ _sh_ljs_get_by_index_rjs(SHRuntime *shr, SHLegacyValue *source, uint32_t key) {
    return res->getHermesValue();
  }
  
@@ -13914,7 +14243,7 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..be4b578bb318d4816f5705467277f043
  LLVM_ATTRIBUTE_NOINLINE
  extern "C" SHLegacyValue _sh_ljs_get_own_private_by_sym(
      SHRuntime *shr,
-@@ -666,6 +1085,101 @@ extern "C" SHLegacyValue _sh_ljs_create_generator_object(
+@@ -666,6 +1198,101 @@ extern "C" SHLegacyValue _sh_ljs_create_generator_object(
    return *genObjRes;
  }
  
@@ -14016,7 +14345,7 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..be4b578bb318d4816f5705467277f043
  LLVM_ATTRIBUTE_NOINLINE
  extern "C" SHLegacyValue _sh_ljs_create_class(
      SHRuntime *shr,
-@@ -807,6 +1321,8 @@ static inline void putById_RJS(
+@@ -807,6 +1434,8 @@ static inline void putById_RJS(
          sh_unit_get_add_cache_entry(unit, cacheEntry->getAddCacheIndex());
      if (LLVM_LIKELY(addCacheEntry.startClazz == clazzPtr) &&
          LLVM_LIKELY(addCacheEntry.resultClazz) &&
@@ -14025,7 +14354,7 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..be4b578bb318d4816f5705467277f043
          LLVM_LIKELY(
              addCacheEntry.getParentEpoch() == runtime.getParentCacheEpoch()) &&
          LLVM_LIKELY(addCacheEntry.parent == obj->getParentGCPtr())) {
-@@ -1037,6 +1553,91 @@ extern "C" void _sh_ljs_put_by_val_strict_rjs(
+@@ -1037,6 +1666,91 @@ extern "C" void _sh_ljs_put_by_val_strict_rjs(
    putByVal_RJS(shr, target, key, value, true);
  }
  
@@ -14117,7 +14446,7 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..be4b578bb318d4816f5705467277f043
  static inline void putByIndex_RJS(
      SHRuntime *shr,
      SHLegacyValue *target,
-@@ -1264,8 +1865,25 @@ static inline HermesValue getByIdWithReceiver_RJS(
+@@ -1264,8 +1978,25 @@ static inline HermesValue getByIdWithReceiver_RJS(
      CallResult<PseudoHandle<>> resPH{ExecutionStatus::EXCEPTION};
      {
        GCScopeMarkerRAII marker{runtime};
@@ -14145,7 +14474,7 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..be4b578bb318d4816f5705467277f043
      }
      if (LLVM_UNLIKELY(resPH == ExecutionStatus::EXCEPTION))
        _sh_throw_current(getSHRuntime(runtime));
-@@ -1411,6 +2029,36 @@ extern "C" SHLegacyValue _sh_ljs_get_by_id_rjs(
+@@ -1411,6 +2142,36 @@ extern "C" SHLegacyValue _sh_ljs_get_by_id_rjs(
        reinterpret_cast<ReadPropertyCacheEntry *>(propCacheEntry));
  }
  
@@ -14182,7 +14511,7 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..be4b578bb318d4816f5705467277f043
  LLVM_ATTRIBUTE_NOINLINE
  extern "C" SHLegacyValue _sh_ljs_get_by_id_with_receiver_rjs(
      SHRuntime *shr,
-@@ -1426,9 +2074,12 @@ extern "C" SHLegacyValue _sh_ljs_get_by_id_with_receiver_rjs(
+@@ -1426,9 +2187,12 @@ extern "C" SHLegacyValue _sh_ljs_get_by_id_with_receiver_rjs(
        reinterpret_cast<ReadPropertyCacheEntry *>(propCacheEntry));
  }
  
@@ -14197,7 +14526,7 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..be4b578bb318d4816f5705467277f043
      SHLegacyValue *target,
      SHSymbolID key,
      SHLegacyValue *value,
-@@ -1450,6 +2101,24 @@ extern "C" void _sh_ljs_define_own_by_id(
+@@ -1450,6 +2214,24 @@ extern "C" void _sh_ljs_define_own_by_id(
      JSObject::setNamedSlotValueUnsafe(obj, runtime, cacheEntry->getSlot(), shv);
      return;
    }
@@ -14222,7 +14551,7 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..be4b578bb318d4816f5705467277f043
    NamedPropertyDescriptor desc;
    OptValue<bool> hasOwnProp =
        JSObject::tryGetOwnNamedDescriptorFast(obj, runtime, symID, desc);
-@@ -1480,12 +2149,35 @@ extern "C" void _sh_ljs_define_own_by_id(
+@@ -1480,12 +2262,35 @@ extern "C" void _sh_ljs_define_own_by_id(
          symID,
          DefinePropertyFlags::getDefaultNewPropertyFlags(),
          Handle<>(valuePHV),
@@ -14259,7 +14588,7 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..be4b578bb318d4816f5705467277f043
  LLVM_ATTRIBUTE_NOINLINE
  extern "C" void _sh_ljs_define_own_by_val(
      SHRuntime *shr,
-@@ -1792,6 +2484,25 @@ _sh_ljs_create_regexp(SHRuntime *shr, SHSymbolID pattern, SHSymbolID flags) {
+@@ -1792,6 +2597,25 @@ _sh_ljs_create_regexp(SHRuntime *shr, SHSymbolID pattern, SHSymbolID flags) {
    return *cr;
  }
  
@@ -14285,7 +14614,7 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..be4b578bb318d4816f5705467277f043
  LLVM_ATTRIBUTE_NOINLINE
  extern "C" SHLegacyValue
  _sh_ljs_create_bigint(SHRuntime *shr, const uint8_t *value, uint32_t size) {
-@@ -2727,3 +3438,32 @@ _sh_asciiz_to_string(SHRuntime *shr, const char *str, ptrdiff_t len) {
+@@ -2727,3 +3551,32 @@ _sh_asciiz_to_string(SHRuntime *shr, const char *str, ptrdiff_t len) {
      _sh_throw_current(shr);
    return *res;
  }
@@ -14319,10 +14648,20 @@ index a378f1aee0721a7f7773b12ae81002d0c00f3d0a..be4b578bb318d4816f5705467277f043
 +  return written;
 +}
 diff --git a/lib/VM/StaticHUnit.cpp b/lib/VM/StaticHUnit.cpp
-index 4cce9f599fb00e6e868fedd669cf0399d9e55c16..57ea558d44fa78c32dcbcc5dd78b84450db000f8 100644
+index 4cce9f599fb00e6e868fedd669cf0399d9e55c16..78db63ae8ff058935acb3f016a8d0c133e427a93 100644
 --- a/lib/VM/StaticHUnit.cpp
 +++ b/lib/VM/StaticHUnit.cpp
-@@ -306,11 +306,29 @@ void hermes::vm::sh_unit_mark_weak_roots(
+@@ -266,6 +266,9 @@ void hermes::vm::sh_unit_mark_roots(
+     SHUnit *unit,
+     RootAcceptorWithNames &acceptor,
+     bool markLongLived) {
++  if (unit->runtime_ext->preparedLiteralLayouts)
++    acceptor.acceptPtr(unit->runtime_ext->preparedLiteralLayouts);
++
+   for (auto &it : unit->runtime_ext->templateMap) {
+     acceptor.acceptPtr(it.second);
+   }
+@@ -306,11 +309,29 @@ void hermes::vm::sh_unit_mark_weak_roots(
        acceptor.acceptWeakSym(prop.nameVal);
      }
  
@@ -14367,6 +14706,70 @@ index 5bf0eb3faa636d974da9c14bd49a1f7d15044b87..67986bb7ed1a8c5160844db2f825ba0a
    SafeUInt32 safeLen(length);
  
    // Special case for 1-character strings, some of which are cached in the
+diff --git a/lib/VM/gcs/HadesGC.cpp b/lib/VM/gcs/HadesGC.cpp
+index 8c8ceecd275fb00826e6031c9d47b02f65caa362..80c26853719ce52e5602e29d64fb212ccc41f5d3 100644
+--- a/lib/VM/gcs/HadesGC.cpp
++++ b/lib/VM/gcs/HadesGC.cpp
+@@ -1481,6 +1481,33 @@ void HadesGC::collect(std::string cause, bool /*canEffectiveOOM*/) {
+   youngGenCollection(std::move(cause), /*forceOldGenCollection*/ false);
+ }
+ 
++HadesGC::YoungReclaimResult HadesGC::tryReclaimYoungGeneration() {
++  auto lk = ensureBackgroundTaskPaused();
++  if (inGC())
++    hermes_fatal("Young reclamation requires the mutator boundary");
++  // Promotion changes ownership of the nursery; compaction can rewrite old
++  // objects. Neither establishes disposable young payload for the embedder.
++  if (!youngGen_ || concurrentPhase_ != Phase::None || compactee_.segment ||
++      promoteYGToOG_) {
++    return {YoungReclaimStatus::Deferred, nullptr, nullptr};
++  }
++  // Repeated boundary collections must not keep emptying YG while bypassing
++  // the old-generation start threshold. Reserve for every possible survivor
++  // before mutating the heap; a deferred caller must allow ordinary GC progress
++  // or restore/dispose, rather than retrying this operation to force progress.
++  const uint64_t maximumOldBytes = oldGen_.allocatedBytes() +
++      oldGen_.externalBytes() + youngGen_.used() + getYoungGenExternalBytes();
++  if (static_cast<double>(maximumOldBytes) >=
++      oldGen_.targetSizeBytes() * static_cast<double>(ogThreshold_))
++    return {YoungReclaimStatus::Deferred, nullptr, nullptr};
++  youngGenCollection("boundary", false, false);
++  // These checks protect a memory-discard authority, including release builds.
++  if (concurrentPhase_ != Phase::None || compactee_.segment ||
++      youngGen_.used() != 0 || !youngGenFinalizables_.empty())
++    hermes_fatal("Young reclamation did not leave an empty nursery");
++  return {YoungReclaimStatus::Reclaimed, youngGen_.start(), youngGen_.hiLim()};
++}
++
+ void HadesGC::waitForCollectionToFinish(std::string cause) {
+   assert(
+       gcMutex_ &&
+@@ -2643,7 +2670,13 @@ uint64_t HadesGC::youngGenEvacuateImpl(bool doCompaction) {
+ 
+ void HadesGC::youngGenCollection(
+     std::string cause,
+-    bool forceOldGenCollection) {
++    bool forceOldGenCollection,
++    bool allowOldGenStart) {
++  assert(
++      (allowOldGenStart ||
++       (!forceOldGenCollection && concurrentPhase_ == Phase::None &&
++        !compactee_.segment && !promoteYGToOG_)) &&
++      "Young-only collection requires a quiescent collector");
+   assert(gcMutex_ && "gcMutex_ must be held during YG collection");
+   assert(
+       gcMutex_.depth() == 1 &&
+@@ -2798,7 +2831,9 @@ void HadesGC::youngGenCollection(
+   // handles the rare case where an OG collection was completed during this YG
+   // collection, and the compaction will therefore only be completed in the next
+   // collection.
+-  if (concurrentPhase_ == Phase::None && !compactee_.segment) {
++  // Boundary reclamation cannot turn into an old-generation cycle. Ordinary
++  // allocation-pressure collections retain their existing policy and limits.
++  if (allowOldGenStart && concurrentPhase_ == Phase::None && !compactee_.segment) {
+     // There is no OG collection running, check the tripwire in case this is the
+     // first YG after an OG completed.
+     checkTripwireAndSubmitStats();
 diff --git a/public/hermes/Public/RuntimeConfig.h b/public/hermes/Public/RuntimeConfig.h
 index 84c1e5ded6167996fc7e27f0ed70c44294bc217a..bca3658703c0deaeebd22f1dd63e1296fd2ffbf0 100644
 --- a/public/hermes/Public/RuntimeConfig.h
@@ -15236,10 +15639,10 @@ index 0000000000000000000000000000000000000000..eb81a2587633095dca25034ca2836755
 +// CHECK: native Promise reentrancy passed
 diff --git a/test/shermes/Inputs/check-c-bundle-layout.py b/test/shermes/Inputs/check-c-bundle-layout.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..1b4455627a4d44547d5b4f80840494cf6a891624
+index 0000000000000000000000000000000000000000..01d55a8df6a9ef3c085570289259ae5fcafa7383
 --- /dev/null
 +++ b/test/shermes/Inputs/check-c-bundle-layout.py
-@@ -0,0 +1,650 @@
+@@ -0,0 +1,658 @@
 +# Copyright (c) Meta Platforms, Inc. and affiliates.
 +#
 +# This source code is licensed under the MIT license found in the
@@ -15338,6 +15741,14 @@ index 0000000000000000000000000000000000000000..1b4455627a4d44547d5b4f80840494cf
 +    if previous and "functionFragmentIndex" in previous:
 +        assert previous["functionFragmentIndex"] + 1 == previous["functionFragmentCount"]
 +    text = "\n".join((directory / member["path"]).read_text() for member in members)
++    # Eligibility follows current allocation instructions, including explicit
++    # parents, rather than every ordinary slot in the retained shape table.
++    ordinary = sorted({int(index) for index in re.findall(
++        r"_sh_ljs_new_object_with_buffer(?:_and_parent)?\(shr, shUnit, "
++        r"(?:[^,\n]+, )?([0-9]+), [0-9]+\)", text)})
++    emitted = re.search(r"s_ordinary_literal_shapes\[\] = \{([^}]*)};", text).group(1)
++    assert [int(index) for index in emitted.split(",") if index] == ordinary
++    assert int(re.search(r"\.ordinary_literal_shape_count = ([0-9]+)", text).group(1)) == len(ordinary)
 +    if emit_layout:
 +        metadata = next((directory / member["path"]).read_text()
 +                        for member in members if member["role"] == "metadata")
@@ -22532,23 +22943,146 @@ index f911c7a4e08173d622798594d2c93da3cd3db5de..b64a5d423649619764b773d839965d7c
  // This might look like a silly test, but it should be useful if we
  // need to add tricky optimizations to isUnicodeOnlySpace
  TEST(UnicodeTest, isUnicodeOnlySpace) {
+diff --git a/unittests/VMRuntime/GCBasicsTest.cpp b/unittests/VMRuntime/GCBasicsTest.cpp
+index c70e45986a0a5a76eba9ce52ec64f67bc0632b64..202a9396b5cb997b3cbdb01bdf1ffffd056de3f3 100644
+--- a/unittests/VMRuntime/GCBasicsTest.cpp
++++ b/unittests/VMRuntime/GCBasicsTest.cpp
+@@ -397,6 +397,45 @@ TEST(GCCallbackTest, TestCallbackInvoked) {
+   }
+ }
+ 
++#if HERMESVM_GCKIND == _HERMESVM_GCVALUE_HADES && \
++    HERMESVM_SANITIZE_HANDLES == 0
++TEST(GCBasicsTestHades, YoungReclamationDefersBeforeOldGenerationPressure) {
++  using Cell = EmptyCell<(FixedSizeHeapSegment::maxSize() / 16) & ~(HeapAlign - 1)>;
++  const auto config = TestGCConfigFixedSize(
++      8 * FixedSizeHeapSegment::storageSize(),
++      GCConfig::Builder().withAllocInYoung(true));
++  auto runtime = DummyRuntime::create(config);
++  auto &rt = *runtime;
++  struct : Locals {
++    PinnedValue<Cell> survivor;
++  } lv;
++  DummyLocalsRAII lraii{rt, &lv};
++  bool deferred = false;
++  for (unsigned i = 0; i < 128; ++i) {
++    // Each previous survivor becomes unreachable in OG. Young-only collection
++    // must defer before this garbage exhausts the heap without an old cycle.
++    lv.survivor = Cell::create(rt);
++    auto result = rt.getHeap().tryReclaimYoungGeneration();
++    if (result.status == HadesGC::YoungReclaimStatus::Deferred) {
++      EXPECT_EQ(nullptr, result.payloadBegin);
++      EXPECT_EQ(nullptr, result.payloadEnd);
++      deferred = true;
++      break;
++    }
++    EXPECT_LT(result.payloadBegin, result.payloadEnd);
++    const auto survivor = reinterpret_cast<uintptr_t>(*lv.survivor);
++    EXPECT_FALSE(
++        reinterpret_cast<uintptr_t>(result.payloadBegin) <= survivor &&
++        survivor < reinterpret_cast<uintptr_t>(result.payloadEnd));
++  }
++  EXPECT_TRUE(deferred);
++  rt.collect();
++  EXPECT_EQ(
++      HadesGC::YoungReclaimStatus::Reclaimed,
++      rt.getHeap().tryReclaimYoungGeneration().status);
++}
++#endif
++
+ #if HERMESVM_GCKIND != _HERMESVM_GCVALUE_MALLOC
+ TEST(GCBasicsTestNCGen, TestIDPersistsAcrossMultipleCollections) {
+   using SegmentCell = EmptyCell<FixedSizeHeapSegment::maxSize()>;
 diff --git a/unittests/VMRuntime/StaticHUnitTest.cpp b/unittests/VMRuntime/StaticHUnitTest.cpp
-index 87be113a8a12acd4320fe516958a9a9846701db2..a0f1bbb39ad3ed8936ebdc981cc7baa4191143a5 100644
+index 87be113a8a12acd4320fe516958a9a9846701db2..c809184b6d3f699e8e3181e76a799a9a48d08067 100644
 --- a/unittests/VMRuntime/StaticHUnitTest.cpp
 +++ b/unittests/VMRuntime/StaticHUnitTest.cpp
-@@ -7,6 +7,7 @@
+@@ -6,7 +6,10 @@
+  */
  
  #include "VMRuntimeTestHelpers.h"
++#include "../../lib/VM/SHUnitExt.h"
  
++#include "hermes/BCGen/SerializedLiteralGenerator.h"
 +#include "hermes/VM/PropertyCache.h"
  #include "hermes/VM/StaticHUtils.h"
  #include "hermes/VM/static_h.h"
  
-@@ -103,4 +104,53 @@ TEST(StaticHUnitTest, RejectsMismatchedStaticABI) {
+@@ -103,4 +106,123 @@ TEST(StaticHUnitTest, RejectsMismatchedStaticABI) {
        "Static Hermes ABI mismatch: generated.*runtime archive");
  }
  
 +using StaticHCacheTest = RuntimeTestFixture;
++
++TEST_F(StaticHCacheTest, PreparesParentAndChildMapsAcrossUnitsAndCollection) {
++  // Install metadata directly to avoid consuming the process-wide unit indexes
++  // exercised by InitializesAllUsableUnitSlots. Runtime still owns these units.
++  struct LiteralUnit {
++    SHUnit unit;
++    SHSymbolID symbols[3];
++    SHCompressedPointer caches[2];
++  };
++  static const uint8_t keys[]{
++      hermes::SerializedLiteralGenerator::ShortStringTag | 3,
++      0, 0, 1, 0, 2, 0};
++  static const SHShapeTableEntry initialShapes[]{{0, 1}, {0, 2}};
++  static const SHShapeTableEntry addedShapes[]{{0, 3}};
++  static const uint32_t indexes[]{0, 1};
++  const auto value = Predefined::getSymbolID(Predefined::value);
++  auto install = [&](const SHShapeTableEntry *shapes, uint32_t count) {
++    auto *data = static_cast<LiteralUnit *>(std::calloc(1, sizeof(LiteralUnit)));
++    if (!data)
++      std::abort();
++    data->symbols[0] = value.unsafeGetRaw();
++    data->symbols[1] = Predefined::getSymbolID(Predefined::length).unsafeGetRaw();
++    data->symbols[2] = Predefined::getSymbolID(Predefined::name).unsafeGetRaw();
++    auto *unit = &data->unit;
++    unit->symbols = data->symbols;
++    unit->num_symbols = 3;
++    unit->obj_key_buffer = keys;
++    unit->obj_key_buffer_size = sizeof(keys);
++    unit->obj_shape_table = shapes;
++    unit->obj_shape_table_count = count;
++    unit->ordinary_literal_shapes = indexes;
++    unit->ordinary_literal_shape_count = count;
++    unit->object_literal_class_cache = data->caches;
++    unit->runtime_ext = new SHUnitExt{};
++    for (size_t index = 1; index < std::size(runtime.units); ++index) {
++      auto &slot = runtime.units[index];
++      if (!slot) {
++        slot = unit;
++        return unit;
++      }
++    }
++    std::abort();
++  };
++  auto *first = install(initialShapes, 2);
++  SHLegacyValue result;
++  auto *shr = getSHRuntime(runtime);
++  ASSERT_TRUE(_sh_prepare_literal_layouts(shr, &result));
++  auto checkMaps = [&](SHUnit *unit) {
++    auto *storage = unit->runtime_ext->preparedLiteralLayouts;
++    ASSERT_NE(nullptr, storage);
++    for (uint32_t i = 0; i < storage->size(); ++i) {
++      auto *clazz = vmcast<HiddenClass>(storage->at(i));
++      NamedPropertyDescriptor desc;
++      auto found = HiddenClass::tryFindPropertyFast(clazz, runtime, value, desc);
++      ASSERT_TRUE(found.hasValue());
++      EXPECT_TRUE(*found);
++      EXPECT_EQ(0u, desc.slot);
++    }
++  };
++  checkMaps(first);
++  auto *second = install(addedShapes, 1);
++  ASSERT_TRUE(_sh_prepare_literal_layouts(shr, &result));
++  checkMaps(first);
++  checkMaps(second);
++  // Only the per-unit GC storage roots the classes through this collection.
++  runtime.collect("prepared layouts test");
++  ASSERT_TRUE(_sh_prepare_literal_layouts(shr, &result));
++  checkMaps(first);
++  checkMaps(second);
++}
 +
 +TEST_F(StaticHCacheTest, RetainsTwoShapesForNamedAndComputedReads) {
 +  auto first = runtime.makeHandle(JSObject::create(runtime));
