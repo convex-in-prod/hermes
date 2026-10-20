@@ -173,6 +173,8 @@ Keep survivor tracing, finalizers and ordinary GC authority intact.
 Validate prepared parent/child maps across units and collection, deferred young
 reclamation, 115 compiler layout cases and 37 native executions. Build both
 host and Wasm runtime archives without claiming complete embedding acceptance.
+
+Skip disabled allocation and sampling instrumentation on the release allocation path while retaining enabled tracking and debug IP validation. Avoid the unused virtual IP lookup and its Wasm indirect-call overhead.
 ---
  API/hermes/SynthTrace.cpp                     |    1 +
  API/hermes/SynthTraceParser.cpp               |    4 +
@@ -244,7 +246,7 @@ host and Wasm runtime archives without claiming complete embedding acceptance.
  lib/Platform/Unicode/CharacterProperties.cpp  |   42 +-
  lib/Sema/FlowChecker-expr.cpp                 |    2 +-
  lib/VM/CMakeLists.txt                         |    2 +
- lib/VM/GCBase.cpp                             |   13 +-
+ lib/VM/GCBase.cpp                             |   30 +-
  lib/VM/Interpreter-slowpaths.cpp              |    5 +
  lib/VM/JSArray.cpp                            |    9 +
  lib/VM/JSArrayBuffer.cpp                      |    8 +-
@@ -337,7 +339,7 @@ host and Wasm runtime archives without claiming complete embedding acceptance.
  unittests/VMRuntime/GCBasicsTest.cpp          |  168 +++
  unittests/VMRuntime/StaticHUnitTest.cpp       |  122 ++
  unittests/VMRuntime/StringPrimitiveTest.cpp   |  189 +++
- 163 files changed, 19900 insertions(+), 426 deletions(-)
+ 163 files changed, 19912 insertions(+), 431 deletions(-)
  create mode 100644 include/hermes/Optimizer/Scalar/RecordUseAnalysis.h
  create mode 100644 include/hermes/Support/MathFunctions.h
  create mode 100644 include/hermes/VM/JSPromise.h
@@ -12485,7 +12487,7 @@ index bf34b0cd5da231f8946fc63ed185da4c908370f4..412f484bd497838f4e23b625e1917d76
    JSLib/Intl.cpp
    JSLib/JSLibInternal.cpp JSLib/JSLibInternal.h
 diff --git a/lib/VM/GCBase.cpp b/lib/VM/GCBase.cpp
-index e0b0e97eb59cdc99c8309a87b7a95c8e5d6a5e2a..b0fdff34f9a6247882bf46b0ceabddd470594b78 100644
+index e0b0e97eb59cdc99c8309a87b7a95c8e5d6a5e2a..516b98cb75f1adc566283ff130bc04424c6765c0 100644
 --- a/lib/VM/GCBase.cpp
 +++ b/lib/VM/GCBase.cpp
 @@ -700,7 +700,7 @@ void GCBase::snapshotAddGCNativeNodes(HeapSnapshot &snap) {
@@ -12522,6 +12524,38 @@ index e0b0e97eb59cdc99c8309a87b7a95c8e5d6a5e2a..b0fdff34f9a6247882bf46b0ceabddd4
  WeakMapEntrySlot *GCBase::allocWeakMapEntrySlot(
      SmallHermesValue key,
      HermesValue value,
+@@ -1039,8 +1046,17 @@ bool GCBase::hasObjectID(const GCCell *cell) {
+ 
+ void GCBase::newAlloc(const GCCell *ptr, uint32_t sz) {
+ #ifdef HERMES_MEMORY_INSTRUMENTATION
++#if !defined(NDEBUG) || defined(HERMES_SLOW_DEBUG)
++  // Debug allocations also validate the captured IP when tracking is disabled.
+   allocationLocationTracker_.newAlloc(ptr, sz);
+-  samplingAllocationTracker_.newAlloc(ptr, sz);
++#else
++  // Keep disabled instrumentation off the allocation call path. In Wasm the
++  // otherwise unused virtual IP lookup also incurs an indirect-call check.
++  if (allocationLocationTracker_.isEnabled())
++    allocationLocationTracker_.newAlloc(ptr, sz);
++#endif
++  if (samplingAllocationTracker_.isEnabled())
++    samplingAllocationTracker_.newAlloc(ptr, sz);
+ #endif
+ }
+ 
+@@ -1384,10 +1400,8 @@ void GCBase::AllocationLocationTracker::disable() {
+ void GCBase::AllocationLocationTracker::newAlloc(
+     const GCCell *ptr,
+     uint32_t sz) {
+-  // Note we always get the current IP even if allocation tracking is not
+-  // enabled as it allows us to assert this feature works across many tests.
+-  // Note it's not very slow, it's slower than the non-virtual version
+-  // in Runtime though.
++  // The allocation hook calls this while disabled only in debug builds, to
++  // exercise IP-capture assertions without charging release allocations.
+   const auto *ip = gc_->gcCallbacks_.getCurrentIPSlow();
+   if (!enabled_) {
+     return;
 diff --git a/lib/VM/Interpreter-slowpaths.cpp b/lib/VM/Interpreter-slowpaths.cpp
 index fa585f16fcf24f1aa2954b930ebc44ab3e2bcd09..53959769951032fc0453f61781b838ac60e2b0ae 100644
 --- a/lib/VM/Interpreter-slowpaths.cpp
