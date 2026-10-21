@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Mon, 28 Sep 2026 11:25:34 +0800
-Subject: [PATCH 15/16] wasm: optimize static execution and native value
+Subject: [PATCH 14/15] wasm: optimize static execution and native value
  boundaries
 
 Expose a native UTF-8 string writer to Static Hermes extern calls and
@@ -256,7 +256,7 @@ Skip disabled allocation and sampling instrumentation on the release allocation 
  lib/VM/JSLib/Math.cpp                         |   51 +-
  lib/VM/JSLib/MathStdFunctions.def             |    2 +-
  lib/VM/JSLib/NativePromise.cpp                |  990 +++++++++++++
- lib/VM/JSLib/String.cpp                       |   15 +-
+ lib/VM/JSLib/String.cpp                       |   19 +-
  lib/VM/JSObject.cpp                           |   11 +-
  lib/VM/JSPromise.cpp                          |   46 +
  lib/VM/JSTypedArray.cpp                       |    7 +
@@ -336,10 +336,11 @@ Skip disabled allocation and sampling instrumentation on the release allocation 
  unittests/Optimizer/CMakeLists.txt            |    1 +
  .../Scalar/RecordUseAnalysisTest.cpp          |  487 ++++++
  .../PlatformUnicode/CharacterPropertyTest.cpp |   26 +
+ .../PlatformUnicode/PlatformUnicodeTest.cpp   |    3 -
  unittests/VMRuntime/GCBasicsTest.cpp          |  168 +++
  unittests/VMRuntime/StaticHUnitTest.cpp       |  122 ++
  unittests/VMRuntime/StringPrimitiveTest.cpp   |  189 +++
- 163 files changed, 19912 insertions(+), 431 deletions(-)
+ 164 files changed, 19914 insertions(+), 436 deletions(-)
  create mode 100644 include/hermes/Optimizer/Scalar/RecordUseAnalysis.h
  create mode 100644 include/hermes/Support/MathFunctions.h
  create mode 100644 include/hermes/VM/JSPromise.h
@@ -442,7 +443,7 @@ index a66277247e6bb2e98918556cf802ef369cb87040..5978572b16bc010e96e1fea23da68316
      conf.withEnableSampledStats(
          llvh::cast<JSONBoolean>(enableSampledStats)->getValue());
 diff --git a/API/hermes/hermes.cpp b/API/hermes/hermes.cpp
-index d401e00890343c3659d4107249376b3c6aec26a8..0a4f40800c4cb6e4ba01b9ffbd903ce879c9aedb 100644
+index 92a5208123c37e443f3201ae2476b5a54149c286..471dadec02102de90617bcee97459dd39fa956b1 100644
 --- a/API/hermes/hermes.cpp
 +++ b/API/hermes/hermes.cpp
 @@ -32,14 +32,18 @@
@@ -464,7 +465,7 @@ index d401e00890343c3659d4107249376b3c6aec26a8..0a4f40800c4cb6e4ba01b9ffbd903ce8
  #include "hermes/VM/SerializedValue.h"
  #include "hermes/VM/StaticHUtils.h"
  #include "hermes/VM/StringPrimitive.h"
-@@ -250,6 +254,17 @@ class HermesRootAPI final : public IHermesRootAPI, public ISetFatalHandler {
+@@ -251,6 +255,17 @@ class HermesRootAPI final : public IHermesRootAPI, public ISetFatalHandler {
    void disableCodeCoverageProfiler() override;
  };
  
@@ -482,7 +483,7 @@ index d401e00890343c3659d4107249376b3c6aec26a8..0a4f40800c4cb6e4ba01b9ffbd903ce8
  namespace {
  using EventLoopCallback = const std::function<void()>;
  using ScheduleCallbackFunc = std::function<void(EventLoopCallback)>;
-@@ -337,21 +352,32 @@ class HermesRuntimeImpl final : public HermesRuntime,
+@@ -338,21 +353,32 @@ class HermesRuntimeImpl final : public HermesRuntime,
      compileFlags_.emitAsyncBreakCheck =
          runtimeConfig.getAsyncBreakCheckInEval();
      runtime_.addCustomRootsFunction(
@@ -521,7 +522,7 @@ index d401e00890343c3659d4107249376b3c6aec26a8..0a4f40800c4cb6e4ba01b9ffbd903ce8
          });
  #ifdef HERMES_MEMORY_INSTRUMENTATION
      runtime_.addCustomSnapshotFunction(
-@@ -362,7 +388,7 @@ class HermesRuntimeImpl final : public HermesRuntime,
+@@ -363,7 +389,7 @@ class HermesRuntimeImpl final : public HermesRuntime,
                "ManagedValues",
                vm::GCBase::IDTracker::reserved(
                    vm::GCBase::IDTracker::ReservedObjectID::JSIHermesValueList),
@@ -530,7 +531,7 @@ index d401e00890343c3659d4107249376b3c6aec26a8..0a4f40800c4cb6e4ba01b9ffbd903ce8
                0);
            snap.beginNode();
            snap.endNode(
-@@ -371,7 +397,7 @@ class HermesRuntimeImpl final : public HermesRuntime,
+@@ -372,7 +398,7 @@ class HermesRuntimeImpl final : public HermesRuntime,
                vm::GCBase::IDTracker::reserved(
                    vm::GCBase::IDTracker::ReservedObjectID::
                        JSIWeakHermesValueList),
@@ -539,7 +540,7 @@ index d401e00890343c3659d4107249376b3c6aec26a8..0a4f40800c4cb6e4ba01b9ffbd903ce8
                0);
          },
          [](vm::HeapSnapshot &snap) {
-@@ -392,6 +418,7 @@ class HermesRuntimeImpl final : public HermesRuntime,
+@@ -393,6 +419,7 @@ class HermesRuntimeImpl final : public HermesRuntime,
  
   public:
    ~HermesRuntimeImpl() override {
@@ -547,7 +548,7 @@ index d401e00890343c3659d4107249376b3c6aec26a8..0a4f40800c4cb6e4ba01b9ffbd903ce8
  #ifdef HERMES_ENABLE_DEBUGGER
      // Deallocate the debugger so it frees any HermesPointerValues it may hold.
      // This must be done before we check hermesValues_ below.
-@@ -475,6 +502,12 @@ class HermesRuntimeImpl final : public HermesRuntime,
+@@ -476,6 +503,12 @@ class HermesRuntimeImpl final : public HermesRuntime,
  
  #undef BRIDGE_INFO
  
@@ -560,7 +561,7 @@ index d401e00890343c3659d4107249376b3c6aec26a8..0a4f40800c4cb6e4ba01b9ffbd903ce8
      jsInfo["hermes_peakAllocatedBytes"] =
          runtime_.getHeap().getPeakAllocatedBytes();
      jsInfo["hermes_peakLiveAfterGC"] = runtime_.getHeap().getPeakLiveAfterGC();
-@@ -881,6 +914,40 @@ class HermesRuntimeImpl final : public HermesRuntime,
+@@ -882,6 +915,40 @@ class HermesRuntimeImpl final : public HermesRuntime,
    bool isHostObject(const jsi::Object &) const override;
    bool isHostFunction(const jsi::Function &) const override;
    jsi::Array getPropertyNames(const jsi::Object &) override;
@@ -601,7 +602,7 @@ index d401e00890343c3659d4107249376b3c6aec26a8..0a4f40800c4cb6e4ba01b9ffbd903ce8
  
    void setPrototypeOf(const jsi::Object &object, const jsi::Value &prototype)
        override;
-@@ -963,6 +1030,9 @@ class HermesRuntimeImpl final : public HermesRuntime,
+@@ -964,6 +1031,9 @@ class HermesRuntimeImpl final : public HermesRuntime,
    vm::HermesValue stringHVFromUtf8(const uint8_t *utf8, size_t length);
    vm::HermesValue stringHVFromUtf16(const char16_t *utf16, size_t length);
    std::string utf8FromStringView(vm::StringView view);
@@ -611,7 +612,7 @@ index d401e00890343c3659d4107249376b3c6aec26a8..0a4f40800c4cb6e4ba01b9ffbd903ce8
  
    /// Extract a UTF-8 message from the given exception \p ex as UTF-16. Uses
    /// \p buf as storage for the resulting UTF-16 message.
-@@ -1193,8 +1263,8 @@ class HermesRuntimeImpl final : public HermesRuntime,
+@@ -1194,8 +1264,8 @@ class HermesRuntimeImpl final : public HermesRuntime,
      template <typename... Args>
      void emplace(Args &&...args) {
        assert(isFree() && "Emplacing already occupied value");
@@ -621,7 +622,7 @@ index d401e00890343c3659d4107249376b3c6aec26a8..0a4f40800c4cb6e4ba01b9ffbd903ce8
      }
  
      // Get the next free element. Must not be called when this instance is
-@@ -1388,6 +1458,18 @@ class HermesRuntimeImpl final : public HermesRuntime,
+@@ -1389,6 +1459,18 @@ class HermesRuntimeImpl final : public HermesRuntime,
    void *getVMRuntimeUnsafe() const override;
    size_t rootsListLengthForTests() const override;
  
@@ -640,7 +641,7 @@ index d401e00890343c3659d4107249376b3c6aec26a8..0a4f40800c4cb6e4ba01b9ffbd903ce8
    ManagedValues<vm::PinnedHermesValue> hermesValues_;
    ManagedValues<vm::WeakRoot<vm::JSObject>> weakHermesValues_;
    std::shared_ptr<::hermes::vm::Runtime> rt_;
-@@ -2534,8 +2616,28 @@ jsi::String HermesRuntimeImpl::createStringFromUtf16(
+@@ -2579,8 +2661,28 @@ jsi::String HermesRuntimeImpl::createStringFromUtf16(
  
  std::string HermesRuntimeImpl::utf8(const jsi::String &str) {
    ExecutionScopeRAII scopeRAII(mutatorScope);
@@ -670,7 +671,7 @@ index d401e00890343c3659d4107249376b3c6aec26a8..0a4f40800c4cb6e4ba01b9ffbd903ce8
  }
  
  size_t HermesRuntimeImpl::length(const jsi::String &str) {
-@@ -3064,6 +3166,410 @@ jsi::Array HermesRuntimeImpl::getPropertyNames(const jsi::Object &obj) {
+@@ -3118,6 +3220,410 @@ jsi::Array HermesRuntimeImpl::getPropertyNames(const jsi::Object &obj) {
    return ret;
  }
  
@@ -2054,7 +2055,7 @@ index c4d27a5671c29cdb8278ff3fac9bb90daf8d0511..3eabea2888aae427f6ff67a29c554700
    bool stripDebugInfoSection = false;
  
 diff --git a/include/hermes/VM/CellKind.h b/include/hermes/VM/CellKind.h
-index df50d7b056d5d76fb68a1517721b247366f7b518..5ded1bc8d641c41f7f6e07df73f0f98f7b67898b 100644
+index 189d60a7f678b4989a231d4e7439fbe2148f369d..7e8feaec916f2601ce1c617c2636b091623074ea 100644
 --- a/include/hermes/VM/CellKind.h
 +++ b/include/hermes/VM/CellKind.h
 @@ -8,6 +8,8 @@
@@ -2064,9 +2065,9 @@ index df50d7b056d5d76fb68a1517721b247366f7b518..5ded1bc8d641c41f7f6e07df73f0f98f
 +#include "hermes/VM/sh_mirror.h"
 +
  #include <cstddef>
+ #include <cstdint>
  #include <type_traits>
- 
-@@ -22,6 +24,10 @@ enum class CellKind {
+@@ -24,6 +26,10 @@ enum class CellKind : uint8_t {
  #include "hermes/VM/CellKinds.def"
  };
  
@@ -2078,10 +2079,10 @@ index df50d7b056d5d76fb68a1517721b247366f7b518..5ded1bc8d641c41f7f6e07df73f0f98f
  // [CallableUnknownMakesThis, CallableMakesThis, CallableExpectsThis]
  static_assert(
 diff --git a/include/hermes/VM/CellKinds.def b/include/hermes/VM/CellKinds.def
-index 0bcd0a0a8fa3d533c87adf56e80e53f80506408d..6d76ea45bbb84193396812c5714fea1c5436a9f7 100644
+index 3eeda2b31d6dc055897da20969516ff6daf9c89c..c660b9160e79b3584dea3fa6094821e2e6eb0010 100644
 --- a/include/hermes/VM/CellKinds.def
 +++ b/include/hermes/VM/CellKinds.def
-@@ -86,6 +86,7 @@ CELL_CLASS(JSRegExp, "RegExp")
+@@ -94,6 +94,7 @@ CELL_CLASS(JSRegExp, "RegExp")
  CELL_CLASS(JSRegExpStringIterator, "RegExp String Iterator")
  CELL_CLASS(RequireContext, "RequireContext")
  CELL_CLASS(JSGeneratorObject, "GeneratorObject")
@@ -2090,7 +2091,7 @@ index 0bcd0a0a8fa3d533c87adf56e80e53f80506408d..6d76ea45bbb84193396812c5714fea1c
  CELL_CLASS(JSBigInt, "BigInt")
  CELL_CLASS(FastArray, "FastArray")
 diff --git a/include/hermes/VM/GCBase.h b/include/hermes/VM/GCBase.h
-index 02dac56140ad788da8989ea118b0d0c737d69d6e..2a5f49f01c8c15704793eb74548599cb7d8261f9 100644
+index 009aabe854d7f07841ffd267721a0a5048b8c55c..4fdc65a65d79c59e248b3726946c2f0e165954d8 100644
 --- a/include/hermes/VM/GCBase.h
 +++ b/include/hermes/VM/GCBase.h
 @@ -41,6 +41,7 @@
@@ -2101,7 +2102,7 @@ index 02dac56140ad788da8989ea118b0d0c737d69d6e..2a5f49f01c8c15704793eb74548599cb
  
  #include <cassert>
  #include <chrono>
-@@ -1079,6 +1080,16 @@ class GCBase {
+@@ -1113,6 +1114,16 @@ class GCBase {
    /// \pre \p target must hold an Object or non-registered Symbol.
    WeakRefSlot *allocWeakSlot(SmallHermesValue target);
  
@@ -2118,7 +2119,7 @@ index 02dac56140ad788da8989ea118b0d0c737d69d6e..2a5f49f01c8c15704793eb74548599cb
    /// Allocate a slot to use in WeakMap/WeakSet when inserting a new entry.
    /// \param key Pointer to the key object.
    /// \param value The mapped value by the key \p key.
-@@ -1334,16 +1345,28 @@ class GCBase {
+@@ -1368,16 +1379,28 @@ class GCBase {
    /// be allocated in the old gen, and references to them need not be
    /// marked during young-gen collection.
    void markRoots(RootAcceptorWithNames &acceptor, bool markLongLived) {
@@ -2149,7 +2150,7 @@ index 02dac56140ad788da8989ea118b0d0c737d69d6e..2a5f49f01c8c15704793eb74548599cb
  
      weakMapEntrySlots_.forEach(
          [&acceptor](WeakMapEntrySlot &slot) { slot.markWeakRoots(acceptor); });
-@@ -1459,6 +1482,8 @@ class GCBase {
+@@ -1493,6 +1516,8 @@ class GCBase {
    /// Whether or not a GC cycle is currently occurring.
    bool inGC_{false};
  
@@ -2159,7 +2160,7 @@ index 02dac56140ad788da8989ea118b0d0c737d69d6e..2a5f49f01c8c15704793eb74548599cb
    /// dumps, particularly when HERMESVM_EXCEPTION_ON_OOM is set.
    bool hasOOMed_{false};
 diff --git a/include/hermes/VM/GCCell.h b/include/hermes/VM/GCCell.h
-index e0113c612137bb4eacb3fa4a11b7184be6eabce8..0dfc40acbd3fe168bcc8a75b71f5ec25f49a83b8 100644
+index 9af01f2f8924a6a6015f05f59984a8beba539461..2ddecf6cd3518e4fa43998f6055d3c7d5899b2c9 100644
 --- a/include/hermes/VM/GCCell.h
 +++ b/include/hermes/VM/GCCell.h
 @@ -47,6 +47,7 @@ class KindAndSize {
@@ -2168,10 +2169,10 @@ index e0113c612137bb4eacb3fa4a11b7184be6eabce8..0dfc40acbd3fe168bcc8a75b71f5ec25
        std::min<size_t>(kNumBits - kNumKindBits, 32);
 +  static_assert(kNumSizeBits == SH_CELL_KIND_SHIFT);
    static_assert(
-       kNumCellKinds < 256,
-       "More cell kinds than available kind bits.");
+       sizeof(CellKind) * 8 <= kNumKindBits,
+       "CellKind size wider than available kind bits.");
 diff --git a/include/hermes/VM/HadesGC.h b/include/hermes/VM/HadesGC.h
-index bd03c3a93922221f0bb68f9a9277c797ff10340c..36ab64bf901dd4656ff1df97bcee9f337dd997fe 100644
+index 983ec94b696265c32fccc5449a384e56b0f277f7..d4bfe1aa28a4a1a2d19509121ad7ffa378bc4e72 100644
 --- a/include/hermes/VM/HadesGC.h
 +++ b/include/hermes/VM/HadesGC.h
 @@ -17,6 +17,7 @@
@@ -2220,9 +2221,9 @@ index bd03c3a93922221f0bb68f9a9277c797ff10340c..36ab64bf901dd4656ff1df97bcee9f33
    static bool classof(const GCBase *gc) {
      return gc->getKind() == HeapKind::HadesGC;
    }
-@@ -225,6 +257,25 @@ class HadesGC final : public GCBase {
-   /// (Part of general GC API defined in GCBase.h).
-   void collect(std::string cause, bool canEffectiveOOM = false) override;
+@@ -233,6 +265,25 @@ class HadesGC final : public GCBase {
+     return ygCumulativeStats_.numCollections;
+   }
  
 +  enum class YoungReclaimStatus : uint32_t { Deferred = 0, Reclaimed = 1 };
 +  struct YoungReclaimResult {
@@ -2246,7 +2247,7 @@ index bd03c3a93922221f0bb68f9a9277c797ff10340c..36ab64bf901dd4656ff1df97bcee9f33
    /// Run the finalizers for all heap objects.
    void finalizeAll() override;
  
-@@ -708,6 +759,12 @@ class HadesGC final : public GCBase {
+@@ -716,6 +767,12 @@ class HadesGC final : public GCBase {
     public:
      explicit OldGen(HadesGC &gc);
  
@@ -2259,7 +2260,7 @@ index bd03c3a93922221f0bb68f9a9277c797ff10340c..36ab64bf901dd4656ff1df97bcee9f33
      size_t numSegments() const;
  
      /// \return The deque of AlignedHeapSegments in the OG.
-@@ -1132,6 +1189,20 @@ class HadesGC final : public GCBase {
+@@ -1140,6 +1197,20 @@ class HadesGC final : public GCBase {
    /// Protected by gcMutex_.
    OldGen oldGen_;
  
@@ -2280,7 +2281,7 @@ index bd03c3a93922221f0bb68f9a9277c797ff10340c..36ab64bf901dd4656ff1df97bcee9f33
  #ifndef NDEBUG
    /// Map an address aligned to AlignedHeapSegment::kSegmentUnitSize to the
    /// start and end address of its owning segment.
-@@ -1341,7 +1412,14 @@ class HadesGC final : public GCBase {
+@@ -1349,7 +1420,14 @@ class HadesGC final : public GCBase {
    ///   if one is not already active.
    /// \post The YG is completely empty, and all bytes are available for new
    ///   allocations.
@@ -2512,7 +2513,7 @@ index 7754568efba7fdb57204e5a53bfb4bda47d7f9cb..bcd52ed05416726c41e99b474d3b95aa
  /// Stored in a list in RuntimeModule to save memory in WritePropertyCacheEntry.
  /// In order to hit this cache entry:
 diff --git a/include/hermes/VM/Runtime.h b/include/hermes/VM/Runtime.h
-index 78d41a183d213e38ed508e847853ac2633ff51a0..167e4341a09fd3f4995b92c4d1a0b6cca0a7407c 100644
+index 9e084138eb08a21fffab8d1999e0f7d2c37c94c3..19130d3fb76496bd3241f2cf0276f39603bc1601 100644
 --- a/include/hermes/VM/Runtime.h
 +++ b/include/hermes/VM/Runtime.h
 @@ -93,6 +93,7 @@ struct RuntimeOffsets;
@@ -10552,7 +10553,7 @@ index 0000000000000000000000000000000000000000..073962c08c215f9983534c4f19959d9e
 +
 +} // namespace hermes
 diff --git a/lib/Optimizer/Scalar/ObjectStackPromotion.cpp b/lib/Optimizer/Scalar/ObjectStackPromotion.cpp
-index 76c78d7f99cc498a248e8914caa0b9aa20db8bb5..5b6d872c7c6a38db02bc10db20adba820ba4f063 100644
+index b29374f17cd535a948c52b1dc5523c51cc9e02ca..841ca441d1e865485894980385dd291311df8d9b 100644
 --- a/lib/Optimizer/Scalar/ObjectStackPromotion.cpp
 +++ b/lib/Optimizer/Scalar/ObjectStackPromotion.cpp
 @@ -7,16 +7,116 @@
@@ -10672,7 +10673,7 @@ index 76c78d7f99cc498a248e8914caa0b9aa20db8bb5..5b6d872c7c6a38db02bc10db20adba82
  /// Try to promote the given object to a series of AllocStackInsts if it does
  /// not escape its enclosing function. If successful, \p alloc and all of its
  /// users are eliminated and replaced with stack operations. For now, this only
-@@ -239,7 +339,7 @@ bool tryPromoteObject(
+@@ -251,7 +351,7 @@ bool tryPromoteObject(
  }
  
  bool runObjectStackPromotion(Function *F) {
@@ -12600,7 +12601,7 @@ index e3ddb67023cc08ee8492cb3088e500063d8782d5..27f17c7ba86723dfc47cec29a991bb59
    JSObjectBuildMeta(cell, mb);
    const auto *self = static_cast<const ArrayImpl *>(cell);
 diff --git a/lib/VM/JSArrayBuffer.cpp b/lib/VM/JSArrayBuffer.cpp
-index 7378a35aa0f5e5d6abae21fef53c2c879759ac93..398305edc31f551d590d69fc48e926a085d035a2 100644
+index da9898c7e26cb986550b8312677b765f1d93e7a1..fe0198df851b27662fa234ed693dfac0fe119649 100644
 --- a/lib/VM/JSArrayBuffer.cpp
 +++ b/lib/VM/JSArrayBuffer.cpp
 @@ -128,7 +128,13 @@ JSArrayBuffer::JSArrayBuffer(
@@ -12669,7 +12670,7 @@ index 5dc1c740e90c32fa5f8a6a0c5dac56d234722487..afc4e7546c2611927e0fa55a9ad3402a
        runtime,
        arrayPrototype,
 diff --git a/lib/VM/JSLib/HermesBuiltin.cpp b/lib/VM/JSLib/HermesBuiltin.cpp
-index 7ac85f1c6f3df1c5816bfb39990caab5afad2771..f5a81ae5436f4f9891393ff77f485929a34326ad 100644
+index 086efd6794bf85f6800547c921c26c64e1701583..29381c57e684a85a84286233557ad0aa30ac37e1 100644
 --- a/lib/VM/JSLib/HermesBuiltin.cpp
 +++ b/lib/VM/JSLib/HermesBuiltin.cpp
 @@ -227,6 +227,97 @@ CallResult<HermesValue> hermesBuiltinThrowReferenceError(
@@ -12780,7 +12781,7 @@ index 7ac85f1c6f3df1c5816bfb39990caab5afad2771..f5a81ae5436f4f9891393ff77f485929
    // We cannot use the fast path if the object is a proxy, host object, or when
    // there could potentially be an accessor defined on the object. This is
    // because in order to use JSObject::forEachOwnPropertyWhile, we must not
-@@ -1142,6 +1236,17 @@ CallResult<HermesValue> hermesBuiltinFastArraySlice(void *, Runtime &runtime) {
+@@ -1146,6 +1240,17 @@ CallResult<HermesValue> hermesBuiltinFastArraySlice(void *, Runtime &runtime) {
    return lv.result.getHermesValue();
  }
  
@@ -12798,7 +12799,7 @@ index 7ac85f1c6f3df1c5816bfb39990caab5afad2771..f5a81ae5436f4f9891393ff77f485929
  void createHermesBuiltins(Runtime &runtime) {
    struct : public Locals {
      PinnedValue<NativeFunction> method;
-@@ -1257,6 +1362,12 @@ void createHermesBuiltins(Runtime &runtime) {
+@@ -1261,6 +1366,12 @@ void createHermesBuiltins(Runtime &runtime) {
        hermesBuiltinFastArraySlice,
        2);
  
@@ -13934,7 +13935,7 @@ index 0000000000000000000000000000000000000000..305088297a6610b0b39f464109329e26
 +} // namespace vm
 +} // namespace hermes
 diff --git a/lib/VM/JSLib/String.cpp b/lib/VM/JSLib/String.cpp
-index f355962871aefc82e2ff4352e170453ea1153699..f612a30ec5d1ba8a345a530621daa4f39960ea1a 100644
+index b0ae4eab2f389d186d3ece83814b2e34cff55abb..a503e925db70c7ffe8f9b872b9342e39361f4ea3 100644
 --- a/lib/VM/JSLib/String.cpp
 +++ b/lib/VM/JSLib/String.cpp
 @@ -937,14 +937,10 @@ static CallResult<HermesValue> convertCase(
@@ -13948,14 +13949,25 @@ index f355962871aefc82e2ff4352e170453ea1153699..f612a30ec5d1ba8a345a530621daa4f3
 -  S->appendUTF16String(buff);
 -  UTF16Ref str = buff.arrayRef();
 -
-   if (!useCurrentLocale) {
+   {
 +    // Keep the source rooted across output allocation, without first copying
 +    // unchanged ASCII strings into a temporary UTF-16 buffer.
 +    auto str = StringPrimitive::createStringView(runtime, S);
      // Try a fast path for ASCII strings.
      // First, bitwise-or all the characters to see if any one isn't ASCII.
      char16_t mask = 0;
-@@ -969,7 +965,7 @@ static CallResult<HermesValue> convertCase(
+@@ -964,8 +960,8 @@ static CallResult<HermesValue> convertCase(
+       }
+     }
+     // localeAffectsCasing() is only consulted once the scan says the fast
+-    // path is otherwise available: the ICU and Java backends query the host
+-    // locale on every call (a JNI round trip on Java), and a non-ASCII
++    // path is otherwise available: the CoreFoundation and Java backends check
++    // the locale on every call (a JNI round trip on Java), and a non-ASCII
+     // string can never take this path, so asking first would charge every
+     // locale-sensitive conversion for an answer it cannot use.
+     if (mask <= 127 &&
+@@ -975,7 +971,7 @@ static CallResult<HermesValue> convertCase(
          return S.getHermesValue();
        }
  
@@ -13964,7 +13976,7 @@ index f355962871aefc82e2ff4352e170453ea1153699..f612a30ec5d1ba8a345a530621daa4f3
          // Use the Runtime stored representations of single-character strings.
          char16_t c = str[0];
          if (upperCase) {
-@@ -1007,6 +1003,9 @@ static CallResult<HermesValue> convertCase(
+@@ -1013,6 +1009,9 @@ static CallResult<HermesValue> convertCase(
        return HermesValue::encodeStringValue(*builder->getStringPrimitive());
      }
    }
@@ -15270,7 +15282,7 @@ index 5bf0eb3faa636d974da9c14bd49a1f7d15044b87..67986bb7ed1a8c5160844db2f825ba0a
  
    // Special case for 1-character strings, some of which are cached in the
 diff --git a/lib/VM/gcs/HadesGC.cpp b/lib/VM/gcs/HadesGC.cpp
-index 8c8ceecd275fb00826e6031c9d47b02f65caa362..572c6e4c6228ced02d518b42be494a2ef9d9c664 100644
+index 6ee38260da3aca49ca252e67a892b55cb5e4cfc1..f641f10f81f11a0b0f6bb08384c14ccc53c8a906 100644
 --- a/lib/VM/gcs/HadesGC.cpp
 +++ b/lib/VM/gcs/HadesGC.cpp
 @@ -69,6 +69,125 @@ void FreelistBuildMeta(const GCCell *cell, Metadata::Builder &mb) {
@@ -15507,8 +15519,8 @@ index 8c8ceecd275fb00826e6031c9d47b02f65caa362..572c6e4c6228ced02d518b42be494a2e
    // Scan all objects for their malloc size. This operation is what makes
    // getHeapInfoWithMallocSize O(heap size).
    forAllObjs([&info](GCCell *cell) {
-@@ -1481,6 +1632,43 @@ void HadesGC::collect(std::string cause, bool /*canEffectiveOOM*/) {
-   youngGenCollection(std::move(cause), /*forceOldGenCollection*/ false);
+@@ -1504,6 +1655,43 @@ void HadesGC::collectWithOptions(
+       /*forceOldGenCollection*/ options.type == GCType::Major);
  }
  
 +HadesGC::YoungReclaimResult HadesGC::emptyYoungPayload() {
@@ -15551,7 +15563,7 @@ index 8c8ceecd275fb00826e6031c9d47b02f65caa362..572c6e4c6228ced02d518b42be494a2e
  void HadesGC::waitForCollectionToFinish(std::string cause) {
    assert(
        gcMutex_ &&
-@@ -1731,7 +1919,7 @@ void HadesGC::prepareCompactee(bool forceCompaction) {
+@@ -1754,7 +1942,7 @@ void HadesGC::prepareCompactee(bool forceCompaction) {
    uint64_t threshold = oldGen_.targetSizeBytes() + buffer;
    uint64_t totalBytes = oldGen_.size() + oldGen_.externalBytes();
    if ((forceCompaction || totalBytes > threshold) &&
@@ -15560,7 +15572,7 @@ index 8c8ceecd275fb00826e6031c9d47b02f65caa362..572c6e4c6228ced02d518b42be494a2e
      compactee_.segment =
          std::make_shared<FixedSizeHeapSegment>(oldGen_.popSegment());
      addSegmentExtentToCrashManager(
-@@ -1930,7 +2118,7 @@ void HadesGC::OldGen::freeUnusedJumboSegments() {
+@@ -1953,7 +2141,7 @@ void HadesGC::OldGen::freeUnusedJumboSegments() {
        continue;
      }
      // Cell must be dead now.
@@ -15569,7 +15581,7 @@ index 8c8ceecd275fb00826e6031c9d47b02f65caa362..572c6e4c6228ced02d518b42be494a2e
      auto sz = cell->getAllocatedSizeSlow();
      // Run its finalizer first if it has one.
      cell->getVT()->finalizeIfExists(cell, gc_);
-@@ -1954,6 +2142,14 @@ void HadesGC::OldGen::freeUnusedJumboSegments() {
+@@ -1977,6 +2165,14 @@ void HadesGC::OldGen::freeUnusedJumboSegments() {
      }
  #endif
  
@@ -15584,7 +15596,7 @@ index 8c8ceecd275fb00826e6031c9d47b02f65caa362..572c6e4c6228ced02d518b42be494a2e
      // Remove the entire segment.
      const size_t segIdx =
          AlignedHeapSegment::getSegmentIndexFromStart(it->lowLim());
-@@ -2026,6 +2222,8 @@ void HadesGC::creditExternalMemory(GCCell *cell, uint32_t sz) {
+@@ -2049,6 +2245,8 @@ void HadesGC::creditExternalMemory(GCCell *cell, uint32_t sz) {
    } else {
      std::lock_guard<Mutex> lk{gcMutex_};
      oldGen_.creditExternalMemory(sz);
@@ -15593,7 +15605,7 @@ index 8c8ceecd275fb00826e6031c9d47b02f65caa362..572c6e4c6228ced02d518b42be494a2e
      uint64_t totalBytes = oldGen_.allocatedBytes() + oldGen_.externalBytes();
      if (totalBytes > oldGen_.targetSizeBytes())
        youngGen_.setEffectiveEnd(youngGen_.level());
-@@ -2044,6 +2242,13 @@ void HadesGC::debitExternalMemory(GCCell *cell, uint32_t sz) {
+@@ -2067,6 +2265,13 @@ void HadesGC::debitExternalMemory(GCCell *cell, uint32_t sz) {
    } else {
      std::lock_guard<Mutex> lk{gcMutex_};
      oldGen_.debitExternalMemory(sz);
@@ -15607,7 +15619,7 @@ index 8c8ceecd275fb00826e6031c9d47b02f65caa362..572c6e4c6228ced02d518b42be494a2e
    }
  }
  
-@@ -2643,7 +2848,13 @@ uint64_t HadesGC::youngGenEvacuateImpl(bool doCompaction) {
+@@ -2666,7 +2871,13 @@ uint64_t HadesGC::youngGenEvacuateImpl(bool doCompaction) {
  
  void HadesGC::youngGenCollection(
      std::string cause,
@@ -15622,7 +15634,7 @@ index 8c8ceecd275fb00826e6031c9d47b02f65caa362..572c6e4c6228ced02d518b42be494a2e
    assert(gcMutex_ && "gcMutex_ must be held during YG collection");
    assert(
        gcMutex_.depth() == 1 &&
-@@ -2798,7 +3009,9 @@ void HadesGC::youngGenCollection(
+@@ -2821,7 +3032,9 @@ void HadesGC::youngGenCollection(
    // handles the rare case where an OG collection was completed during this YG
    // collection, and the compaction will therefore only be completed in the next
    // collection.
@@ -15633,7 +15645,7 @@ index 8c8ceecd275fb00826e6031c9d47b02f65caa362..572c6e4c6228ced02d518b42be494a2e
      // There is no OG collection running, check the tripwire in case this is the
      // first YG after an OG completed.
      checkTripwireAndSubmitStats();
-@@ -3311,6 +3524,8 @@ void HadesGC::OldGen::addSegment(FixedSizeHeapSegment seg) {
+@@ -3334,6 +3547,8 @@ void HadesGC::OldGen::addSegment(FixedSizeHeapSegment seg) {
  }
  
  FixedSizeHeapSegment HadesGC::OldGen::popSegment() {
@@ -15642,7 +15654,7 @@ index 8c8ceecd275fb00826e6031c9d47b02f65caa362..572c6e4c6228ced02d518b42be494a2e
    const auto &segBuckets = segmentBuckets_.back();
    for (size_t bucket = 0; bucket < kNumFreelistBuckets; ++bucket) {
      if (segBuckets[bucket].head) {
-@@ -3548,19 +3763,22 @@ void HadesGC::OldGen::verifyFreelists() {
+@@ -3571,19 +3786,22 @@ void HadesGC::OldGen::verifyFreelists() {
    llvh::DenseSet<const SegmentBucket *> occupiedSegBuckets;
  
    for (size_t seg = 0; seg < segments_.size(); seg++) {
@@ -15667,7 +15679,7 @@ index 8c8ceecd275fb00826e6031c9d47b02f65caa362..572c6e4c6228ced02d518b42be494a2e
        // Record that this segment has cells for this bucket.
        occupiedSegBuckets.insert(&segBuckets[bucket]);
        auto *cell = vmcast<FreelistCell>(
-@@ -3577,7 +3795,7 @@ void HadesGC::OldGen::verifyFreelists() {
+@@ -3600,7 +3818,7 @@ void HadesGC::OldGen::verifyFreelists() {
      auto *cell = (GCCell *)segments_[seg].start();
      auto *end = (GCCell *)segments_[seg].level();
      while (cell < end) {
@@ -22894,10 +22906,10 @@ index 5edd31c01642f026cf9abee4db1d35addf6b9717..59abde7effc365aebf48e18da6178f32
 +
  } // namespace
 diff --git a/unittests/API/APITest.cpp b/unittests/API/APITest.cpp
-index aae9e34229d4d5e4f039d2505f24a718e47687c0..794bcee070b3d123432163ff9691d98c24205b9f 100644
+index f0763f93663167ee0d795134fe03e48f652b9e6e..d891399ccfc030512cdf6dbb103001377e044063 100644
 --- a/unittests/API/APITest.cpp
 +++ b/unittests/API/APITest.cpp
-@@ -62,6 +62,46 @@ class HermesRuntimeCustomConfigTest : public ::testing::Test,
+@@ -66,6 +66,46 @@ class HermesRuntimeCustomConfigTest : public ::testing::Test,
        : HermesRuntimeTestBase(makeHermesRuntime(runtimeConfig)) {}
  };
  
@@ -22944,7 +22956,7 @@ index aae9e34229d4d5e4f039d2505f24a718e47687c0..794bcee070b3d123432163ff9691d98c
  TEST(HermesRuntimeConfigTest, FinalizerThreadRunner) {
    struct RunnerState {
      std::atomic<bool> active{false};
-@@ -1538,6 +1578,100 @@ TEST_P(HermesRuntimeTest, NativeExceptionDoesNotUseGlobalError) {
+@@ -1933,6 +1973,100 @@ TEST_P(HermesRuntimeTest, NativeExceptionDoesNotUseGlobalError) {
        test.call(*rt).getString(*rt).utf8(*rt));
  }
  
@@ -23045,7 +23057,7 @@ index aae9e34229d4d5e4f039d2505f24a718e47687c0..794bcee070b3d123432163ff9691d98c
  TEST_P(HermesRuntimeTest, UTF16ConversionTest) {
    String ascii = String::createFromUtf8(*rt, "z");
    EXPECT_EQ(ascii.utf16(*rt), u"z");
-@@ -3694,3 +3828,304 @@ INSTANTIATE_TEST_CASE_P(
+@@ -4313,3 +4447,304 @@ INSTANTIATE_TEST_CASE_P(
      HermesRuntimeTest,
      ::testing::ValuesIn(runtimeGenerators()));
  } // namespace
@@ -23941,19 +23953,39 @@ index f911c7a4e08173d622798594d2c93da3cd3db5de..b64a5d423649619764b773d839965d7c
  // This might look like a silly test, but it should be useful if we
  // need to add tricky optimizations to isUnicodeOnlySpace
  TEST(UnicodeTest, isUnicodeOnlySpace) {
+diff --git a/unittests/PlatformUnicode/PlatformUnicodeTest.cpp b/unittests/PlatformUnicode/PlatformUnicodeTest.cpp
+index 6c7edd8b5384e852d302b54ff7b63382337bbbd6..bbf8edd0c63967dfb42701fae8674b2b37c459d6 100644
+--- a/unittests/PlatformUnicode/PlatformUnicodeTest.cpp
++++ b/unittests/PlatformUnicode/PlatformUnicodeTest.cpp
+@@ -13,8 +13,6 @@ namespace {
+ 
+ using namespace hermes::platform_unicode;
+ 
+-// convertToCase is not implemented in PlatformUnicodeLite.
+-#if HERMES_PLATFORM_UNICODE != HERMES_PLATFORM_UNICODE_LITE
+ TEST(PlatformUnicode, CaseTest) {
+   llvh::SmallVector<char16_t, 16> str = {u'a', u'B', u'c', u'\u00df'};
+   convertToCase(str, CaseConversion::ToUpper, false /* useCurrentLocale */);
+@@ -48,6 +46,5 @@ TEST(PlatformUnicode, Normalize) {
+   EXPECT_EQ(u'\u0323', str[1]);
+   EXPECT_EQ(u'\u0307', str[2]);
+ }
+-#endif
+ 
+ } // namespace
 diff --git a/unittests/VMRuntime/GCBasicsTest.cpp b/unittests/VMRuntime/GCBasicsTest.cpp
-index c70e45986a0a5a76eba9ce52ec64f67bc0632b64..66df8a09511b3dcb8a18aa18ab52c9abda8c26c1 100644
+index 4d758161eb69f8caa23bb38295b1e0b3ea0b04ac..2adad80daed31588dceb48523aa1bc5482af1b4a 100644
 --- a/unittests/VMRuntime/GCBasicsTest.cpp
 +++ b/unittests/VMRuntime/GCBasicsTest.cpp
-@@ -15,6 +15,7 @@
- #include "hermes/VM/WeakRef.h"
+@@ -16,6 +16,7 @@
  #include "hermes/VM/WeakRoot-inline.h"
  
+ #include <chrono>
 +#include <cstring>
  #include <functional>
  #include <new>
- #include <vector>
-@@ -397,6 +398,173 @@ TEST(GCCallbackTest, TestCallbackInvoked) {
+ #include <thread>
+@@ -399,6 +400,173 @@ TEST(GCCallbackTest, TestCallbackInvoked) {
    }
  }
  
