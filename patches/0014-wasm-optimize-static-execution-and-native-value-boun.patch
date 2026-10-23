@@ -185,13 +185,23 @@ indexed tests, empty replacements, unchanged-root-lowercase replacement and
 replacement equality. Preserve evaluation order, UTF-16 indexing, coercion,
 GC rooting and the original IR on a declined fast path. Bound generated matcher
 and descriptor storage, and retain interpreter parity and split-C linkage.
+
+Expand non-Unicode case-insensitive literal matchers to UTF-16 canonical
+equivalents using the interpreter's tables. Support bounded capture-free
+forward alternatives with ordered suffix retries, validated branch targets,
+and a bounded pending-choice stack. Preserve existing operation, bytecode,
+source-size and work budgets; unsupported shapes retain the interpreter.
+
+Validate folded literals, empty and nested alternatives, common-suffix
+backtracking, repetition, captures declined by branching matchers, and
+native/interpreter parity without changing the runtime ABI.
 ---
  API/hermes/SynthTrace.cpp                     |    1 +
  API/hermes/SynthTraceParser.cpp               |    4 +
  API/hermes/hermes.cpp                         |  526 +++++-
  API/hermes/hermes.h                           |   93 ++
  doc/HighLevelOptimizations.md                 |  282 ++++
- doc/RegExp.md                                 |  139 +-
+ doc/RegExp.md                                 |  148 +-
  include/hermes/ADT/ManagedChunkedList.h       |   66 +-
  include/hermes/AST/Context.h                  |   42 +
  include/hermes/BCGen/HBC/BytecodeVersion.h    |    2 +-
@@ -276,7 +286,7 @@ and descriptor storage, and retain interpreter parity and split-C linkage.
  .../Unicode/UnicodeCaseConversion.cpp         |   12 +
  lib/Regex/CMakeLists.txt                      |    1 +
  lib/Regex/Executor.cpp                        |  273 +++-
- lib/Regex/RegexAOT.cpp                        |  493 ++++++
+ lib/Regex/RegexAOT.cpp                        |  587 +++++++
  lib/Regex/RegexSerialization.cpp              |  116 ++
  lib/Sema/FlowChecker-expr.cpp                 |    2 +-
  lib/VM/CMakeLists.txt                         |    2 +
@@ -355,7 +365,7 @@ and descriptor storage, and retain interpreter parity and split-C linkage.
  .../record-argument-static-prototype.js       |   91 ++
  test/shermes/record-return-load-forwarding.js |   99 ++
  test/shermes/regexp-aot-bundle.js             |   18 +
- test/shermes/regexp-aot.js                    |   95 ++
+ test/shermes/regexp-aot.js                    |  152 ++
  test/shermes/regexp-fusion.js                 |  166 ++
  test/shermes/regexp-specialized.js            |  152 ++
  test/shermes/regexp-string-operations.js      |  131 ++
@@ -378,11 +388,11 @@ and descriptor storage, and retain interpreter parity and split-C linkage.
  .../Scalar/RecordUseAnalysisTest.cpp          |  487 ++++++
  .../PlatformUnicode/CharacterPropertyTest.cpp |   26 +
  .../PlatformUnicode/PlatformUnicodeTest.cpp   |    3 -
- unittests/Support/RegexTest.cpp               |  300 ++++
+ unittests/Support/RegexTest.cpp               |  351 ++++
  unittests/VMRuntime/GCBasicsTest.cpp          |  168 ++
  unittests/VMRuntime/StaticHUnitTest.cpp       |  122 ++
  unittests/VMRuntime/StringPrimitiveTest.cpp   |  189 +++
- 196 files changed, 22818 insertions(+), 564 deletions(-)
+ 196 files changed, 23029 insertions(+), 564 deletions(-)
  create mode 100644 include/hermes/Optimizer/Scalar/RecordUseAnalysis.h
  create mode 100644 include/hermes/Regex/RegexAOT.h
  create mode 100644 include/hermes/Support/MathFunctions.h
@@ -1537,7 +1547,7 @@ index 3b7089efa3dcae91c5d30c2a97ed44f414baa52f..f34ed825751ce9b7089c599aaf1c5dac
  
  An example of some sample code found in input to Hermes to clone a Map and add an element:
 diff --git a/doc/RegExp.md b/doc/RegExp.md
-index dae8d503b89751e6d43c4b30c52a26be5cc2b466..8117dfac75e1e469969389988247202bb0060f03 100644
+index dae8d503b89751e6d43c4b30c52a26be5cc2b466..9203ca460599ffaebd33ac006f793408e14c4826 100644
 --- a/doc/RegExp.md
 +++ b/doc/RegExp.md
 @@ -5,7 +5,7 @@ title: RegExp
@@ -1549,7 +1559,7 @@ index dae8d503b89751e6d43c4b30c52a26be5cc2b466..8117dfac75e1e469969389988247202b
  
  The regexp engine proceeds as follows:
  
-@@ -14,6 +14,142 @@ The regexp engine proceeds as follows:
+@@ -14,6 +14,151 @@ The regexp engine proceeds as follows:
  1. *Emitting phase.* The node tree is traversed and emits regexp bytecode.
  1. *Execution phase.* The bytecode is executed against an input string.
  
@@ -1560,24 +1570,31 @@ index dae8d503b89751e6d43c4b30c52a26be5cc2b466..8117dfac75e1e469969389988247202b
 +code. Eligible concatenations contain literals, classes, dots, captures, word
 +boundaries, ordinary or multiline anchors, and greedy or lazy width-one
 +repetition, including counted repetition. Captures may surround a repetition but
-+cannot occur inside its body. Empty matches are supported. Global, sticky and
-+indices flags retain their ordinary builtin behavior.
++cannot occur inside its body. Patterns with alternatives must be capture-free
++throughout; their branches may contain the other terms and width-one repetitions.
++Empty branches and matches are supported.
++Global, sticky and indices flags retain their ordinary builtin behavior.
 +
 +The matcher emits direct character predicates and repetition loops, with direct
 +branches for backtracking. It scans candidate starts using the possible first
 +characters and, where available, a leading word boundary. Captures and loop
-+positions use bounded call-local storage. Fixed-width patterns with an ordinary
-+end anchor check only their final possible start, subject to sticky and start
-+anchors. Character classes derive from the interpreter's tables. Case-sensitive
-+matchers accept ASCII and UTF-16 input
-+without conversion, including lone surrogates. Non-Unicode case-insensitive
-+classes also accept UTF-16: their bytecode ranges already contain the case
-+equivalents. Folded literal instructions still specialize ASCII input and
-+decline UTF-16 input. Local modifiers are
-+interpreted through the actual bytecode instructions.
++positions use bounded call-local storage. Alternatives preserve their original
++order, including retries when a common suffix fails. Forward branches target
++validated operation boundaries; they cannot enter a literal payload or a
++repetition body. A bounded stack holds one pending choice per alternative or
++repetition site. Fixed-width concatenations with an ordinary end anchor check
++only their final possible start, subject to sticky and start
++anchors. Character classes derive from the interpreter's tables. Matchers accept
++ASCII and UTF-16 input without conversion, including lone surrogates.
++Non-Unicode case-insensitive literals and runs expand canonical equivalents
++using the same Hermes tables as the interpreter and character-class compiler.
++Case-insensitive class bytecode already contains those equivalents. In particular,
++non-Unicode folding does not equate long s or the Kelvin sign with ASCII letters.
++Local modifiers are interpreted through the actual bytecode instructions.
 +
-+Unicode mode, branching alternatives, lookarounds, backreferences, repeated captures and
-+other unsupported instructions retain the interpreter. This is not a DFA or a
++Unicode mode, patterns combining alternatives and captures, repeated alternatives,
++lookarounds, backreferences, repeated captures and other unsupported instructions
++retain the interpreter. This is not a DFA or a
 +linear-time matching guarantee. A generated search has a work budget of 262,144
 +candidate attempts, repetition and backtracking steps; exhaustion restarts the complete
 +original bytecode search without publishing partial captures. The interpreter
@@ -1589,12 +1606,14 @@ index dae8d503b89751e6d43c4b30c52a26be5cc2b466..8117dfac75e1e469969389988247202b
 +direct linear scan without a speculative work cap or duplicate predicate check.
 +
 +Generation examines at most 2 KiB of bytecode per pattern and accepts at most 64
-+operations, 64 explicit class ranges, eight captures and eight repetition sites.
++operations, 64 explicit class ranges, eight captures, eight repetition sites and
++eight alternative sites. Branching matchers have at most sixteen pending choices;
++their scratch storage is independent of the subject length.
 +Generated C is limited to 24 KiB per pattern and 512 KiB per logical module, with
 +at most 256 distinct patterns analyzed for compiled matchers. Identical compiled
 +patterns share one function across literal sites and bundle shards. These are
 +source-generation limits, not promises about final machine-code size. Repetition
-+is never unrolled.
++is never unrolled, and alternatives are not expanded into separate full paths.
 +
 +If compiled-function generation declines, Static Hermes may derive the existing
 +fixed-width descriptor for one shared matcher. That tier supports non-Unicode,
@@ -1692,7 +1711,7 @@ index dae8d503b89751e6d43c4b30c52a26be5cc2b466..8117dfac75e1e469969389988247202b
  ## Supported Syntax
  
  As of this writing, Hermes regexp supports
-@@ -22,3 +158,4 @@ As of this writing, Hermes regexp supports
+@@ -22,3 +167,4 @@ As of this writing, Hermes regexp supports
  1. ES9 lookbehinds.
  1. Named capture groups.
  1. Unicode property escapes.
@@ -13974,10 +13993,10 @@ index 46f8fa5b6e30e232e583a1acf96f3918da8b2c2c..5f40e6202fcebced341b6715f0d862ba
  } // namespace regex
 diff --git a/lib/Regex/RegexAOT.cpp b/lib/Regex/RegexAOT.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..80767646c9918086b5e26279591b67b871bf271a
+index 0000000000000000000000000000000000000000..f83d1b61c02d092e446fe0e7dd9db5d4ed065514
 --- /dev/null
 +++ b/lib/Regex/RegexAOT.cpp
-@@ -0,0 +1,493 @@
+@@ -0,0 +1,587 @@
 +/*
 + * Copyright (c) Meta Platforms, Inc. and affiliates.
 + *
@@ -13986,11 +14005,13 @@ index 0000000000000000000000000000000000000000..80767646c9918086b5e26279591b67b8
 + */
 +
 +#include "hermes/Regex/RegexAOT.h"
++#include "hermes/Platform/Unicode/CodePointSet.h"
 +#include "hermes/Regex/RegexSerialization.h"
 +#include "hermes/Regex/RegexTraits.h"
 +#include "llvh/ADT/Twine.h"
 +#include "llvh/Support/raw_ostream.h"
 +
++#include <algorithm>
 +#include <array>
 +
 +using namespace hermes;
@@ -14003,6 +14024,7 @@ index 0000000000000000000000000000000000000000..80767646c9918086b5e26279591b67b8
 +constexpr size_t kMaxOperations = 64;
 +constexpr size_t kMaxRanges = 64;
 +constexpr size_t kMaxLoops = 8;
++constexpr size_t kMaxAlternations = 8;
 +constexpr size_t kMaxSource = 24 * 1024;
 +
 +struct AOTOperation {
@@ -14011,6 +14033,8 @@ index 0000000000000000000000000000000000000000..80767646c9918086b5e26279591b67b8
 +  uint32_t min = 1;
 +  uint32_t max = 1;
 +  uint32_t capture = 0;
++  // Bytecode offset during decoding, operation index after target validation.
++  uint32_t target = 0;
 +  bool greedy = true;
 +  bool invert = false;
 +};
@@ -14069,14 +14093,13 @@ index 0000000000000000000000000000000000000000..80767646c9918086b5e26279591b67b8
 +}
 +
 +// Decode precisely one width-one instruction. Case-insensitive literals use
-+// compile-time ASCII folding; the containing matcher declines UTF-16 input.
++// the same compile-time case-equivalence expansion as character classes.
 +// BracketICase ranges have already been expanded by the regexp compiler.
 +bool readTerm(
 +    const Insn *base,
 +    std::string &predicate,
 +    size_t &width,
-+    size_t &rangeCount,
-+    bool &asciiOnly) {
++    size_t &rangeCount) {
 +  uint32_t literal = 0;
 +  bool icase = false;
 +  switch (base->opcode) {
@@ -14115,8 +14138,8 @@ index 0000000000000000000000000000000000000000..80767646c9918086b5e26279591b67b8
 +      if (rangeCount > kMaxRanges)
 +        return false;
 +      // Non-Unicode bracket ranges already contain their case equivalents.
-+      // Unlike folded literals, they need no runtime canonicalization, even
-+      // for UTF-16 subjects. Unicode-mode classes are rejected by the analyzer.
++      // They need no runtime canonicalization, even for UTF-16 subjects.
++      // Unicode-mode classes are rejected by the analyzer.
 +      width = term->totalWidth();
 +      predicate = "(0";
 +      for (auto type : {CharacterClass::Digits,
@@ -14140,11 +14163,12 @@ index 0000000000000000000000000000000000000000..80767646c9918086b5e26279591b67b8
 +  }
 +  predicate = rangePredicate(literal, literal);
 +  if (icase) {
-+    asciiOnly = true;
++    CodePointSet singleton;
++    singleton.add(literal);
++    const auto equivalents = makeCanonicallyEquivalent(singleton, false);
 +    predicate = "(0";
-+    for (uint32_t c = 0; c < 128; ++c)
-+      if (ASCIIRegexTraits::canonicalize(c, false) == literal)
-+        predicate += " || " + rangePredicate(c, c);
++    for (const auto &range : equivalents.ranges())
++      predicate += " || " + rangePredicate(range.first, range.end() - 1);
 +    predicate += ')';
 +  }
 +  return true;
@@ -14177,26 +14201,48 @@ index 0000000000000000000000000000000000000000..80767646c9918086b5e26279591b67b8
 +    return (stem + suffix + "_" + std::to_string(i)).str();
 +  };
 +  const std::string next = ("next" + suffix).str();
++  const std::string backtrack = ("backtrack" + suffix).str();
 +  std::string firstSet = "(0";
-+  bool nullable = true;
++  std::array<bool, kMaxOperations + 1> firstReachable{};
++  firstReachable[0] = true;
++  std::array<uint64_t, kMaxOperations + 1> minWidths{};
++  // Forward targets allow bounded passes over the graph. Candidate pruning
++  // must include every branch, including empty paths to a shared suffix.
++  for (size_t i = ops.size(); i-- > 0;) {
++    const auto &op = ops[i];
++    if (op.opcode == Opcode::Jump32)
++      minWidths[i] = minWidths[op.target];
++    else if (op.opcode == Opcode::Alternation)
++      minWidths[i] = std::min(minWidths[i + 1], minWidths[op.target]);
++    else
++      minWidths[i] = minWidths[i + 1] + (op.predicate.empty() ? 0 : op.min);
++  }
 +  const AOTOperation *leadingBoundary = nullptr;
 +  bool sawTerm = false;
 +  bool fixedWidth = true;
 +  bool endAnchored = false;
-+  size_t loops = 0;
-+  uint64_t minWidth = 0;
-+  for (const auto &op : ops) {
++  size_t loops = 0, alternatives = 0;
++  const uint64_t minWidth = minWidths[0];
++  for (size_t i = 0; i < ops.size(); ++i) {
++    const auto &op = ops[i];
 +    if (!op.predicate.empty()) {
-+      if (nullable) {
++      if (firstReachable[i])
 +        firstSet += " || (" + op.predicate + ')';
-+        nullable = op.min == 0;
-+      }
 +      sawTerm = true;
-+      minWidth += op.min;
 +      fixedWidth &= op.min == op.max;
 +    } else if (!sawTerm && op.opcode == Opcode::WordBoundary) {
 +      leadingBoundary = &op;
 +    }
++    if (op.opcode == Opcode::Alternation || op.opcode == Opcode::Jump32) {
++      firstReachable[op.target] |= firstReachable[i];
++      // No assertion after a split is necessarily common to every path.
++      sawTerm = true;
++      fixedWidth = false;
++      alternatives += op.opcode == Opcode::Alternation;
++    }
++    if (op.opcode != Opcode::Jump32 &&
++        (op.predicate.empty() || op.min == 0))
++      firstReachable[i + 1] |= firstReachable[i];
 +    if (op.opcode == Opcode::Width1Loop)
 +      ++loops;
 +    if (op.opcode == Opcode::RightAnchor)
@@ -14206,6 +14252,13 @@ index 0000000000000000000000000000000000000000..80767646c9918086b5e26279591b67b8
 +  os << "    uint32_t p, candidate = start, c;\n";
 +  for (size_t i = 0; i < loops; ++i)
 +    os << "    uint32_t lo" << i << ", hi" << i << ", pos" << i << ";\n";
++  if (alternatives) {
++    // Forward-only branches visit each site at most once on any active path.
++    // A loop has one resumable choice, regardless of its repetition count.
++    os << "    uint32_t choices[" << loops + alternatives << "], depth;\n";
++    for (size_t i = 0; i < alternatives; ++i)
++      os << "    uint32_t alternative" << i << ";\n";
++  }
 +  if (minWidth > UINT32_MAX) {
 +    os << "    return HermesRegexAOTNoMatch;\n";
 +    return;
@@ -14226,7 +14279,7 @@ index 0000000000000000000000000000000000000000..80767646c9918086b5e26279591b67b8
 +     << "u) return HermesRegexAOTNoMatch;\n";
 +  // Reject impossible starts before initializing captures or repetition state.
 +  // Leading word-boundary checks also skip the interiors of word runs.
-+  if (!nullable) {
++  if (!firstReachable[ops.size()]) {
 +    os << "      c = s[candidate];\n"
 +       << "      if (!(" << firstSet << ")) goto " << next << ";\n";
 +  }
@@ -14241,9 +14294,16 @@ index 0000000000000000000000000000000000000000..80767646c9918086b5e26279591b67b8
 +  // otherwise a long irrelevant prefix makes the interpreter scan it again.
 +  os << "      if (!work--) return HermesRegexAOTFallback;\n"
 +        "      p = candidate;\n";
-+  std::string fail = next;
++  if (alternatives)
++    os << "      depth = 0;\n";
++  std::string fail = alternatives ? backtrack : next;
++  std::vector<std::string> choices;
 +  loops = 0;
-+  for (const auto &op : ops) {
++  size_t alternative = 0;
++  for (size_t index = 0; index < ops.size(); ++index) {
++    const auto &op = ops[index];
++    if (alternatives)
++      os << "    " << label("op", index) << ":\n";
 +    if (op.opcode == Opcode::Width1Loop) {
 +      const auto i = loops++;
 +      os << "      if (" << op.min << "u > length - p) goto " << fail << ";\n"
@@ -14265,9 +14325,14 @@ index 0000000000000000000000000000000000000000..80767646c9918086b5e26279591b67b8
 +         << "      if (pos" << i << " == " << (op.greedy ? "lo" : "hi")
 +         << i << ") goto " << fail << ";\n"
 +         << "      " << (op.greedy ? "--pos" : "++pos") << i << ";\n"
-+         << "    " << label("resume", i) << ":\n"
-+         << "      p = pos" << i << ";\n";
-+      fail = label("backtrack", i);
++         << "    " << label("resume", i) << ":\n";
++      if (alternatives) {
++        os << "      choices[depth++] = " << choices.size() << "u;\n";
++        choices.push_back(label("backtrack", i));
++      } else {
++        fail = label("backtrack", i);
++      }
++      os << "      p = pos" << i << ";\n";
 +      continue;
 +    }
 +    if (!op.predicate.empty()) {
@@ -14276,6 +14341,20 @@ index 0000000000000000000000000000000000000000..80767646c9918086b5e26279591b67b8
 +      continue;
 +    }
 +    switch (op.opcode) {
++      case Opcode::Alternation: {
++        const auto i = alternative++;
++        os << "      alternative" << i << " = p;\n"
++           << "      choices[depth++] = " << choices.size() << "u;\n"
++           << "      goto " << label("op", index + 1) << ";\n"
++           << "    " << label("alternative", i) << ":\n"
++           << "      p = alternative" << i << ";\n"
++           << "      goto " << label("op", op.target) << ";\n";
++        choices.push_back(label("alternative", i));
++        break;
++      }
++      case Opcode::Jump32:
++        os << "      goto " << label("op", op.target) << ";\n";
++        break;
 +      case Opcode::BeginMarkedSubexpression:
 +      case Opcode::EndMarkedSubexpression:
 +        os << "      ranges[" << (op.capture + 1) * 2 +
@@ -14306,12 +14385,22 @@ index 0000000000000000000000000000000000000000..80767646c9918086b5e26279591b67b8
 +        llvm_unreachable("Unsupported operation in compiled matcher");
 +    }
 +  }
-+  // Every capture in this straight-line program is visited on a successful
++  // Every capture in a straight-line program is visited on a successful
 +  // path. Resuming a loop rewrites all subsequent captures; no capture can be
 +  // inside a loop, alternative or assertion requiring restoration.
++  if (alternatives)
++    os << "    " << label("op", ops.size()) << ":\n";
 +  os << "      ranges[0] = candidate; ranges[1] = p;\n"
-+     << "      return HermesRegexAOTMatch;\n"
-+     << "    " << next << ":\n"
++     << "      return HermesRegexAOTMatch;\n";
++  if (alternatives) {
++    os << "    " << backtrack << ":\n"
++       << "      if (!work--) return HermesRegexAOTFallback;\n"
++       << "      if (depth) switch (choices[--depth]) {\n";
++    for (size_t i = 0; i < choices.size(); ++i)
++      os << "        case " << i << ": goto " << choices[i] << ";\n";
++    os << "      }\n";
++  }
++  os << "    " << next << ":\n"
 +     << "      if (candidate == length";
 +  if (anchored)
 +    os << " || 1";
@@ -14333,8 +14422,11 @@ index 0000000000000000000000000000000000000000..80767646c9918086b5e26279591b67b8
 +      header->loopCount > kMaxLoops)
 +    return llvh::None;
 +
-+  bool asciiOnly = false;
-+  size_t ranges = 0, loops = 0, offset = sizeof(*header);
++  size_t ranges = 0, loops = 0, alternatives = 0, offset = sizeof(*header);
++  // Only decoded operation boundaries may be branch destinations. In
++  // particular, a run's payload and a width-one loop's body are not entries.
++  std::array<size_t, kMaxBytecode> operationAt;
++  operationAt.fill(kMaxOperations + 1);
 +  std::vector<AOTOperation> ops;
 +  uint32_t begun = 0, ended = 0;
 +  while (offset < bytes.size()) {
@@ -14343,14 +14435,36 @@ index 0000000000000000000000000000000000000000..80767646c9918086b5e26279591b67b8
 +    // exactly fills the operation budget must still be allowed to terminate.
 +    if (ops.size() == kMaxOperations && base->opcode != Opcode::Goal)
 +      return llvh::None;
++    operationAt[offset - sizeof(*header)] = ops.size();
 +    AOTOperation op{base->opcode, {}};
 +    size_t width = 0;
-+    if (readTerm(base, op.predicate, width, ranges, asciiOnly)) {
++    if (readTerm(base, op.predicate, width, ranges)) {
 +      offset += width;
 +      ops.push_back(std::move(op));
 +      continue;
 +    }
 +    switch (base->opcode) {
++      case Opcode::Alternation:
++      case Opcode::Jump32:
++        // Captures require restoration across alternatives; leave those
++        // programs on the interpreter. Only forward control flow is emitted.
++        if (header->markedCount)
++          return llvh::None;
++        if (base->opcode == Opcode::Alternation) {
++          if (++alternatives > kMaxAlternations)
++            return llvh::None;
++          op.target = llvh::cast<AlternationInsn>(base)->secondaryBranch;
++          width = sizeof(AlternationInsn);
++        } else {
++          op.target = llvh::cast<Jump32Insn>(base)->target;
++          width = sizeof(Jump32Insn);
++        }
++        if (op.target <= offset - sizeof(*header) ||
++            op.target >= bytes.size() - sizeof(*header))
++          return llvh::None;
++        offset += width;
++        ops.push_back(std::move(op));
++        break;
 +      case Opcode::Goal:
 +        if (offset + sizeof(GoalInsn) != bytes.size() ||
 +            begun != (1u << header->markedCount) - 1 || ended != begun)
@@ -14375,8 +14489,8 @@ index 0000000000000000000000000000000000000000..80767646c9918086b5e26279591b67b8
 +          folded.c = chars[i];
 +          AOTOperation term{
 +              Opcode::MatchChar8, rangePredicate(chars[i], chars[i])};
-+          if (icase)
-+            readTerm(&folded, term.predicate, width, ranges, asciiOnly);
++          if (icase && !readTerm(&folded, term.predicate, width, ranges))
++            return llvh::None;
 +          ops.push_back(std::move(term));
 +        }
 +        offset += prefix + count;
@@ -14390,8 +14504,7 @@ index 0000000000000000000000000000000000000000..80767646c9918086b5e26279591b67b8
 +                reinterpret_cast<const Insn *>(loop + 1),
 +                op.predicate,
 +                width,
-+                ranges,
-+                asciiOnly) ||
++                ranges) ||
 +            offset + sizeof(*loop) + width !=
 +                sizeof(*header) + loop->notTakenTarget)
 +          return llvh::None;
@@ -14442,30 +14555,30 @@ index 0000000000000000000000000000000000000000..80767646c9918086b5e26279591b67b8
 +        return llvh::None;
 +    }
 +  }
++  for (size_t i = 0; i < ops.size(); ++i) {
++    auto &op = ops[i];
++    if (op.opcode != Opcode::Alternation && op.opcode != Opcode::Jump32)
++      continue;
++    const auto target = operationAt[op.target];
++    if (!alternatives || target > ops.size() || target <= i)
++      return llvh::None;
++    op.target = target;
++  }
 +  std::string source;
 +  llvh::raw_string_ostream os(source);
 +  os << "HERMES_REGEX_AOT_HIDDEN int32_t " << name
 +     << "(const void *input, uint32_t length, uint32_t start, "
 +        "uint32_t flags, uint32_t *ranges) {\n"
 +        "  uint32_t work = 262144u;\n";
-+  if (asciiOnly)
-+    os << "  if (!(flags & " << constants::matchInputAllAscii
-+       << "u)) return HermesRegexAOTFallback;\n";
 +  const bool anchored = header->constraints & MatchConstraintAnchoredAtStart;
 +  if (anchored)
 +    os << "  if (start != 0) return HermesRegexAOTNoMatch;\n";
 +  os << "  if (flags & " << constants::matchInputAllAscii << "u) {\n"
 +        "    const uint8_t *s = (const uint8_t *)input;\n";
 +  emitBody(os, ops, anchored, "8");
-+  os << "  }";
-+  if (!asciiOnly) {
-+    os << " else {\n    const uint16_t *s = (const uint16_t *)input;\n";
-+    emitBody(os, ops, anchored, "16");
-+    os << "  }";
-+  } else {
-+    os << "\n  return HermesRegexAOTFallback;";
-+  }
-+  os << "\n}\n";
++  os << "  } else {\n    const uint16_t *s = (const uint16_t *)input;\n";
++  emitBody(os, ops, anchored, "16");
++  os << "  }\n}\n";
 +  os.flush();
 +  if (source.size() > kMaxSource)
 +    return llvh::None;
@@ -24869,10 +24982,10 @@ index 0000000000000000000000000000000000000000..1e08c73aca85d67c1b19e6bac5dd0ffe
 +// linkage or the runtime function pointers.
 diff --git a/test/shermes/regexp-aot.js b/test/shermes/regexp-aot.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..aa7e1f829d51c0a7adf109ba5cef5361309b1d87
+index 0000000000000000000000000000000000000000..71459d14b873648ba07aa908ac043d0c62d30f51
 --- /dev/null
 +++ b/test/shermes/regexp-aot.js
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,152 @@
 +/**
 + * Copyright (c) Meta Platforms, Inc. and affiliates.
 + *
@@ -24892,6 +25005,8 @@ index 0000000000000000000000000000000000000000..aa7e1f829d51c0a7adf109ba5cef5361
 +// C: uint32_t work = 262144u;
 +// C: backtrack8_
 +// C: HermesRegexAOTFallback
++// C: uint32_t choices[
++// C: alternative16_
 +
 +// Leave room for the parity driver's control-flow wrapper: outlining moves
 +// instruction runs into helpers but keeps the block labels and branches.
@@ -24899,12 +25014,25 @@ index 0000000000000000000000000000000000000000..aa7e1f829d51c0a7adf109ba5cef5361
 +function assert(value) {
 +  if (!value) throw new Error('Compiled regexp mismatch');
 +}
++function seedMatchState() {
++  /(seed)(ed)/.exec('!seeded?');
++}
++function matchState() {
++  return [RegExp.input, RegExp.lastMatch, RegExp.lastParen,
++    RegExp.leftContext, RegExp.rightContext, RegExp.$1, RegExp.$2, RegExp.$3];
++}
 +function snapshot(re, input, start) {
++  seedMatchState();
 +  re.lastIndex = start;
 +  var m = re.exec(input);
-+  return JSON.stringify([m, m && m.index, m && m.groups,
-+    m && m.indices, re.lastIndex,
-+    m && [RegExp.lastMatch, RegExp.$1, RegExp.$2, RegExp.$3]]);
++  return JSON.stringify([m, m && m.index, m && m.input, m && m.groups,
++    m && m.indices, re.lastIndex, matchState()]);
++}
++function testSnapshot(re, input, start) {
++  seedMatchState();
++  re.lastIndex = start;
++  var matched = re.test(input);
++  return JSON.stringify([matched, re.lastIndex, matchState()]);
 +}
 +// The constructor consumes a runtime property, so it uses the interpreter.
 +// Literal matches must agree on priority, captures and state, not only success.
@@ -24925,36 +25053,78 @@ index 0000000000000000000000000000000000000000..aa7e1f829d51c0a7adf109ba5cef5361
 +  /[\D\s]+/, /[\s]+/, /[^]+/, /[]*/, /(.+)(.*)/s,
 +  /\u0100+(\ud800*)/d, /[\u0100-\uffff]+/,
 +  /(?i:a+)(?-i:B+)/, /(?s:.+)(?-s:.)/,
++  // Non-Unicode folded literals, literal runs and width-one repetitions use
++  // the same equivalence classes for ASCII and UTF-16 subjects.
++  /abc/i, /\u00e9cho/i, /\u0101+end/i, /\ud800+end/i,
++  /[a-z]+\u00e9[\s\S]*?fin/i,
++  /k/i, /s/i, /\u212a/i, /\u017f/i, /\u03c3/i,
++  /\u00b5/i, /\u0131/i, /\u00df/i,
++  // Ordered alternatives must retry after their shared continuation fails.
++  /(?:a|ab)c/d, /(?:ab|a)b/d, /(?:ab|a)/dg, /(?:a|ab)/dy,
++  /(?:|ab)c/d, /(?:ab|)c/d, /(?:|ab)/dgy, /(?:ab|)/dgy,
++  /(?:a*|ab)c/d, /(?:a*?|ab)c/d, /(?:a{1,3}?|ab)b/d,
++  /a*(?:ab|a)b/d, /a*?(?:ab|a)b/d,
++  /(?:ab|a)b*(?:bc|b)c/d, /(?:ab|a)b*?(?:bc|b)c/d,
++  /(?:(?:ab|a)c|a)b/d, /(?:a$|ab)c/, /(?:^a|b)c/,
++  /(?:\ba|b)c/, /(?:a|b\B)c/, /(?:^a|b$)/m,
++  /^(?:ab|a)b$/dgy, /(?:\u00e9cho|\u00e9clair)\s*[^]*?fin/ig,
++  /(?:\u00e9cho\s*|\u00e9cho[^]*?)fin/iy,
++  /(?:\ud800a|\ud800)end/ig,
++  /(?:ab|a)(?:ab|a)(?:ab|a)(?:ab|a)(?:ab|a)(?:ab|a)(?:ab|a)(?:ab|a)c/,
 +  // Unsupported control flow and Unicode stay on the interpreter.
 +  /(ab|cd)+/, /(a)?b/d, /(?=(a))a/, /(a)\1/,
-+  /(?<=a)b/, /./u, /\u212a/iu
++  /(?<=a)b/, /./u, /\u212a/iu, /\u017f/iu, /k/iu, /s/iu,
++  /(?:a|ab)+c/, /(?:a|ab)*?c/
 +];
 +var inputs = ['', 'a', 'b', 'ab', 'aaab', 'aaac', 'xaa', 'x\na', 'a1x', 'za7xz',
 +  'abc: 123', 'ABC = 42', 'no delimiter', ' a: 1! ',
 +  '\naaa\r\nbbb\u2028a\u2029', 'a\n', 'aaaBBB',
 +  '\u0100\u0100\ud800\ud800', '\ud800a\udc00', '\u00e9a',
 +  '\u212ak', '\u017fs', '\u00a0\ufeff\u1680\u2000\u202f\u3000',
-+  '\u00e9ABC: 42'];
++  '\u00e9ABC: 42', 'abc', 'abb', 'abbbbc', 'abab', 'acb',
++  'ABC', '\u00e9ABC', '\u00c9CHO', '\u00c9CLAIR \nFIN',
++  '\u00e9cho FIN', '\u00c9CHO missing suffix',
++  '\u0100\u0101END', '\ud800END', '\ud800aEND',
++  'kKsS', '\u212a\u017f', '\u03a3\u03c2\u03c3',
++  '\u00b5\u039c\u03bc', '\u0131I', '\u00dfSS',
++  'aaaaaaaac', 'ababababababababc', 'abababababababab!'];
 +for (var i = 0; i < patterns.length; ++i) {
 +  var re = patterns[i];
 +  var dynamic = new RegExp(re.source, re.flags);
 +  for (var j = 0; j < inputs.length; ++j) {
 +    var input = inputs[j];
-+    for (var start = 0; start <= input.length + 1; ++start)
++    for (var start = 0; start <= input.length + 1; ++start) {
 +      assert(snapshot(re, input, start) === snapshot(dynamic, input, start));
++      assert(testSnapshot(re, input, start) ===
++        testSnapshot(dynamic, input, start));
++    }
 +  }
 +}
++assert(!/k/i.test('\u212a') && !/s/i.test('\u017f'));
++assert(/k/iu.test('\u212a') && /s/iu.test('\u017f'));
++assert(/\u03c3/i.test('\u03c2') && /\u00b5/i.test('\u039c'));
++assert(!/i/i.test('\u0131') && !/ss/i.test('\u00df'));
 +// Ambiguous loops exceed the compiled work budget and restart the interpreter.
 +var expensive = /^(a*)(a*)(a*)b$/d;
 +var text = new Array(141).join('a');
 +assert(snapshot(expensive, text, 0) ===
 +  snapshot(new RegExp(expensive.source, expensive.flags), text, 0));
++// The branch stack also restarts safely after excessive continuation retries.
++var expensiveAlternative = /^(?:a*a*a*b|a*a*a*c)$/d;
++assert(snapshot(expensiveAlternative, text, 0) ===
++  snapshot(new RegExp(expensiveAlternative.source, expensiveAlternative.flags),
++    text, 0));
 +// Consuming a long capture exceeds the work budget even though the match
 +// succeeds. An irrelevant prefix is pruned without spending that budget.
 +var long = 'a' + new Array(270001).join('1') + 'b';
 +var longPattern = /a(\d+)b/d;
 +assert(snapshot(longPattern, long, 0) ===
 +  snapshot(new RegExp(longPattern.source, longPattern.flags), long, 0));
++var longAlternative = /(?:\u00e9\d+|e\d+)b/id;
++var longUtf16 = '\u00c9' + new Array(270001).join('1') + 'b';
++assert(snapshot(longAlternative, longUtf16, 0) ===
++  snapshot(new RegExp(longAlternative.source, longAlternative.flags),
++    longUtf16, 0));
 +// The result-free builtin still publishes generated captures and legacy state.
 +var tested = /(?<left>a*)(a+)b/dg;
 +assert(tested.test('xaaab') && tested.lastIndex === 5);
@@ -27543,7 +27713,7 @@ index 6c7edd8b5384e852d302b54ff7b63382337bbbd6..bbf8edd0c63967dfb42701fae8674b2b
  
  } // namespace
 diff --git a/unittests/Support/RegexTest.cpp b/unittests/Support/RegexTest.cpp
-index 0d5c72abc0c9f74d1f91ecbeae14812fede3ec82..8e26243e3471edfcd976d82473f86cc7e6b60f7c 100644
+index 0d5c72abc0c9f74d1f91ecbeae14812fede3ec82..9bd89393461bf295761e3e7e33f22e86b21fbe7f 100644
 --- a/unittests/Support/RegexTest.cpp
 +++ b/unittests/Support/RegexTest.cpp
 @@ -7,9 +7,11 @@
@@ -27558,7 +27728,7 @@ index 0d5c72abc0c9f74d1f91ecbeae14812fede3ec82..8e26243e3471edfcd976d82473f86cc7
  #include "gtest/gtest.h"
  
  using namespace hermes::regex;
-@@ -80,6 +82,304 @@ TEST(Regex, Short) {
+@@ -80,6 +82,355 @@ TEST(Regex, Short) {
    EXPECT_EQ("(0-6) (1-5)", flatten(matchRanges));
  }
  
@@ -27566,14 +27736,18 @@ index 0d5c72abc0c9f74d1f91ecbeae14812fede3ec82..8e26243e3471edfcd976d82473f86cc7
 +  for (const auto &pattern : {
 +           "", "(a*)", "(a*?)(a{2,4})", "^([a-z]+)$", "(?m:^a+$)",
 +           "\\b([a-z]+)\\s*[:=]\\s*(\\d+)\\b", "(?i:a+)(?-i:B)",
-+           "(?<name>[^,]+),", "[\\d\\S]+", "\\u0100+(\\ud800*)"}) {
++           "(?<name>[^,]+),", "[\\d\\S]+", "\\u0100+(\\ud800*)",
++           "(?:a|ab)c", "(?:ab|a)b", "(?:|ab)c", "(?:ab|)c",
++           "(?:a*|ab)c", "(?:a*?|ab)c",
++           "(?i:\\u00e9(?:cho|clair)\\s*.*?END)"}) {
 +    auto compiled = hermes::CompiledRegExp::tryCompile(pattern, "");
 +    ASSERT_TRUE(compiled);
 +    EXPECT_TRUE(compiled->compileAOTRegex("matcher")) << pattern;
 +  }
 +  for (const auto &pattern : {
 +           "(ab|cd)", "(?=a)a", "(?<=a)b", "(a)\\1", "(a)+",
-+           "(a)?", "(a)(b)(c)(d)(e)(f)(g)(h)(i)"}) {
++           "(a)?", "(a)(?:b|c)", "(?:a|b)+", "(?:a|ab)*?c", "(?:ab|cd)+",
++           "(a)(b)(c)(d)(e)(f)(g)(h)(i)"}) {
 +    auto compiled = hermes::CompiledRegExp::tryCompile(pattern, "");
 +    ASSERT_TRUE(compiled);
 +    EXPECT_FALSE(compiled->compileAOTRegex("matcher")) << pattern;
@@ -27590,6 +27764,53 @@ index 0d5c72abc0c9f74d1f91ecbeae14812fede3ec82..8e26243e3471edfcd976d82473f86cc7
 +    ASSERT_TRUE(compiled);
 +    EXPECT_EQ(count <= 64, compiled->compileAOTRegex("matcher").hasValue())
 +        << count;
++  }
++  for (size_t count : {8u, 9u}) {
++    std::string pattern;
++    for (size_t i = 0; i < count; ++i)
++      pattern += "(?:ab|a)";
++    auto compiled = hermes::CompiledRegExp::tryCompile(pattern, "");
++    ASSERT_TRUE(compiled);
++    EXPECT_EQ(count == 8, compiled->compileAOTRegex("matcher").hasValue());
++  }
++}
++
++TEST(Regex, AOTBranchTargets) {
++  // Literal runs require at least three characters; a two-character branch
++  // emits separate instructions, so its second character is a legal target.
++  for (const auto &pattern : {"abc|def", "a*|b*"}) {
++    auto compiled = hermes::CompiledRegExp::tryCompile(pattern, "");
++    ASSERT_TRUE(compiled);
++    ASSERT_TRUE(compiled->compileAOTRegex("matcher"));
++    // Corrupt only targets in an otherwise producer-validated program. AOT
++    // must not turn instruction payloads or loop bodies into entry points.
++    auto bytes = compiled->getBytecode();
++    auto *code = const_cast<uint8_t *>(bytes.data()) +
++        sizeof(RegexBytecodeHeader);
++    auto *alt = reinterpret_cast<AlternationInsn *>(code);
++    ASSERT_EQ(Opcode::Alternation, alt->opcode);
++    const uint32_t secondary = alt->secondaryBranch;
++    auto *jump = reinterpret_cast<Jump32Insn *>(
++        code + secondary - sizeof(Jump32Insn));
++    ASSERT_EQ(Opcode::Jump32, jump->opcode);
++    const uint32_t continuation = jump->target;
++    const uint32_t prefix = pattern[1] == '*' ? sizeof(Width1LoopInsn)
++                                            : sizeof(MatchNChar8Insn);
++    const uint32_t primaryPayload = sizeof(AlternationInsn) + prefix;
++    const uint32_t secondaryPayload = secondary + prefix;
++    const uint32_t pastGoal = bytes.size() - sizeof(RegexBytecodeHeader);
++    // The secondary payload is ahead of Jump32, so its rejection also checks
++    // operation boundaries rather than just the backward-branch guard.
++    for (uint32_t target :
++         {0u, 1u, primaryPayload, secondaryPayload, pastGoal, UINT32_MAX}) {
++      alt->secondaryBranch = target;
++      EXPECT_FALSE(compiled->compileAOTRegex("matcher")) << target;
++      alt->secondaryBranch = secondary;
++      jump->target = target;
++      EXPECT_FALSE(compiled->compileAOTRegex("matcher")) << target;
++      jump->target = continuation;
++    }
++    EXPECT_TRUE(compiled->compileAOTRegex("matcher"));
 +  }
 +}
 +

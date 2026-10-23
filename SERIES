@@ -12,5 +12,5 @@
 0011-shermes-group-outlined-helpers-into-bounded-C-transl.patch a686034f50db5db0605a3fab0e74fc20a946de4b
 0012-wasm-define-fast-floating-point-integer-conversions.patch 07a4fdf3bb3148fd84e0aab3d608eff5fd0d3829
 0013-vm-fast-path-dense-Array.prototype.map-reads.patch 248e8e7ef1fdf55c1bfe4ca29f0166409569fe6f
-0014-wasm-optimize-static-execution-and-native-value-boun.patch 7cb54b5a7747a20ab9e9c803a413b5c6f477162d
-0015-intl-add-a-static-ICU-provider-for-Wasm-runtimes.patch d8759528165a85dcf8f6aec66e22ccddb7ee06eb
+0014-wasm-optimize-static-execution-and-native-value-boun.patch f27e7b684f918e130308de7589d0962e013ca2bf
+0015-intl-add-a-static-ICU-provider-for-Wasm-runtimes.patch 40441111c9e369d1b87c0b0d1fa009b72539d70a
