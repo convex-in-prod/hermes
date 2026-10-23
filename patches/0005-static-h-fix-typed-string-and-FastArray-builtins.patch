@@ -1,9 +1,15 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Thu, 27 Aug 2026 13:49:51 +0800
-Subject: [PATCH 05/15] StaticH: fix typed string and FastArray builtins
+Subject: [PATCH 05/15] static-h: fix typed string and FastArray builtins
 
-Expose String.prototype.charCodeAt in the typed library and give FastArray a dedicated prototype with the standard iterator when values cross into dynamic JavaScript. Add semantic and execution coverage for both surfaces.
+Expose String.prototype.charCodeAt in the typed library and give
+FastArray a dedicated prototype with the standard iterator when values
+cross into dynamic JavaScript.
+
+Keep semantic and execution coverage with the implementation. Match the
+upstream semantic dump's implicit-return annotations in the charCodeAt
+fixture without changing its type or runtime assertions.
 ---
  lib/VM/JSLib/GlobalObject.cpp               | 19 ++++++-
  test/Sema/flow/builtin-string-charCodeAt.js | 46 +++++++++++++++++
@@ -51,7 +57,7 @@ index d3bee7f3e5678574a866c477468223b215a654c6..7e87288addfbe2256104f3978a56ef70
        createArrayBufferConstructor(runtime));
 diff --git a/test/Sema/flow/builtin-string-charCodeAt.js b/test/Sema/flow/builtin-string-charCodeAt.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..da82e11bd7079dc30f5c3f23d087ffcbaef14c0c
+index 0000000000000000000000000000000000000000..7298c3ff3854336dd93ac3dbbe5ba9485b561b79
 --- /dev/null
 +++ b/test/Sema/flow/builtin-string-charCodeAt.js
 @@ -0,0 +1,46 @@
@@ -77,13 +83,13 @@ index 0000000000000000000000000000000000000000..da82e11bd7079dc30f5c3f23d087ffcb
 +// CHECK-NEXT:%function.3 = function(this: string, pos: number): number
 +
 +// CHECK:SemContext
-+// CHECK-NEXT:Func strict
++// CHECK-NEXT:Func strict mayReachImplicitReturn
 +// CHECK-NEXT:    Scope %s.1
 +// CHECK-NEXT:        Decl %d.1 'exports' Parameter : any
 +// CHECK-NEXT:        Decl %d.2 'test' Var : %function.2
 +// CHECK-NEXT:        Decl %d.3 'arguments' Var Arguments
 +// CHECK-NEXT:        hoistedFunction test
-+// CHECK-NEXT:    Func strict
++// CHECK-NEXT:    Func strict noImplicitReturn
 +// CHECK-NEXT:        Scope %s.2
 +// CHECK-NEXT:            Decl %d.4 's' Parameter : string
 +// CHECK-NEXT:            Decl %d.5 'arguments' Var Arguments

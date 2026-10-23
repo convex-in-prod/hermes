@@ -1,17 +1,25 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
-Date: Thu, 10 Sep 2026 03:16:59 +0800
-Subject: [PATCH 07/15] support: test inline SerialExecutor ownership without
+Date: Thu, 27 Aug 2026 13:49:20 +0800
+Subject: [PATCH 01/15] support: run serial tasks inline without Emscripten
  pthreads
 
-Separate worker-dependent tests from single-threaded Emscripten coverage. Verify that move-only task captures are destroyed before add returns, nested work runs inline, and no worker runner is invoked. Describe the threaded and inline ownership contracts without contradictory lifecycle claims.
+Avoid creating the executor thread in single-threaded Emscripten builds.
+Running each task inline preserves ordering and permits finalizers to
+complete without a worker thread.
+
+Document the threaded and inline ownership contracts together. Keep
+worker-dependent tests separate, and cover destruction of move-only task
+captures before add returns, nested inline work, and the absence of a
+worker-runner invocation.
 ---
- include/hermes/Support/SerialExecutor.h  | 18 ++++++++----
+ include/hermes/Support/SerialExecutor.h  | 17 +++++++----
+ lib/Support/SerialExecutor.cpp           |  6 ++++
  unittests/Support/SerialExecutorTest.cpp | 37 ++++++++++++++++++++++++
- 2 files changed, 49 insertions(+), 6 deletions(-)
+ 3 files changed, 55 insertions(+), 5 deletions(-)
 
 diff --git a/include/hermes/Support/SerialExecutor.h b/include/hermes/Support/SerialExecutor.h
-index 6bf0448b768a25e04700240292344d6fab33fc56..17a5ff8630a0c9a539a99bcfd04f1cf7b8a182ca 100644
+index 26e65e3a946a77da04b024225196f74d4002ea31..17a5ff8630a0c9a539a99bcfd04f1cf7b8a182ca 100644
 --- a/include/hermes/Support/SerialExecutor.h
 +++ b/include/hermes/Support/SerialExecutor.h
 @@ -81,8 +81,8 @@ class SerialExecutor {
@@ -34,7 +42,7 @@ index 6bf0448b768a25e04700240292344d6fab33fc56..17a5ff8630a0c9a539a99bcfd04f1cf7
    SerialExecutor(
        size_t stackSize = 0,
        std::chrono::nanoseconds timeout = kDefaultTimeout,
-@@ -118,12 +120,12 @@ class SerialExecutor {
+@@ -118,11 +120,12 @@ class SerialExecutor {
    }
  
    /// Make sure that the spawned thread has terminated. Will block if there is a
@@ -45,13 +53,12 @@ index 6bf0448b768a25e04700240292344d6fab33fc56..17a5ff8630a0c9a539a99bcfd04f1cf7
  
 -  /// Push a task to the back of the queue, lazily creating the worker thread if
 -  /// it does not exist.
--  /// Single-threaded Emscripten instead runs and destroys the task inline.
 +  /// On threaded builds, push a task to the back of the queue, lazily creating
 +  /// the worker thread if it does not exist.
    ///
    /// Ownership of \p task transfers to the queue before this returns, so the
    /// task and everything it captures are destroyed on the worker thread after
-@@ -133,6 +135,10 @@ class SerialExecutor {
+@@ -132,6 +135,10 @@ class SerialExecutor {
    /// call add(). Once ~SerialExecutor has begun draining, only the worker
    /// thread may do so: the drain loop picks up whatever it enqueues, whereas a
    /// task enqueued from another thread at that point may never run at all.
@@ -62,6 +69,23 @@ index 6bf0448b768a25e04700240292344d6fab33fc56..17a5ff8630a0c9a539a99bcfd04f1cf7
    void add(llvh::unique_function<void()> task);
  };
  } // namespace hermes
+diff --git a/lib/Support/SerialExecutor.cpp b/lib/Support/SerialExecutor.cpp
+index 513282319a614bc7a6680118a2c4d82265d4d2de..2b255d4d0975cbdafa8e6deec5051cba3bfa2d07 100644
+--- a/lib/Support/SerialExecutor.cpp
++++ b/lib/Support/SerialExecutor.cpp
+@@ -32,6 +32,12 @@ SerialExecutor::~SerialExecutor() {
+ }
+ 
+ void SerialExecutor::add(llvh::unique_function<void()> task) {
++#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
++  // No worker exists in this configuration; keep task ownership on this thread.
++  task();
++  return;
++#endif
++
+   std::unique_lock<std::mutex> lock(mutex_);
+   // Draining inside ~SerialExecutor destroys tasks, and a task's captured
+   // state may enqueue more work from its destructor. That is fine: the drain
 diff --git a/unittests/Support/SerialExecutorTest.cpp b/unittests/Support/SerialExecutorTest.cpp
 index dcc31ac2ed08a506ca63569a4f9f58acdfd5e709..a252756c3fa33b9f66e06585eba13f51a2f1a948 100644
 --- a/unittests/Support/SerialExecutorTest.cpp

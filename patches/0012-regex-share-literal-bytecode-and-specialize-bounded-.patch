@@ -1,0 +1,4390 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Mon, 28 Sep 2026 11:25:34 +0800
+Subject: [PATCH 12/15] regex: share literal bytecode and specialize bounded
+ operations
+
+Borrow immutable compiled literal bytecode while creating fresh RegExp
+objects with independent lastIndex and named-group initialization. Honor
+overridden exec methods, and avoid discarded match arrays for eligible
+Boolean tests while retaining captures and legacy match state.
+
+Generate bounded AOT matchers for supported literals and repetitions,
+including UTF-16 non-Unicode case equivalents and capture-free forward
+alternatives. Validate branch targets, bound pending alternatives and
+suffix retries, and preserve interpreter fallback and work budgets.
+Index Unicode canonicalization tables by immutable page directories.
+
+Lower guarded whole operations on fresh unescaped regex literals:
+indexed tests, empty replacement, unchanged lowercase replacement and
+replacement equality. Preserve lookup/evaluation order, coercion,
+UTF-16 indexing, rooting and original IR on a declined fast path.
+
+Bound generated descriptor and matcher storage per module. Keep normal
+and split-C emission, interpreter parity, custom execution, captures,
+alternatives and exhaustive supported-codepoint coverage with the
+engine/compiler integration. This does not replace the general matcher.
+---
+ doc/RegExp.md                                 | 148 ++++-
+ include/hermes/IR/IRBuilder.h                 |   4 +
+ include/hermes/IR/Instrs.def                  |   2 +
+ include/hermes/IR/Instrs.h                    |  45 ++
+ .../Platform/Unicode/UnicodeCaseConversion.h  |   4 +
+ include/hermes/Regex/Executor.h               |  77 +++
+ include/hermes/Regex/RegexAOT.h               |  55 ++
+ include/hermes/Regex/RegexBytecode.h          |  20 +-
+ include/hermes/Regex/RegexSerialization.h     |  10 +
+ include/hermes/Regex/RegexTraits.h            |  18 +-
+ include/hermes/Regex/RegexTypes.h             |   1 +
+ include/hermes/VM/JSRegExp.h                  |  27 +-
+ .../hermes/VM/RuntimeHermesValueFields.def    |   4 +-
+ include/hermes/VM/static_h.h                  |  28 +
+ lib/BCGen/HBC/ISel.cpp                        |   5 +
+ lib/BCGen/SH/CMakeLists.txt                   |   1 +
+ lib/BCGen/SH/LoadConstants.cpp                |   3 +
+ lib/BCGen/SH/LoweringPasses.h                 |   2 +
+ lib/BCGen/SH/RegExpLowering.cpp               | 193 ++++++
+ lib/BCGen/SH/SH.cpp                           | 118 +++-
+ lib/IR/IRBuilder.cpp                          |   9 +
+ lib/IR/IRVerifier.cpp                         |   8 +
+ lib/Platform/Unicode/CharacterProperties.cpp  |  42 +-
+ .../Unicode/UnicodeCaseConversion.cpp         |  12 +
+ lib/Regex/CMakeLists.txt                      |   1 +
+ lib/Regex/Executor.cpp                        | 273 +++++++-
+ lib/Regex/RegexAOT.cpp                        | 587 ++++++++++++++++++
+ lib/Regex/RegexSerialization.cpp              | 116 ++++
+ lib/VM/Interpreter-slowpaths.cpp              |   8 +-
+ lib/VM/JSLib/RegExp.cpp                       | 217 +++++--
+ lib/VM/JSRegExp.cpp                           | 136 ++--
+ lib/VM/StaticH.cpp                            | 191 ++++++
+ test/shermes/regexp-aot-bundle.js             |  18 +
+ test/shermes/regexp-aot.js                    | 152 +++++
+ test/shermes/regexp-fusion.js                 | 166 +++++
+ test/shermes/regexp-specialized.js            | 152 +++++
+ test/shermes/regexp-string-operations.js      | 131 ++++
+ .../PlatformUnicode/CharacterPropertyTest.cpp |  26 +
+ .../PlatformUnicode/PlatformUnicodeTest.cpp   |   3 -
+ unittests/Support/RegexTest.cpp               | 351 +++++++++++
+ 40 files changed, 3213 insertions(+), 151 deletions(-)
+ create mode 100644 include/hermes/Regex/RegexAOT.h
+ create mode 100644 lib/BCGen/SH/RegExpLowering.cpp
+ create mode 100644 lib/Regex/RegexAOT.cpp
+ create mode 100644 test/shermes/regexp-aot-bundle.js
+ create mode 100644 test/shermes/regexp-aot.js
+ create mode 100644 test/shermes/regexp-fusion.js
+ create mode 100644 test/shermes/regexp-specialized.js
+ create mode 100644 test/shermes/regexp-string-operations.js
+
+diff --git a/doc/RegExp.md b/doc/RegExp.md
+index dae8d503b89751e6d43c4b30c52a26be5cc2b466..9203ca460599ffaebd33ac006f793408e14c4826 100644
+--- a/doc/RegExp.md
++++ b/doc/RegExp.md
+@@ -5,7 +5,7 @@ title: RegExp
+ 
+ ## RegExp
+ 
+-The Hermes regexp engine is a traditional engine using a backtracking stack. It compiles a regexp into bytecode which can be executed efficiently. For regexp literals like `/abc/`, this occurs at compile time: the regexp bytecode is embedded into the Hermes bytecode file. Note regexp bytecode is distinct from Hermes bytescode.
++The general Hermes regexp engine uses a backtracking stack and executes regexp bytecode. For regexp literals like `/abc/`, compilation occurs ahead of execution: HBC embeds the regexp bytecode in its bytecode file, and Static Hermes emits static byte arrays in generated C. Regexp bytecode is distinct from Hermes bytecode.
+ 
+ The regexp engine proceeds as follows:
+ 
+@@ -14,6 +14,151 @@ The regexp engine proceeds as follows:
+ 1. *Emitting phase.* The node tree is traversed and emits regexp bytecode.
+ 1. *Execution phase.* The bytecode is executed against an input string.
+ 
++## Static Hermes compiled matchers
++
++Static Hermes can emit pattern-specific C control flow from validated regexp
++bytecode. The ordinary C toolchain compiles these functions to native or Wasm
++code. Eligible concatenations contain literals, classes, dots, captures, word
++boundaries, ordinary or multiline anchors, and greedy or lazy width-one
++repetition, including counted repetition. Captures may surround a repetition but
++cannot occur inside its body. Patterns with alternatives must be capture-free
++throughout; their branches may contain the other terms and width-one repetitions.
++Empty branches and matches are supported.
++Global, sticky and indices flags retain their ordinary builtin behavior.
++
++The matcher emits direct character predicates and repetition loops, with direct
++branches for backtracking. It scans candidate starts using the possible first
++characters and, where available, a leading word boundary. Captures and loop
++positions use bounded call-local storage. Alternatives preserve their original
++order, including retries when a common suffix fails. Forward branches target
++validated operation boundaries; they cannot enter a literal payload or a
++repetition body. A bounded stack holds one pending choice per alternative or
++repetition site. Fixed-width concatenations with an ordinary end anchor check
++only their final possible start, subject to sticky and start
++anchors. Character classes derive from the interpreter's tables. Matchers accept
++ASCII and UTF-16 input without conversion, including lone surrogates.
++Non-Unicode case-insensitive literals and runs expand canonical equivalents
++using the same Hermes tables as the interpreter and character-class compiler.
++Case-insensitive class bytecode already contains those equivalents. In particular,
++non-Unicode folding does not equate long s or the Kelvin sign with ASCII letters.
++Local modifiers are interpreted through the actual bytecode instructions.
++
++Unicode mode, patterns combining alternatives and captures, repeated alternatives,
++lookarounds, backreferences, repeated captures and other unsupported instructions
++retain the interpreter. This is not a DFA or a
++linear-time matching guarantee. A generated search has a work budget of 262,144
++candidate attempts, repetition and backtracking steps; exhaustion restarts the complete
++original bytecode search without publishing partial captures. The interpreter
++retains its existing resource errors. Guest execution metering still applies to
++the generated code and to the fallback.
++
++First-character and boundary rejection do not consume that backtracking budget:
++they advance through the subject once. A single character predicate uses a
++direct linear scan without a speculative work cap or duplicate predicate check.
++
++Generation examines at most 2 KiB of bytecode per pattern and accepts at most 64
++operations, 64 explicit class ranges, eight captures, eight repetition sites and
++eight alternative sites. Branching matchers have at most sixteen pending choices;
++their scratch storage is independent of the subject length.
++Generated C is limited to 24 KiB per pattern and 512 KiB per logical module, with
++at most 256 distinct patterns analyzed for compiled matchers. Identical compiled
++patterns share one function across literal sites and bundle shards. These are
++source-generation limits, not promises about final machine-code size. Repetition
++is never unrolled, and alternatives are not expanded into separate full paths.
++
++If compiled-function generation declines, Static Hermes may derive the existing
++fixed-width descriptor for one shared matcher. That tier supports non-Unicode,
++capture-free concatenations of case-sensitive literals, classes and dots, optionally
++with ordinary start/end anchors. It examines at most 1 KiB of bytecode, accepts
++16 consuming terms and 32 ranges, and emits at most 64 KiB of descriptors per
++logical module. All remaining patterns use the bytecode interpreter.
++Case-insensitive non-Unicode classes also qualify because their bytecode ranges
++already include case equivalents; folded literal instructions do not qualify.
++
++## Whole-operation lowering
++
++Static Hermes recognizes a fresh literal used only by `.test()` and an
++unanchored, capture-free, non-Unicode character predicate. It also recognizes
++global character filtering with an empty replacement, optionally preceded by
++`toLowerCase()` or consumed by strict equality with the original input. These
++operations can omit the RegExp object and generic builtin call frames. They use
++the validated bytecode descriptor, not source-pattern heuristics.
++Its descriptors share the existing 64 KiB per-module auxiliary-data budget;
++exhaustion selects the retained original expression.
++
++The compiler keeps the complete original expression behind a runtime guard.
++Only contiguous expression instructions qualify: moving method lookup across
++argument coercion or other user effects would change behavior. The runtime
++requires a primitive string and exact own builtin methods on the intrinsic
++prototypes, including the global/unicode flag getters for replacement. Changed
++methods, accessors, coercible objects, sticky matching and unsupported regex
++shapes retain the original path. A directly indexed string argument can be
++consumed as a code unit only when its numeric index is integral and in bounds.
++
++Lowercase/filter fusion currently admits strings unchanged by root lowercasing.
++It checks Hermes's full Unicode casing tables for BMP characters; expansions,
++context-sensitive conversions and surrogate pairs retain normal conversion.
++Platforms with external casing tables use the fused lowercase path only for
++ASCII. The scan constructs output lazily after the first removed character;
++an equality consumer needs no output string. Even that consumer scans to the
++end so legacy match state reflects the final successful replacement match.
++
++Successful indexed tests retain a single code unit for legacy `RegExp.input`
++and match/context getters, materializing its string only if observed. They do
++not retain the containing source string. Failed tests preserve previous state;
++ordinary successful matches replace the lazy input. Captures, contexts and
++input remain observable across GC. No cross-request normalization cache is used.
++
++## Matching state and ownership
++
++`RegExp.prototype.test` coerces its input and resolves `exec` once. Custom callable
++methods still run and must return an object or null. When the resolved operation
++is the builtin matcher on a real RegExp, or the specified non-callable fallback
++selects it, `test` omits the JavaScript match array, substring results, groups and
++indices. Matching still retains capture ranges, updates legacy RegExp properties
++on success, and performs the ordinary `lastIndex` conversions and writes. Failure
++leaves previous legacy match state intact; stack overflow remains an error.
++Object consumers such as `exec` and string matching operations still receive
++ordinary match objects.
++
++Boolean tests can resolve an ordinary builtin `exec` data property without
++allocating lookup handles when existing property maps establish its value.
++Missing property maps, accessors and proxy/host prototype chains retain ordinary
++lookup.
++Global replacement with an empty string and ordinary builtin `exec` copies
++unmatched spans directly, omitting match arrays, capture substrings and the list
++of results. Input/replacement coercion, the observable global/unicode reads and
++the initial `lastIndex` write occur before the builtin `exec` guard. The fast path
++requires an internally global RegExp, maintains
++`lastIndex`, empty-match advancement and legacy capture state, and never invokes
++custom `exec` or a replacement callback. Other replacements use the ordinary
++object-result protocol. These paths do not eliminate the RegExp object itself.
++
++Each literal evaluation whose object can be observed creates a distinct mutable
++RegExp object. Only generated
++Static Hermes bytecode, descriptors and matcher functions are borrowed: their
++immutable storage must remain alive for the runtime's full lifetime under the existing persistent SHUnit
++contract, including when supplied by an embedding loader. Every RegExp carries
++both a descriptor pointer and a generated matcher pointer, plus the bytecode
++ownership tag, including instances that use the interpreter. Generated code is
++shared by the module rather than copied into a per-instance executable cache.
++Dynamic compilation,
++HBC literals and same-flags copies own their bytecode. Finalization and per-object
++native-size/snapshot accounting include only owned bytecode; borrowed static data
++still belongs to the module and its memory accounting.
++
++The executor's synchronous capture sink borrows ranges only during its call and
++must not reenter JavaScript or trigger GC while raw input pointers are live. The
++VM copies those ranges directly into its existing native match storage. This
++removes an intermediate output vector, not the interpreter's capture and
++backtracking state. The existing stack guard and embedding interruption contract
++remain in force; there is no new cancellation protocol. Prepared runtime images
++still require the exact compatible runtime, module graph, memory layout and
++function-table reconstruction. Generated matchers are linked into their owning
++module and passed through the existing specialized-literal helper; they add no
++host import or separate memory. The helper signature and RegExp layout require
++matching generated code and runtime artifacts.
++
+ ## Supported Syntax
+ 
+ As of this writing, Hermes regexp supports
+@@ -22,3 +167,4 @@ As of this writing, Hermes regexp supports
+ 1. ES9 lookbehinds.
+ 1. Named capture groups.
+ 1. Unicode property escapes.
++1. Match indices (`d`), dotAll (`s`), and local `i`, `m`, and `s` modifiers.
+diff --git a/include/hermes/IR/IRBuilder.h b/include/hermes/IR/IRBuilder.h
+index 7a1fdc6cd18bd683022e174412ddcbbc49f58ac1..773a311bd5fe20501a388956e23eeeddcb439b5e 100644
+--- a/include/hermes/IR/IRBuilder.h
++++ b/include/hermes/IR/IRBuilder.h
+@@ -569,6 +569,10 @@ class IRBuilder {
+ 
+   CreateRegExpInst *createRegExpInst(Identifier pattern, Identifier flags);
+ 
++  LIRTryFastRegExpInst *createLIRTryFastRegExpInst(
++      LiteralString *pattern, LiteralString *flags, unsigned operation,
++      Value *input, Value *index);
++
+   TypeOfInst *createTypeOfInst(Value *input);
+   TypeOfIsInst *createTypeOfIsInst(Value *input, LiteralTypeOfIsTypes *types);
+ 
+diff --git a/include/hermes/IR/Instrs.def b/include/hermes/IR/Instrs.def
+index 8d12bf8b68f7c8f861fc466d35f4b75f94d54c58..ca9501ff21efd67aaa18850659833c72b5b531a6 100644
+--- a/include/hermes/IR/Instrs.def
++++ b/include/hermes/IR/Instrs.def
+@@ -300,6 +300,8 @@ DEF_VALUE(GetNativeRuntimeInst, Instruction)
+ DEF_VALUE(LazyCompilationDataInst, Instruction)
+ DEF_VALUE(EvalCompilationDataInst, Instruction)
+ 
++DEF_VALUE(LIRTryFastRegExpInst, Instruction)
++
+ // Don't undef these if this file is being included in ValueKinds.def, since
+ // these macros are still used after the #include.
+ #ifndef INCLUDED_FROM_VALUEKINDS
+diff --git a/include/hermes/IR/Instrs.h b/include/hermes/IR/Instrs.h
+index ec4d6c14265740f5687738911a0592cf04f859ef..8a54aab94cd7222489a3ba0401dc7762b8d3d820 100644
+--- a/include/hermes/IR/Instrs.h
++++ b/include/hermes/IR/Instrs.h
+@@ -6347,6 +6347,51 @@ class LIRDeadValueInst : public Instruction {
+   }
+ };
+ 
++/// SH-only guarded string/regexp operation. Undefined selects the original
++/// operation; successful results also preserve the legacy RegExp match state.
++class LIRTryFastRegExpInst : public Instruction {
++ public:
++  enum { PatternIdx, FlagsIdx, OperationIdx, InputIdx, IndexIdx };
++
++  explicit LIRTryFastRegExpInst(
++      LiteralString *pattern, LiteralString *flags, LiteralNumber *operation,
++      Value *input, Value *index)
++      : Instruction(ValueKind::LIRTryFastRegExpInstKind) {
++    setType(*getInherentTypeImpl());
++    pushOperand(pattern);
++    pushOperand(flags);
++    pushOperand(operation);
++    pushOperand(input);
++    pushOperand(index);
++  }
++  explicit LIRTryFastRegExpInst(
++      const LIRTryFastRegExpInst *src, llvh::ArrayRef<Value *> operands)
++      : Instruction(src, operands) {}
++  LiteralString *getPattern() const {
++    return cast<LiteralString>(getOperand(PatternIdx));
++  }
++  LiteralString *getFlags() const {
++    return cast<LiteralString>(getOperand(FlagsIdx));
++  }
++  unsigned getOperation() const {
++    return cast<LiteralNumber>(getOperand(OperationIdx))->asUInt32();
++  }
++  Value *getInput() const { return getOperand(InputIdx); }
++  Value *getIndex() const { return getOperand(IndexIdx); }
++  static llvh::Optional<Type> getInherentTypeImpl() {
++    return Type::createAnyType();
++  }
++  static bool hasOutput() { return true; }
++  static bool isTyped() { return false; }
++  SideEffect getSideEffectImpl() const {
++    // Reads mutable builtin descriptors, writes legacy match state and can GC.
++    return SideEffect::createUnknown();
++  }
++  static bool classof(const Value *V) {
++    return V->getKind() == ValueKind::LIRTryFastRegExpInstKind;
++  }
++};
++
+ class NativeCallInst : public Instruction {
+   NativeCallInst(const NativeCallInst &) = delete;
+   void operator=(const NativeCallInst &) = delete;
+diff --git a/include/hermes/Platform/Unicode/UnicodeCaseConversion.h b/include/hermes/Platform/Unicode/UnicodeCaseConversion.h
+index aab2e0d163d0cd8ee75e5f765d92fc75f3f5a7d3..10b451718e96839a441c3e01d03178e46c911cae 100644
+--- a/include/hermes/Platform/Unicode/UnicodeCaseConversion.h
++++ b/include/hermes/Platform/Unicode/UnicodeCaseConversion.h
+@@ -23,6 +23,10 @@ enum class CaseConversion { ToUpper, ToLower };
+ /// rules exactly, so it has no separate enumerator.
+ enum class CaseLocale { Root, Turkish, Lithuanian };
+ 
++/// Whether this BMP code unit is unchanged by root lowercasing in every
++/// context. Surrogates decline: a pair may denote a cased supplementary letter.
++bool isUnchangedLowercaseCodeUnit(char16_t character);
++
+ /// Convert \p buf to \p targetCase in place, applying the full Unicode case
+ /// mappings and the conditional rules for \p locale.
+ ///
+diff --git a/include/hermes/Regex/Executor.h b/include/hermes/Regex/Executor.h
+index e713c6eb7d7c47ef3f5dda9da5d3bab22cc51678..e3e6376702b7a2ea94ea64984afcf60f9bf2623b 100644
+--- a/include/hermes/Regex/Executor.h
++++ b/include/hermes/Regex/Executor.h
+@@ -8,9 +8,11 @@
+ #ifndef HERMES_REGEX_EXECUTOR_H
+ #define HERMES_REGEX_EXECUTOR_H
+ 
++#include "hermes/Regex/RegexAOT.h"
+ #include "hermes/Regex/RegexBytecode.h"
+ #include "hermes/Regex/RegexTypes.h"
+ #include "hermes/Support/StackOverflowGuard.h"
++#include "llvh/ADT/STLExtras.h"
+ 
+ // This file contains the machinery for executing a regexp compiled to bytecode.
+ 
+@@ -53,6 +55,81 @@ struct CapturedRange {
+   }
+ };
+ 
++/// Called synchronously on success with the full match and capture groups.
++/// The borrowed capture array is valid only for the duration of the call.
++using CaptureRangeSink =
++    llvh::function_ref<void(CapturedRange, llvh::ArrayRef<CapturedRange>)>;
++
++/// Classify one code unit using an unanchored, one-term simple descriptor.
++/// The caller proves this descriptor shape; no state, allocation or JS calls.
++bool matchSimpleRegexCharacter(const uint8_t *descriptor, char16_t character);
++
++/// Invoke generated control flow with the ordinary constraint/stack checks.
++/// A declined representation or exhausted work budget restarts bytecode search.
++MatchRuntimeResult searchWithAOTRegex(
++    HermesRegexAOTMatcher matcher,
++    llvh::ArrayRef<uint8_t> bytecode,
++    const char *first,
++    uint32_t start,
++    uint32_t length,
++    CaptureRangeSink captures,
++    constants::MatchFlagType matchFlags,
++    StackOverflowGuard guard);
++
++MatchRuntimeResult searchWithAOTRegex(
++    HermesRegexAOTMatcher matcher,
++    llvh::ArrayRef<uint8_t> bytecode,
++    const char16_t *first,
++    uint32_t start,
++    uint32_t length,
++    CaptureRangeSink captures,
++    constants::MatchFlagType matchFlags,
++    StackOverflowGuard guard);
++
++/// Search without allocating an intermediate output vector. The sink must not
++/// reenter the VM or trigger GC while the executor holds input pointers.
++MatchRuntimeResult searchWithBytecode(
++    llvh::ArrayRef<uint8_t> bytecode,
++    const char16_t *first,
++    uint32_t start,
++    uint32_t length,
++    CaptureRangeSink captures,
++    constants::MatchFlagType matchFlags,
++    StackOverflowGuard guard);
++
++MatchRuntimeResult searchWithBytecode(
++    llvh::ArrayRef<uint8_t> bytecode,
++    const char *first,
++    uint32_t start,
++    uint32_t length,
++    CaptureRangeSink captures,
++    constants::MatchFlagType matchFlags,
++    StackOverflowGuard guard);
++
++/// Execute a persistent descriptor produced by compileSimpleRegex. This path
++/// accepts only fixed-width, capture-free, non-Unicode code-unit patterns.
++/// Case-insensitive classes use their already-expanded bytecode ranges;
++/// folded literal instructions are not supported.
++/// As with searchWithBytecode, start must not exceed length. The sink has the
++/// same synchronous, non-reentrant lifetime contract.
++MatchRuntimeResult searchWithSimpleRegex(
++    const uint8_t *descriptor,
++    const char16_t *first,
++    uint32_t start,
++    uint32_t length,
++    CaptureRangeSink captures,
++    constants::MatchFlagType matchFlags,
++    StackOverflowGuard guard);
++
++MatchRuntimeResult searchWithSimpleRegex(
++    const uint8_t *descriptor,
++    const char *first,
++    uint32_t start,
++    uint32_t length,
++    CaptureRangeSink captures,
++    constants::MatchFlagType matchFlags,
++    StackOverflowGuard guard);
++
+ /// Given a string \p first with length \p length, look for regex matches
+ /// starting at offset \p start. We must have 0 <= start <= length.
+ /// Search using the compiled regex represented by \p bytecode with the flags \p
+diff --git a/include/hermes/Regex/RegexAOT.h b/include/hermes/Regex/RegexAOT.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..d800b79c706f838927f23e918933faa48cc8ff81
+--- /dev/null
++++ b/include/hermes/Regex/RegexAOT.h
+@@ -0,0 +1,55 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++#ifndef HERMES_REGEX_REGEXAOT_H
++#define HERMES_REGEX_REGEXAOT_H
++
++#include <stdint.h>
++
++#define HERMES_REGEX_AOT_MAX_CAPTURES 8
++
++// Matchers are shared between translation units of one linked SH module. They
++// must not become exports merely because an embedding exports its runtime API.
++#if defined(__GNUC__) && !defined(_WIN32)
++#define HERMES_REGEX_AOT_HIDDEN __attribute__((visibility("hidden")))
++#else
++#define HERMES_REGEX_AOT_HIDDEN
++#endif
++
++/// Internal generated-C/runtime contract, not an embedding API. Input is
++/// borrowed ASCII or UTF-16, with code-unit offsets. No allocation, GC or VM
++/// reentry is permitted. On success, ranges contains start/end pairs for the
++/// whole match followed by every capture. Other outcomes leave no usable ranges.
++/// A fallback restarts the original interpreter search, including its resource
++/// checks; it must never be interpreted as no match.
++/// The typed executor adapter normalizes matchInputAllAscii to describe storage:
++/// set means 8-bit ASCII, clear means UTF-16, even if its contents are ASCII.
++enum HermesRegexAOTResult {
++  HermesRegexAOTFallback = -1,
++  HermesRegexAOTNoMatch = 0,
++  HermesRegexAOTMatch = 1,
++};
++
++typedef int32_t (*HermesRegexAOTMatcher)(
++    const void *input,
++    uint32_t length,
++    uint32_t start,
++    uint32_t matchFlags,
++    uint32_t *ranges);
++
++/// Guarded whole-operation lowering. A declined operation returns undefined
++/// without changing observable state; generated code executes the original IR.
++enum HermesRegexOperation {
++  HermesRegexTest,
++  HermesRegexTestIndexed,
++  HermesRegexReplaceEmpty,
++  HermesRegexLowerReplaceEmpty,
++  HermesRegexReplaceEmptyEqual,
++  HermesRegexLowerReplaceEmptyEqual,
++};
++
++#endif
+diff --git a/include/hermes/Regex/RegexBytecode.h b/include/hermes/Regex/RegexBytecode.h
+index c52c80f2f759fec28112b613a0e70f431f1c92e9..0f6171fc6c11a9239e201fc0f45486aadb5a5748 100644
+--- a/include/hermes/Regex/RegexBytecode.h
++++ b/include/hermes/Regex/RegexBytecode.h
+@@ -131,7 +131,8 @@ struct BracketInsn : public Insn {
+ };
+ 
+ /// BracketICaseInsn is a variant of BracketInsn used when the ignoreCase flag
+-/// is set. Character class tests (\w, \d, \s) canonicalize before matching.
++/// is set. Explicit ranges already contain their case equivalents. Character
++/// class tests (\w, \d, \s) canonicalize only in the Unicode variant.
+ struct BracketICaseInsn : public BracketInsn {};
+ 
+ /// U16BracketInsn is a variant of BracketInsn used in Unicode regular
+@@ -180,8 +181,8 @@ struct WordBoundaryICaseInsn : public Insn {
+ };
+ 
+ /// Begin/EndMarkedSubexpression stores the index of the marked subexpression.
+-/// Note that the first marked subexpression has index 1 (0 is reserved for
+-/// the entire match).
++/// Capture indexes are zero-based. The executor publishes the entire match
++/// separately, before these captures in the external result.
+ struct BeginMarkedSubexpressionInsn : public Insn {
+   uint16_t mexp;
+ };
+@@ -296,8 +297,21 @@ struct RegexBytecodeHeader {
+   MatchConstraintSet constraints;
+ };
+ 
++/// Immutable fixed-width matcher data. Each term is a BracketInsn and its
++/// ranges; the opcode is always Bracket and needs no runtime dispatch. This is
++/// auxiliary compiler/runtime data, not part of the HBC bytecode format.
++struct SimpleRegexHeader {
++  uint8_t termCount;
++  uint8_t anchoredAtStart;
++  uint8_t anchoredAtEnd;
++  MatchConstraintSet constraints;
++};
++
+ LLVM_PACKED_END;
+ 
++constexpr uint32_t kSimpleRegexMaxTerms = 16;
++constexpr uint32_t kSimpleRegexMaxRanges = 32;
++
+ /// OpcodeFor<Instruction>::value is the opcode for the Instruction.
+ template <typename Instruction>
+ struct OpcodeFor {};
+diff --git a/include/hermes/Regex/RegexSerialization.h b/include/hermes/Regex/RegexSerialization.h
+index 8e9721ceab42695a4df2533705742e059dd2163c..8c802eb0fbb9156e2e1b17fdec6be3e58b60cfdb 100644
+--- a/include/hermes/Regex/RegexSerialization.h
++++ b/include/hermes/Regex/RegexSerialization.h
+@@ -70,6 +70,16 @@ class CompiledRegExp {
+   /// \return regexp-specific bytecode for the receiver.
+   llvh::ArrayRef<uint8_t> getBytecode() const;
+ 
++  /// Compile bounded fixed-width literal/class matching data from validated
++  /// bytecode. Unsupported flags, syntax or size return None for interpreter
++  /// fallback. No source syntax is reparsed or approximated.
++  llvh::Optional<std::vector<uint8_t>> compileSimpleRegex() const;
++
++  /// Emit a bounded C matcher from validated bytecode. Unsupported control flow
++  /// or exceeded budgets select the interpreter. The caller supplies a valid C
++  /// identifier and retains the emitted function for the lifetime of its SHUnit.
++  llvh::Optional<std::string> compileAOTRegex(llvh::StringRef name) const;
++
+  private:
+   std::vector<uint8_t> bytecode_;
+   std::string pattern_;
+diff --git a/include/hermes/Regex/RegexTraits.h b/include/hermes/Regex/RegexTraits.h
+index 6f15ec9432fda1f92a2e5aad682534a1ee309146..9fd1ac8a85d6035c2234f45ec95d7df75676a153 100644
+--- a/include/hermes/Regex/RegexTraits.h
++++ b/include/hermes/Regex/RegexTraits.h
+@@ -17,8 +17,6 @@
+ #include "hermes/Platform/Unicode/PlatformUnicode.h"
+ #include "hermes/Regex/RegexBytecode.h"
+ #include "hermes/Regex/RegexTypes.h"
+-#include "llvh/ADT/DenseMap.h"
+-#include "llvh/ADT/Optional.h"
+ 
+ namespace hermes {
+ namespace regex {
+@@ -45,9 +43,6 @@ struct UTF16RegexTraits {
+   using CodeUnit = char16_t;
+ 
+  private:
+-  using CanonicalizeCache = llvh::SmallDenseMap<CodePoint, CodePoint, 16>;
+-  mutable CanonicalizeCache toUpperCache_;
+-
+   /// ES9 11.2
+   static bool isWhiteSpaceChar(CodePoint c) {
+     return c == u'\u0009' || c == u'\u000B' || c == u'\u000C' ||
+@@ -63,7 +58,7 @@ struct UTF16RegexTraits {
+ 
+  public:
+   /// \return whether the character \p c has the character type \p type.
+-  bool characterHasType(CodePoint c, regex::CharacterClass::Type type) const {
++  static bool characterHasType(CodePoint c, regex::CharacterClass::Type type) {
+     switch (type) {
+       case regex::CharacterClass::Digits:
+         return u'0' <= c && c <= u'9';
+@@ -98,10 +93,9 @@ struct UTF16RegexTraits {
+     return hermes::canonicalize(c, unicode);
+   }
+ 
+-  /// \return whether the character c is contained within the range [first,
+-  /// last]. If ICase is set, perform a canonicalizing membership test as
+-  /// specified in "CharacterSetMatcher" ES5.1 15.10.2.8.
+-  bool rangesContain(llvh::ArrayRef<BracketRange32> ranges, CodePoint c) const {
++  /// \return whether any range contains c. Case equivalence is expanded into
++  /// the ranges by the compiler, rather than canonicalized during membership.
++  static bool rangesContain(llvh::ArrayRef<BracketRange32> ranges, CodePoint c) {
+     return anyRangeContainsChar(ranges, c);
+   }
+ };
+@@ -112,7 +106,7 @@ struct ASCIIRegexTraits {
+   using CodePoint = uint8_t;
+   using CodeUnit = char;
+ 
+-  bool characterHasType(CodePoint c, regex::CharacterClass::Type type) const {
++  static bool characterHasType(CodePoint c, regex::CharacterClass::Type type) {
+     switch (type) {
+       case regex::CharacterClass::Digits:
+         return '0' <= c && c <= '9';
+@@ -148,7 +142,7 @@ struct ASCIIRegexTraits {
+ 
+   /// \return whether any of a list of ranges contains \p c.
+   /// Note that our ranges contain uint32_t, but we test chars for membership.
+-  bool rangesContain(llvh::ArrayRef<BracketRange32> ranges, char16_t c) const {
++  static bool rangesContain(llvh::ArrayRef<BracketRange32> ranges, char16_t c) {
+     return anyRangeContainsChar(ranges, c);
+   }
+ };
+diff --git a/include/hermes/Regex/RegexTypes.h b/include/hermes/Regex/RegexTypes.h
+index 23df2adf4841be5e33e40f90ba24bbac3e438c95..ed63d25b6c6e964f25a18faf6de01fc409e11fe9 100644
+--- a/include/hermes/Regex/RegexTypes.h
++++ b/include/hermes/Regex/RegexTypes.h
+@@ -35,6 +35,7 @@ enum MatchFlagType {
+   matchDefault = 0,
+ 
+   /// ^ anchors should not treat the input start as a line start.
++  /// Currently ignored by the bytecode executor and both specialization tiers.
+   matchNotBeginningOfLine = 1 << 0,
+ 
+   /// $ anchors should not treat the input end as a line end.
+diff --git a/include/hermes/VM/JSRegExp.h b/include/hermes/VM/JSRegExp.h
+index 9408798405009c8f67d48447edbad533267de32a..6c579c73e1ec716010ed0f3f93b85d85091ef223 100644
+--- a/include/hermes/VM/JSRegExp.h
++++ b/include/hermes/VM/JSRegExp.h
+@@ -9,6 +9,7 @@
+ #define HERMES_VM_JSREGEXP_H
+ 
+ #include "hermes/Regex/Regex.h"
++#include "hermes/Regex/RegexAOT.h"
+ #include "hermes/Regex/RegexTypes.h"
+ #include "hermes/VM/JSObject.h"
+ #include "hermes/VM/RegExpMatch.h"
+@@ -50,15 +51,27 @@ class JSRegExp final : public JSObject {
+       Runtime &runtime,
+       Handle<HiddenClass> arrayClass);
+ 
++  enum class BytecodeOwnership : uint8_t {
++    Copy,
++    // The caller retains immutable storage until the runtime is destroyed.
++    BorrowPersistent,
++  };
++
+   /// Initializes RegExp with existing bytecode. Populates fields for the
+   /// pattern and flags, but performs no validation on them. It is assumed that
+   /// the bytecode is correct and corresponds to the given pattern/flags.
++  /// A non-null simpleRegex is an equivalent immutable descriptor with the
++  /// same persistent lifetime; only BorrowPersistent may provide one.
++  /// aotMatcher is an alternative generated matcher with that same lifetime.
+   static void initialize(
+       Handle<JSRegExp> selfHandle,
+       Runtime &runtime,
+       Handle<StringPrimitive> pattern,
+       Handle<StringPrimitive> flags,
+-      llvh::ArrayRef<uint8_t> bytecode);
++      llvh::ArrayRef<uint8_t> bytecode,
++      BytecodeOwnership ownership,
++      const uint8_t *simpleRegex = nullptr,
++      HermesRegexAOTMatcher aotMatcher = nullptr);
+ 
+   /// Initialize a RegExp based on another RegExp \p otherHandle. If \p flags
+   /// matches the internal flags of the other RegExp, this lets us avoid
+@@ -136,8 +149,9 @@ class JSRegExp final : public JSObject {
+  private:
+   ~JSRegExp();
+ 
+-  /// Store a copy of the \p bytecode array.
+-  void initializeBytecode(llvh::ArrayRef<uint8_t> bytecode);
++  void initializeBytecode(
++      llvh::ArrayRef<uint8_t> bytecode,
++      BytecodeOwnership ownership);
+ 
+   static ExecutionStatus initializeGroupNameMappingObj(
+       Runtime &runtime,
+@@ -151,8 +165,13 @@ class JSRegExp final : public JSObject {
+   /// that the native pointer is always 8 byte aligned without extra padding.
+   GCPointer<StringPrimitive> pattern_;
+ 
+-  uint8_t *bytecode_{};
++  const uint8_t *bytecode_{};
++  // Optional bounded descriptor in the same persistent SH unit as the bytecode.
++  const uint8_t *simpleRegex_{};
++  // Generated code has the same persistent SHUnit lifetime as borrowed data.
++  HermesRegexAOTMatcher aotMatcher_{};
+   uint32_t bytecodeSize_{0};
++  BytecodeOwnership bytecodeOwnership_{BytecodeOwnership::Copy};
+ 
+   regex::SyntaxFlags syntaxFlags_ = {};
+ 
+diff --git a/include/hermes/VM/RuntimeHermesValueFields.def b/include/hermes/VM/RuntimeHermesValueFields.def
+index 42ca00073903029d96198bba0a56b3cdd54f7a06..ff69fbbf64ee82629b5477bb3bf3e5c5e84a64e4 100644
+--- a/include/hermes/VM/RuntimeHermesValueFields.def
++++ b/include/hermes/VM/RuntimeHermesValueFields.def
+@@ -73,7 +73,9 @@ RUNTIME_HV_FIELD(typedArrayBaseConstructor, NativeConstructor)
+ 
+ RUNTIME_HV_FIELD(regExpLastInput, StringPrimitive)
+ RUNTIME_HV_FIELD(strForSymbolNoDescription, StringPrimitive)
+-RUNTIME_HV_FIELD(regExpLastRegExp, JSRegExp)
++// A fused indexed test can retain one code unit instead of its source string.
++// Legacy getters materialize it on demand; ordinary matches clear this field.
++RUNTIME_HV_FIELD(regExpLastInputChar, HermesValue)
+ 
+ RUNTIME_HV_FIELD(throwTypeErrorAccessor, PropertyAccessor)
+ RUNTIME_HV_FIELD(arrayClass, HiddenClass)
+diff --git a/include/hermes/VM/static_h.h b/include/hermes/VM/static_h.h
+index 17368786772c03d1b8482dd738ce42a2d7277911..4d82bea4e29f90dea6a0bd0f5f0221b866758ebc 100644
+--- a/include/hermes/VM/static_h.h
++++ b/include/hermes/VM/static_h.h
+@@ -8,6 +8,7 @@
+ #ifndef HERMES_STATIC_H_H
+ #define HERMES_STATIC_H_H
+ 
++#include "hermes/Regex/RegexAOT.h"
+ #include "hermes/Support/MathFunctions.h"
+ #include "hermes/Support/sh_tryfast_fp_cvt.h"
+ #include "hermes/VM/sh_legacy_value.h"
+@@ -1406,6 +1407,33 @@ _sh_ljs_get_string(SHRuntime *shr, SHSymbolID symID);
+ SHERMES_EXPORT SHLegacyValue
+ _sh_ljs_create_regexp(SHRuntime *shr, SHSymbolID pattern, SHSymbolID flags);
+ 
++/// The bytecode must be immutable and remain alive until runtime destruction,
++/// as required of SHUnit data. The runtime borrows it without copying.
++SHERMES_EXPORT SHLegacyValue _sh_ljs_create_regexp_precompiled(
++    SHRuntime *shr,
++    SHSymbolID pattern,
++    SHSymbolID flags,
++    const uint8_t *bytecode,
++    uint32_t bytecode_size);
++
++/// Data and generated code must satisfy the persistent SHUnit lifetime.
++/// Exactly one specialization is non-null and must match the bytecode semantics.
++SHERMES_EXPORT SHLegacyValue _sh_ljs_create_regexp_specialized(
++    SHRuntime *shr,
++    SHSymbolID pattern,
++    SHSymbolID flags,
++    const uint8_t *bytecode,
++    uint32_t bytecode_size,
++    const uint8_t *simple_regex,
++    HermesRegexAOTMatcher aot_matcher);
++
++/// The descriptor has exactly one unanchored, non-Unicode code-unit term.
++/// Undefined declines without observable effects; all operands are rooted by
++/// the caller. The successful path cannot invoke user JavaScript.
++SHERMES_EXPORT SHLegacyValue _sh_ljs_try_fast_regexp(
++    SHRuntime *shr, const uint8_t *descriptor, uint32_t operation,
++    const SHLegacyValue *input, const SHLegacyValue *index);
++
+ /// \param value the string of the BigInt.
+ /// \param size  the size of the string \c value.
+ SHERMES_EXPORT SHLegacyValue
+diff --git a/lib/BCGen/HBC/ISel.cpp b/lib/BCGen/HBC/ISel.cpp
+index 790689261d81ffacbd6e3bb2bca467ad7bf56c89..6d339e318baa3468344700e116a64a6c8e920830 100644
+--- a/lib/BCGen/HBC/ISel.cpp
++++ b/lib/BCGen/HBC/ISel.cpp
+@@ -2530,6 +2530,11 @@ void HBCISel::generateEvalCompilationDataInst(
+   // Nothing to do, this is metadata.
+ }
+ 
++void HBCISel::generateLIRTryFastRegExpInst(
++    LIRTryFastRegExpInst *, BasicBlock *) {
++  llvm_unreachable("RegExp operation lowering is SH-only");
++}
++
+ void HBCISel::generateBB(BasicBlock *BB, BasicBlock *next) {
+   // Register the address of the current basic block.
+   auto begin_loc = BCFGen_->getCurrentLocation();
+diff --git a/lib/BCGen/SH/CMakeLists.txt b/lib/BCGen/SH/CMakeLists.txt
+index 08f09cb1ff6b09cf62add4d4be8a743865d530c7..7352a53b958f72f1704726183c7d9e263defc400 100644
+--- a/lib/BCGen/SH/CMakeLists.txt
++++ b/lib/BCGen/SH/CMakeLists.txt
+@@ -10,6 +10,7 @@ add_hermes_library(hermesSHBackend
+   RecreateCheapValues.cpp
+   LowerNanBoxedUnionNarrowT.cpp
+   PeepholeLowering.cpp
++  RegExpLowering.cpp
+   SH.cpp
+   SHRegAlloc.cpp SHRegAlloc.h
+   LineDirectiveEmitter.cpp LineDirectiveEmitter.h
+diff --git a/lib/BCGen/SH/LoadConstants.cpp b/lib/BCGen/SH/LoadConstants.cpp
+index 830215370bc9c94cb5d98b8cb8351a5a5bc83c18..924639373a12d94feb743baffc8688bfb68ff55a 100644
+--- a/lib/BCGen/SH/LoadConstants.cpp
++++ b/lib/BCGen/SH/LoadConstants.cpp
+@@ -121,6 +121,9 @@ bool operandMustBeLiteral(Instruction *Inst, unsigned opIndex) {
+   if (llvh::isa<CreateRegExpInst>(Inst))
+     return true;
+ 
++  if (llvh::isa<LIRTryFastRegExpInst>(Inst))
++    return opIndex <= LIRTryFastRegExpInst::OperationIdx;
++
+   if (auto *baseSwitchImm = llvh::dyn_cast<BaseSwitchImmInst>(Inst)) {
+     if (opIndex == BaseSwitchImmInst::SizeIdx ||
+         opIndex >= baseSwitchImm->getFirstCaseIdx())
+diff --git a/lib/BCGen/SH/LoweringPasses.h b/lib/BCGen/SH/LoweringPasses.h
+index 71be4079aa123457673d11cd8326e71211cd82ea..afe27425bb1e0c168953b8ce0b793ad499769286 100644
+--- a/lib/BCGen/SH/LoweringPasses.h
++++ b/lib/BCGen/SH/LoweringPasses.h
+@@ -33,6 +33,8 @@ Pass *createRecreateCheapValues(SHRegisterAllocator &RA);
+ 
+ /// Perform simple peephole lowering.
+ Pass *createPeepholeLowering(bool optimize);
++
++Pass *createRegExpLowering();
+ } // namespace hermes::sh
+ 
+ #endif
+diff --git a/lib/BCGen/SH/RegExpLowering.cpp b/lib/BCGen/SH/RegExpLowering.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..1be891b235b69407876b466d04d0fe2b78e0dd5d
+--- /dev/null
++++ b/lib/BCGen/SH/RegExpLowering.cpp
+@@ -0,0 +1,193 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++#include "LoweringPasses.h"
++#include "hermes/IR/Analysis.h"
++#include "hermes/IR/IRBuilder.h"
++#include "hermes/Optimizer/Scalar/Utils.h"
++#include "hermes/Regex/RegexAOT.h"
++#include "hermes/Regex/RegexBytecode.h"
++#include "hermes/Regex/RegexSerialization.h"
++#include "llvh/ADT/STLExtras.h"
++
++namespace hermes::sh {
++namespace {
++
++LoadPropertyInst *method(CallInst *call, llvh::StringRef name) {
++  if (!call || !llvh::isa<LiteralUndefined>(call->getNewTarget()))
++    return nullptr;
++  auto *load = llvh::dyn_cast<LoadPropertyInst>(call->getCallee());
++  auto *key = load ? llvh::dyn_cast<LiteralString>(load->getProperty()) : nullptr;
++  return key && key->getValue().str() == name &&
++          load->getObject() == call->getThis() && load->hasOneUser()
++      ? load : nullptr;
++}
++
++bool onlyUsers(Value *value, llvh::ArrayRef<Instruction *> allowed) {
++  for (auto *use : value->getUsers())
++    if (!llvh::is_contained(allowed, use))
++      return false;
++  return true;
++}
++
++// Every skipped instruction must belong to the recognized expression. This
++// deliberately excludes intervening coercions, getters and calls: resolving
++// test before argument effects and exec after them is observable JavaScript.
++bool exactRegion(llvh::ArrayRef<Instruction *> instructions) {
++  for (size_t i = 1; i < instructions.size(); ++i)
++    if (instructions[i - 1]->getNextNode() != instructions[i])
++      return false;
++  return true;
++}
++
++bool availableBefore(Value *value, Instruction *before) {
++  auto *inst = llvh::dyn_cast<Instruction>(value);
++  return !inst || DominanceInfo(before->getFunction())
++                     .properlyDominates(inst, before);
++}
++
++bool supportsCharacterOperation(CreateRegExpInst *regexp) {
++  if (regexp->getFlags()->getValue().str().contains('y'))
++    return false;
++  auto &compiled = regexp->getContext().getCompiledRegExp(
++      regexp->getPattern()->getValue().getUnderlyingPointer(),
++      regexp->getFlags()->getValue().getUnderlyingPointer());
++  auto simple = compiled.compileSimpleRegex();
++  if (!simple)
++    return false;
++  const auto *header =
++      reinterpret_cast<const regex::SimpleRegexHeader *>(simple->data());
++  return header->termCount == 1 && !header->anchoredAtStart &&
++      !header->anchoredAtEnd;
++}
++
++void replaceRegion(
++    Function *function, CreateRegExpInst *regexp,
++    llvh::ArrayRef<Instruction *> region, unsigned operation, Value *input,
++    Value *index) {
++  IRBuilder builder(function);
++  auto *first = region.front();
++  auto *last = region.back();
++  builder.setLocation(first->getLocation());
++  auto *before = first->getParent();
++  auto *slow = splitBasicBlock(before, first->getIterator());
++  auto *join = splitBasicBlock(slow, last->getNextNode()->getIterator());
++  builder.setInsertionBlock(before);
++  auto *fast = builder.createLIRTryFastRegExpInst(
++      regexp->getPattern(), regexp->getFlags(), operation, input, index);
++  auto *declined = builder.createTypeOfIsInst(
++      fast, builder.getLiteralTypeOfIsTypes(
++                TypeOfIsTypes{}.withUndefined(true)));
++  builder.createCondBranchInst(declined, slow, join);
++  builder.setInsertionBlock(slow);
++  builder.createBranchInst(join);
++  builder.setInsertionPoint(&join->front());
++  auto *result = builder.createPhiInst();
++  last->replaceAllUsesWith(result);
++  result->addEntry(last, slow);
++  result->addEntry(fast, before);
++}
++
++bool lowerTest(Function *function, CallInst *call) {
++  auto *load = method(call, "test");
++  auto *regexp = llvh::dyn_cast<CreateRegExpInst>(call->getThis());
++  if (!load || !regexp || call->getNumArguments() != 2 ||
++      !onlyUsers(regexp, {load, call}) || !supportsCharacterOperation(regexp))
++    return false;
++  IRBuilder builder(function);
++  auto *input = call->getArgument(1);
++  auto *index = llvh::dyn_cast<LoadPropertyInst>(input);
++  if (index && index->hasOneUser()) {
++    llvh::SmallVector<Instruction *, 4> region;
++    // Both source orders occur after inlining. The runtime admits only own
++    // in-bounds string indices, so the fast path cannot invoke a prototype.
++    if (index->getNextNode() == regexp)
++      region = {index, regexp, load, call};
++    else
++      region = {regexp, load, index, call};
++    if (exactRegion(region) && availableBefore(index->getObject(), region[0]) &&
++        availableBefore(index->getProperty(), region[0])) {
++      replaceRegion(function, regexp, region, HermesRegexTestIndexed,
++                    index->getObject(), index->getProperty());
++      return true;
++    }
++  }
++  if (!exactRegion({regexp, load, call}) || !availableBefore(input, regexp))
++    return false;
++  replaceRegion(function, regexp, {regexp, load, call}, HermesRegexTest,
++                input, builder.getLiteralUndefined());
++  return true;
++}
++
++bool lowerReplace(Function *function, CallInst *call) {
++  auto *load = method(call, "replace");
++  if (!load || call->getNumArguments() != 3)
++    return false;
++  auto *regexp = llvh::dyn_cast<CreateRegExpInst>(call->getArgument(1));
++  auto *replacement = llvh::dyn_cast<LiteralString>(call->getArgument(2));
++  if (!regexp || !regexp->hasOneUser() || !replacement ||
++      !replacement->getValue().str().empty() ||
++      !regexp->getFlags()->getValue().str().contains('g') ||
++      regexp->getFlags()->getValue().str().contains('y') ||
++      !supportsCharacterOperation(regexp))
++    return false;
++
++  Value *input = call->getThis();
++  llvh::SmallVector<Instruction *, 6> region{load, regexp, call};
++  unsigned operation = HermesRegexReplaceEmpty;
++  auto *lower = llvh::dyn_cast<CallInst>(input);
++  auto *lowerMethod = method(lower, "toLowerCase");
++  if (lowerMethod && lower->getNumArguments() == 1 &&
++      onlyUsers(lower, {load, call}) &&
++      exactRegion({lowerMethod, lower, load, regexp, call})) {
++    region.insert(region.begin(), {lowerMethod, lower});
++    input = lower->getThis();
++    operation = HermesRegexLowerReplaceEmpty;
++  }
++  if (!exactRegion(region) || !availableBefore(input, region.front()))
++    return false;
++
++  // An equality consumer needs neither the filtered string nor an early-exit
++  // scan: the final successful match still determines the legacy RegExp state.
++  auto *comparison = llvh::dyn_cast<BinaryOperatorInst>(call->getNextNode());
++  if (comparison && call->hasOneUser() &&
++      comparison->getKind() == ValueKind::BinaryStrictlyEqualInstKind &&
++      ((comparison->getLeftHandSide() == call &&
++        comparison->getRightHandSide() == input) ||
++       (comparison->getRightHandSide() == call &&
++        comparison->getLeftHandSide() == input))) {
++    region.push_back(comparison);
++    operation = operation == HermesRegexLowerReplaceEmpty
++        ? HermesRegexLowerReplaceEmptyEqual : HermesRegexReplaceEmptyEqual;
++  }
++  IRBuilder builder(function);
++  replaceRegion(function, regexp, region, operation, input,
++                builder.getLiteralUndefined());
++  return true;
++}
++
++class RegExpLowering : public FunctionPass {
++ public:
++  RegExpLowering() : FunctionPass("RegExpLowering") {}
++  bool runOnFunction(Function *function) override {
++    llvh::SmallVector<CallInst *, 16> calls;
++    for (auto &block : *function)
++      for (auto &inst : block)
++        if (auto *call = llvh::dyn_cast<CallInst>(&inst))
++          calls.push_back(call);
++    bool changed = false;
++    for (auto *call : calls)
++      changed |= lowerTest(function, call) || lowerReplace(function, call);
++    return changed;
++  }
++};
++} // namespace
++
++Pass *createRegExpLowering() {
++  return new RegExpLowering();
++}
++} // namespace hermes::sh
+diff --git a/lib/BCGen/SH/SH.cpp b/lib/BCGen/SH/SH.cpp
+index 45b5c5114bc485945a1f4b54e81320ed9a0b5c38..c60550fd97c497864ed78a0ec94969f93ea7c5da 100644
+--- a/lib/BCGen/SH/SH.cpp
++++ b/lib/BCGen/SH/SH.cpp
+@@ -511,6 +511,13 @@ class SHNativeJSFunctionTable {
+ struct ModuleGen {
+   uint32_t nextComputedReadCacheIdx{0};
+   uint32_t nextComputedWriteCacheIdx{0};
++  /// Bound auxiliary regex data even for modules with many literal sites.
++  static constexpr size_t kSimpleRegexModuleBudget = 64 * 1024;
++  size_t simpleRegexBytes{0};
++  /// Each compiled regexp is analyzed once, including rejected patterns. The
++  /// generation limits are shared by ordinary output and all bundle shards.
++  llvh::DenseMap<CompiledRegExp *, std::string> aotRegexNames;
++  std::string aotRegexSource;
+   /// Table containing uniqued strings for the current module.
+   SHStringTable stringTable{};
+ 
+@@ -1928,36 +1935,106 @@ class InstrGen {
+   void generateDebuggerInst(DebuggerInst &inst) {
+     hermes_fatal("DebuggerInst should have been deleted.");
+   }
+-  void generateCreateRegExpInst(CreateRegExpInst &inst) {
+-    os_.indent(2);
++  void generateLIRTryFastRegExpInst(LIRTryFastRegExpInst &inst) {
++    auto &regexp = F_.getContext().getCompiledRegExp(
++        inst.getPattern()->getValue().getUnderlyingPointer(),
++        inst.getFlags()->getValue().getUnderlyingPointer());
++    auto descriptor = regexp.compileSimpleRegex();
++    assert(descriptor && "Lowering must prove the descriptor shape");
++    if (descriptor->size() >
++        ModuleGen::kSimpleRegexModuleBudget - moduleGen_.simpleRegexBytes) {
++      // Keep the existing module data bound, including outlined fragments.
++      // Undefined selects the original expression already retained in the IR.
++      os_ << "  ";
++      generateValue(inst);
++      os_ << " = _sh_ljs_undefined();\n";
++      return;
++    }
++    moduleGen_.simpleRegexBytes += descriptor->size();
++    os_ << "  {\n    static const uint8_t regexp_term[] = {";
++    for (uint8_t byte : *descriptor)
++      os_ << (unsigned)byte << ',';
++    os_ << "};\n    ";
++    generateValue(inst);
++    os_ << " = _sh_ljs_try_fast_regexp(shr, regexp_term, "
++        << inst.getOperation() << ", ";
++    generateRegisterPtr(*inst.getInput());
++    os_ << ", ";
++    generateRegisterPtr(*inst.getIndex());
++    os_ << ");\n  }\n";
++  }
+ 
++  void generateCreateRegExpInst(CreateRegExpInst &inst) {
+     uint32_t patternStrID =
+         moduleGen_.stringTable.add(inst.getPattern()->getValue().str());
+     uint32_t flagsStrID =
+         moduleGen_.stringTable.add(inst.getFlags()->getValue().str());
+-
+-    // Compile the regexp. We expect this to succeed because the AST went
+-    // through the SemanticValidator. This is a bit of a hack: what we would
+-    // really like to do is have the Parser emit a CompiledRegExp that can be
+-    // threaded through the AST and then through the IR to this instruction
+-    // selection, but that is too awkward, so we compile again here.
+-    // uint32_t reBytecodeID = UINT32_MAX;
+-    // if (auto regexp = CompiledRegExp::tryCompile(
+-    //         inst.getPattern()->getValue().str(),
+-    //         inst.getFlags()->getValue().str())) {
+-    //   reBytecodeID = moduleGen_.regexpTable.addRegExp(std::move(*regexp));
+-    // }
+-
+-    // TODO(T132343328): Compile the regexp bytecode ahead of time.
++    auto &regexp = F_.getContext().getCompiledRegExp(
++        inst.getPattern()->getValue().getUnderlyingPointer(),
++        inst.getFlags()->getValue().getUnderlyingPointer());
++
++    // Keep literal data with the instruction so ordinary C output, bundles and
++    // outlined fragments share the same path. IRGen separately initializes named
++    // capture groups. Runtime evaluation must still allocate a fresh RegExp.
++    os_ << "  {\n    static const uint8_t regexp_bytecode[] = {";
++    for (uint8_t byte : regexp.getBytecode())
++      os_ << (unsigned)byte << ',';
++    os_ << "};\n";
++    constexpr size_t kAOTRegexModuleBudget = 512 * 1024;
++    constexpr size_t kAOTRegexAnalysisLimit = 256;
++    auto aot = moduleGen_.aotRegexNames.find(&regexp);
++    if (aot == moduleGen_.aotRegexNames.end() &&
++        moduleGen_.aotRegexNames.size() < kAOTRegexAnalysisLimit &&
++        moduleGen_.aotRegexSource.size() < kAOTRegexModuleBudget) {
++      std::string name =
++          ("sh_regex_" + options_.unitName + "_" +
++           std::to_string(moduleGen_.aotRegexNames.size())).str();
++      auto source = regexp.compileAOTRegex(name);
++      if (source &&
++          source->size() <=
++              kAOTRegexModuleBudget - moduleGen_.aotRegexSource.size()) {
++        moduleGen_.aotRegexSource += *source;
++      } else {
++        name.clear();
++      }
++      aot = moduleGen_.aotRegexNames.insert({&regexp, std::move(name)}).first;
++    }
++    const bool hasAOT =
++        aot != moduleGen_.aotRegexNames.end() && !aot->second.empty();
++    auto simpleRegex = hasAOT ? llvh::None : regexp.compileSimpleRegex();
++    if (simpleRegex &&
++        simpleRegex->size() >
++            ModuleGen::kSimpleRegexModuleBudget - moduleGen_.simpleRegexBytes)
++      simpleRegex = llvh::None;
++    if (simpleRegex) {
++      moduleGen_.simpleRegexBytes += simpleRegex->size();
++      os_ << "    static const uint8_t regexp_simple[] = {";
++      for (uint8_t byte : *simpleRegex)
++        os_ << (unsigned)byte << ',';
++      os_ << "};\n";
++    }
++    if (hasAOT) {
++      // Block declarations work in outlined instruction fragments too. Bodies
++      // are emitted once in unit data, linked into the same native/Wasm module.
++      os_ << "    extern HERMES_REGEX_AOT_HIDDEN int32_t " << aot->second
++          << "(const void *, uint32_t, uint32_t, uint32_t, uint32_t *);\n";
++    }
++    os_ << "    ";
+     generateValue(inst);
+-    os_ << " = ";
+-    os_ << "_sh_ljs_create_regexp(shr, ";
++    os_ << " = " << ((simpleRegex || hasAOT)
++                        ? "_sh_ljs_create_regexp_specialized(shr, "
++                        : "_sh_ljs_create_regexp_precompiled(shr, ");
+     os_ << (options_.emitCBundle ? "shUnit->symbols[" : "get_symbols(shUnit)[")
+         << patternStrID << ']';
+     os_ << ", ";
+     os_ << (options_.emitCBundle ? "shUnit->symbols[" : "get_symbols(shUnit)[")
+         << flagsStrID << ']';
+-    os_ << ");\n";
++    os_ << ", regexp_bytecode, sizeof(regexp_bytecode)";
++    if (simpleRegex)
++      os_ << ", regexp_simple, NULL";
++    else if (hasAOT)
++      os_ << ", NULL, " << aot->second;
++    os_ << ");\n  }\n";
+   }
+   void generateTryEndInst(TryEndInst &inst) {
+     // Restore the tryState to the state of the Try enclosing the catch.
+@@ -2809,6 +2886,8 @@ bool lowerModuleIR(Module *M, bool optimize) {
+   // needs to run before LowerBuiltinCalls because it introduces calls to
+   // HermesInternal.
+   PM.addPass(sh::createPeepholeLowering(optimize));
++  if (optimize)
++    PM.addPass(sh::createRegExpLowering());
+   // LowerBuiltinCalls needs to run before the rest of the lowering.
+   PM.addPass(createLowerBuiltinCalls());
+   PM.addPass(new LowerNumericProperties());
+@@ -3237,6 +3316,7 @@ void generateUnitData(
+     uint32_t nextReadCacheIdx,
+     uint32_t nextPrivateNameCacheIdx,
+     const BytecodeGenerationOptions &options) {
++  OS << moduleGen.aotRegexSource;
+   if (options.emitCBundle) {
+     OS << "SH_BUNDLE_HIDDEN uint32_t ";
+     moduleGen.nativeFunctionTable.generateUnitIndexLabel(OS);
+diff --git a/lib/IR/IRBuilder.cpp b/lib/IR/IRBuilder.cpp
+index 5bbfd8e149ee725a81d90b34fde8d9f56cc57d09..234e5a0ad6190ec496bf7bcf39b7dcd497b21e95 100644
+--- a/lib/IR/IRBuilder.cpp
++++ b/lib/IR/IRBuilder.cpp
+@@ -876,6 +876,15 @@ CreateRegExpInst *IRBuilder::createRegExpInst(
+   return res;
+ }
+ 
++LIRTryFastRegExpInst *IRBuilder::createLIRTryFastRegExpInst(
++    LiteralString *pattern, LiteralString *flags, unsigned operation,
++    Value *input, Value *index) {
++  auto *inst = new LIRTryFastRegExpInst(
++      pattern, flags, getLiteralNumber(operation), input, index);
++  insert(inst);
++  return inst;
++}
++
+ TypeOfInst *IRBuilder::createTypeOfInst(Value *input) {
+   auto *inst = new TypeOfInst(input);
+   insert(inst);
+diff --git a/lib/IR/IRVerifier.cpp b/lib/IR/IRVerifier.cpp
+index e3b6c96e53e62073b07108ca133df23569801ef0..b5d2573fbb2873c53857e63e93e0e5438fae7534 100644
+--- a/lib/IR/IRVerifier.cpp
++++ b/lib/IR/IRVerifier.cpp
+@@ -1806,6 +1806,14 @@ bool Verifier::visitLIRDeadValueInst(const LIRDeadValueInst &Inst) {
+   return true;
+ }
+ 
++bool Verifier::visitLIRTryFastRegExpInst(const LIRTryFastRegExpInst &Inst) {
++  Assert(Inst.getNumOperands() == 5, "Invalid regexp operation operands");
++  Assert(llvh::isa<LiteralString>(Inst.getOperand(0)), "Expected pattern");
++  Assert(llvh::isa<LiteralString>(Inst.getOperand(1)), "Expected flags");
++  Assert(llvh::isa<LiteralNumber>(Inst.getOperand(2)), "Expected operation");
++  return true;
++}
++
+ bool Verifier::visitNativeCallInst(const hermes::NativeCallInst &Inst) {
+   // FIXM: this should be added when types are propagated.
+   //  Assert(
+diff --git a/lib/Platform/Unicode/CharacterProperties.cpp b/lib/Platform/Unicode/CharacterProperties.cpp
+index 436938927766c1632b583b7786c44e6553a694fc..3ddd8ca28d0d2866ab4366a5ae5339c657ade1d9 100644
+--- a/lib/Platform/Unicode/CharacterProperties.cpp
++++ b/lib/Platform/Unicode/CharacterProperties.cpp
+@@ -9,6 +9,7 @@
+ #include "hermes/Platform/Unicode/CodePointSet.h"
+ 
+ #include <algorithm>
++#include <array>
+ #include <climits>
+ #include <iterator>
+ #include <string>
+@@ -166,6 +167,36 @@ static bool operator<(const UnicodeTransformRange &m, uint32_t cp) {
+   return m.start + m.count <= cp;
+ }
+ 
++struct TransformPage {
++  uint16_t begin;
++  uint16_t end;
++};
++
++template <const auto &Ranges>
++static constexpr auto indexTransformPages() {
++  constexpr size_t size = std::size(Ranges);
++  static_assert(size <= UINT16_MAX, "transform indices must fit in a page");
++  constexpr size_t pageCount =
++      (Ranges[size - 1].start + Ranges[size - 1].count + 255) / 256;
++  std::array<TransformPage, pageCount> pages{};
++  size_t begin = 0;
++  for (size_t page = 0; page < pageCount; ++page) {
++    while (begin < size &&
++           Ranges[begin].start + Ranges[begin].count <= page * 256)
++      ++begin;
++    size_t end = begin;
++    while (end < size && Ranges[end].start < (page + 1) * 256)
++      ++end;
++    pages[page] = {static_cast<uint16_t>(begin), static_cast<uint16_t>(end)};
++  }
++  return pages;
++}
++
++// Retain ranges crossing a page boundary in both pages. Empty pages require
++// no search, and supplementary planes after the last transform need no table.
++static constexpr auto unicodeFoldPages = indexTransformPages<UNICODE_FOLDS>();
++static constexpr auto legacyCanonPages = indexTransformPages<LEGACY_CANONS>();
++
+ /// Find all code points which canonicalize to a value in \p range, and add them
+ /// to \p receiver. This is a slow linear search across all ranges.
+ static void addPrecanonicalCharacters(
+@@ -250,9 +281,16 @@ CodePointSet makeCanonicallyEquivalent(const CodePointSet &set, bool unicode) {
+ }
+ 
+ uint32_t canonicalize(uint32_t cp, bool unicode) {
+-  const auto start =
++  const auto table =
+       unicode ? std::begin(UNICODE_FOLDS) : std::begin(LEGACY_CANONS);
+-  const auto end = unicode ? std::end(UNICODE_FOLDS) : std::end(LEGACY_CANONS);
++  const auto *pages = unicode ? unicodeFoldPages.data() : legacyCanonPages.data();
++  const size_t pageCount =
++      unicode ? unicodeFoldPages.size() : legacyCanonPages.size();
++  if ((cp >> 8) >= pageCount)
++    return cp;
++  const auto page = pages[cp >> 8];
++  const auto start = table + page.begin;
++  const auto end = table + page.end;
+   auto where = std::lower_bound(start, end, cp);
+   if (where != end && where->start <= cp && cp < where->start + where->count) {
+     return applyTransform(*where, cp);
+diff --git a/lib/Platform/Unicode/UnicodeCaseConversion.cpp b/lib/Platform/Unicode/UnicodeCaseConversion.cpp
+index 8481f4f0895d0afbc2d731ac489755555ce21d81..446a54dc4a217203db7bf33f3a41f3bf42ed07b9 100644
+--- a/lib/Platform/Unicode/UnicodeCaseConversion.cpp
++++ b/lib/Platform/Unicode/UnicodeCaseConversion.cpp
+@@ -316,6 +316,18 @@ void convertCodePoint(
+ 
+ } // namespace
+ 
++bool isUnchangedLowercaseCodeUnit(char16_t character) {
++  if (character < 128)
++    return character < 'A' || character > 'Z';
++  if (character >= 0xD800 && character <= 0xDFFF)
++    return false;
++  // Final_Sigma is the only contextual root-lowercase rule and its source
++  // already changes in TO_LOWER_DELTAS. Full mappings must not be approximated
++  // by simple case folding (notably U+0130, which expands).
++  return !findFull(FULL_LOWER, character) &&
++      applyDelta(TO_LOWER_DELTAS, character) == character;
++}
++
+ void convertCaseUTF16(
+     llvh::SmallVectorImpl<char16_t> &buf,
+     CaseConversion targetCase,
+diff --git a/lib/Regex/CMakeLists.txt b/lib/Regex/CMakeLists.txt
+index 247aa379db49f202a19f8b513e7094764ea4c4e8..4c34600d9f46b306f250ce3f9c1a8069eabab4aa 100644
+--- a/lib/Regex/CMakeLists.txt
++++ b/lib/Regex/CMakeLists.txt
+@@ -6,6 +6,7 @@
+ set(source_files
+   RegexParser.cpp
+   RegexSerialization.cpp
++  RegexAOT.cpp
+   Executor.cpp
+ )
+ 
+diff --git a/lib/Regex/Executor.cpp b/lib/Regex/Executor.cpp
+index 46f8fa5b6e30e232e583a1acf96f3918da8b2c2c..5f40e6202fcebced341b6715f0d862ba79d2eab1 100644
+--- a/lib/Regex/Executor.cpp
++++ b/lib/Regex/Executor.cpp
+@@ -721,12 +721,11 @@ bool matchBackRef(
+ /// in \p insn.
+ template <class Traits>
+ bool bracketMatchesChar(
+-    const Context<Traits> &ctx,
++    bool unicode,
+     const BracketInsn *insn,
+     const BracketRange32 *ranges,
+     typename Traits::CodePoint ch,
+     bool icase) {
+-  const auto &traits = ctx.traits_;
+   // Note that if the bracket is negated /[^abc]/, we want to return true if we
+   // do not match, false if we do. Implement this by xor with the negate flag.
+ 
+@@ -736,23 +735,22 @@ bool bracketMatchesChar(
+   // /iu must match any character whose canonical form is a word character
+   // (e.g. U+212A KELVIN SIGN canonicalizes to 'k').
+   if (insn->positiveCharClasses || insn->negativeCharClasses) {
+-    auto testCh =
+-        icase && ctx.syntaxFlags_.unicode ? Traits::canonicalize(ch, true) : ch;
++    auto testCh = icase && unicode ? Traits::canonicalize(ch, true) : ch;
+     for (auto charClass :
+          {CharacterClass::Digits,
+           CharacterClass::Spaces,
+           CharacterClass::Words}) {
+       if ((insn->positiveCharClasses & charClass) &&
+-          traits.characterHasType(testCh, charClass))
++          Traits::characterHasType(testCh, charClass))
+         return true ^ insn->negate;
+       if ((insn->negativeCharClasses & charClass) &&
+-          !traits.characterHasType(testCh, charClass))
++          !Traits::characterHasType(testCh, charClass))
+         return true ^ insn->negate;
+     }
+   }
+ 
+   bool contained =
+-      traits.rangesContain(llvh::makeArrayRef(ranges, insn->rangeCount), ch);
++      Traits::rangesContain(llvh::makeArrayRef(ranges, insn->rangeCount), ch);
+   return contained ^ insn->negate;
+ }
+ 
+@@ -917,7 +915,8 @@ bool Context<Traits>::matchWidth1(const Insn *base, CodeUnit c) const {
+       const BracketInsn *insn = llvh::cast<BracketInsn>(base);
+       const BracketRange32 *ranges =
+           reinterpret_cast<const BracketRange32 *>(insn + 1);
+-      return bracketMatchesChar<Traits>(*this, insn, ranges, c, false);
++      return bracketMatchesChar<Traits>(
++          syntaxFlags_.unicode, insn, ranges, c, false);
+     }
+ 
+     case Width1Opcode::BracketICase: {
+@@ -927,7 +926,8 @@ bool Context<Traits>::matchWidth1(const Insn *base, CodeUnit c) const {
+       const BracketICaseInsn *insn = llvh::cast<BracketICaseInsn>(base);
+       const BracketRange32 *ranges =
+           reinterpret_cast<const BracketRange32 *>(insn + 1);
+-      return bracketMatchesChar<Traits>(*this, insn, ranges, c, true);
++      return bracketMatchesChar<Traits>(
++          syntaxFlags_.unicode, insn, ranges, c, true);
+     }
+   }
+   llvm_unreachable("Invalid width 1 opcode");
+@@ -1302,7 +1302,11 @@ auto Context<Traits>::match(State<Traits> *s, bool onlyAtStart)
+               reinterpret_cast<const BracketRange32 *>(insn + 1);
+           if (c.atEnd() ||
+               !bracketMatchesChar<Traits>(
+-                  *this, insn, ranges, c.consumeUTF16(), false))
++                  syntaxFlags_.unicode,
++                  insn,
++                  ranges,
++                  c.consumeUTF16(),
++                  false))
+             BACKTRACK();
+           s->ip_ += insn->totalWidth();
+           break;
+@@ -1314,7 +1318,11 @@ auto Context<Traits>::match(State<Traits> *s, bool onlyAtStart)
+               reinterpret_cast<const BracketRange32 *>(insn + 1);
+           if (c.atEnd() ||
+               !bracketMatchesChar<Traits>(
+-                  *this, insn, ranges, c.consumeUTF16(), true))
++                  syntaxFlags_.unicode,
++                  insn,
++                  ranges,
++                  c.consumeUTF16(),
++                  true))
+             BACKTRACK();
+           s->ip_ += insn->totalWidth();
+           break;
+@@ -1623,6 +1631,178 @@ auto Context<Traits>::match(State<Traits> *s, bool onlyAtStart)
+   return nullptr;
+ }
+ 
++template <typename CharT, class Traits>
++static MatchRuntimeResult searchWithAOTRegexImpl(
++    HermesRegexAOTMatcher matcher,
++    llvh::ArrayRef<uint8_t> bytecode,
++    const CharT *first,
++    uint32_t start,
++    uint32_t length,
++    CaptureRangeSink captures,
++    constants::MatchFlagType matchFlags,
++    StackOverflowGuard guard) {
++  const auto *header =
++      reinterpret_cast<const RegexBytecodeHeader *>(bytecode.data());
++  assert(start <= length && "Search start exceeds input length");
++  assert(header->markedCount <= HERMES_REGEX_AOT_MAX_CAPTURES);
++  Cursor<Traits> cursor{first, first + start, first + length, true};
++  if (!cursor.satisfiesConstraints(matchFlags, header->constraints))
++    return MatchRuntimeResult::NoMatch;
++  {
++#ifndef HERMES_CHECK_NATIVE_STACK
++    StackOverflowGuard::CallFrameRAII frame{guard};
++#endif
++    if (guard.isOverflowing())
++      return MatchRuntimeResult::StackOverflow;
++    uint32_t ranges[2 * (HERMES_REGEX_AOT_MAX_CAPTURES + 1)];
++    // The public flag is a content hint, including for UTF-16 input. The C
++    // matcher uses it to select storage width, which only this overload knows.
++    // Preserve the caller's flags for constraints and an interpreter restart.
++    const auto matcherFlags = sizeof(CharT) == 1
++        ? matchFlags | constants::matchInputAllAscii
++        : matchFlags & ~constants::matchInputAllAscii;
++    const int32_t result = matcher(first, length, start, matcherFlags, ranges);
++    if (result == HermesRegexAOTMatch) {
++      CapturedRange groups[HERMES_REGEX_AOT_MAX_CAPTURES];
++      for (uint32_t i = 0; i < header->markedCount; ++i)
++        groups[i] = {ranges[2 * (i + 1)], ranges[2 * (i + 1) + 1]};
++      if (captures)
++        captures({ranges[0], ranges[1]}, {groups, header->markedCount});
++      return MatchRuntimeResult::Match;
++    }
++    if (result == HermesRegexAOTNoMatch)
++      return MatchRuntimeResult::NoMatch;
++    if (result != HermesRegexAOTFallback)
++      llvm_unreachable("Invalid generated matcher result");
++  }
++  // No VM state has been published. Leave the AOT stack frame before restarting
++  // so the original interpreter retains its stack and backtrack error behavior.
++  return searchWithBytecode(
++      bytecode, first, start, length, captures, matchFlags, guard);
++}
++
++MatchRuntimeResult searchWithAOTRegex(
++    HermesRegexAOTMatcher matcher,
++    llvh::ArrayRef<uint8_t> bytecode,
++    const char *first,
++    uint32_t start,
++    uint32_t length,
++    CaptureRangeSink captures,
++    constants::MatchFlagType matchFlags,
++    StackOverflowGuard guard) {
++  return searchWithAOTRegexImpl<char, ASCIIRegexTraits>(
++      matcher, bytecode, first, start, length, captures, matchFlags, guard);
++}
++
++MatchRuntimeResult searchWithAOTRegex(
++    HermesRegexAOTMatcher matcher,
++    llvh::ArrayRef<uint8_t> bytecode,
++    const char16_t *first,
++    uint32_t start,
++    uint32_t length,
++    CaptureRangeSink captures,
++    constants::MatchFlagType matchFlags,
++    StackOverflowGuard guard) {
++  return searchWithAOTRegexImpl<char16_t, UTF16RegexTraits>(
++      matcher, bytecode, first, start, length, captures, matchFlags, guard);
++}
++
++bool matchSimpleRegexCharacter(const uint8_t *descriptor, char16_t character) {
++  const auto *header = reinterpret_cast<const SimpleRegexHeader *>(descriptor);
++  assert(header->termCount == 1 && !header->anchoredAtStart &&
++         !header->anchoredAtEnd);
++  const auto *term = reinterpret_cast<const BracketInsn *>(header + 1);
++  return bracketMatchesChar<UTF16RegexTraits>(
++      false, term, reinterpret_cast<const BracketRange32 *>(term + 1),
++      character, false);
++}
++
++template <typename CharT, class Traits>
++static MatchRuntimeResult searchWithSimpleRegexImpl(
++    const uint8_t *descriptor,
++    const CharT *first,
++    uint32_t start,
++    uint32_t length,
++    CaptureRangeSink captures,
++    constants::MatchFlagType matchFlags,
++    StackOverflowGuard guard) {
++  const auto *header = reinterpret_cast<const SimpleRegexHeader *>(descriptor);
++  assert(header->termCount && header->termCount <= kSimpleRegexMaxTerms);
++  assert(start <= length && "Search start exceeds input length");
++  // Match the interpreter's ordering: constraints can reject before entering
++  // the matcher, but failed match attempts must still report stack overflow.
++  if (((header->constraints & MatchConstraintNonASCII) &&
++       (matchFlags & constants::matchInputAllAscii)) ||
++      (header->anchoredAtStart && start != 0))
++    return MatchRuntimeResult::NoMatch;
++#ifndef HERMES_CHECK_NATIVE_STACK
++  StackOverflowGuard::CallFrameRAII frame{guard};
++#endif
++  if (guard.isOverflowing())
++    return MatchRuntimeResult::StackOverflow;
++  if (header->termCount > length - start)
++    return MatchRuntimeResult::NoMatch;
++
++  const bool sticky = matchFlags & constants::matchOnlyAtStart;
++  const uint32_t last = length - header->termCount;
++  if (header->anchoredAtEnd) {
++    if ((matchFlags & constants::matchNotEndOfLine) ||
++        ((sticky || header->anchoredAtStart) && start != last))
++      return MatchRuntimeResult::NoMatch;
++    start = last;
++  }
++  const bool onlyAtStart =
++      sticky || header->anchoredAtStart || header->anchoredAtEnd;
++
++  // All terms consume exactly one code unit. The length bound makes every
++  // input read valid, and ascending candidates preserve leftmost-first matches.
++  // Class membership shares the interpreter's tables, including JS whitespace.
++  for (uint32_t pos = start; pos <= last; ++pos) {
++    const uint8_t *termData = descriptor + sizeof(*header);
++    uint32_t termIndex = 0;
++    for (; termIndex < header->termCount; ++termIndex) {
++      const auto *term = reinterpret_cast<const BracketInsn *>(termData);
++      const auto *ranges = reinterpret_cast<const BracketRange32 *>(term + 1);
++      if (!bracketMatchesChar<Traits>(
++              false, term, ranges, first[pos + termIndex], false))
++        break;
++      termData += term->totalWidth();
++    }
++    if (termIndex == header->termCount) {
++      if (captures)
++        captures(CapturedRange{pos, pos + header->termCount}, {});
++      return MatchRuntimeResult::Match;
++    }
++    if (onlyAtStart)
++      break;
++  }
++  return MatchRuntimeResult::NoMatch;
++}
++
++MatchRuntimeResult searchWithSimpleRegex(
++    const uint8_t *descriptor,
++    const char16_t *first,
++    uint32_t start,
++    uint32_t length,
++    CaptureRangeSink captures,
++    constants::MatchFlagType matchFlags,
++    StackOverflowGuard guard) {
++  return searchWithSimpleRegexImpl<char16_t, UTF16RegexTraits>(
++      descriptor, first, start, length, captures, matchFlags, guard);
++}
++
++MatchRuntimeResult searchWithSimpleRegex(
++    const uint8_t *descriptor,
++    const char *first,
++    uint32_t start,
++    uint32_t length,
++    CaptureRangeSink captures,
++    constants::MatchFlagType matchFlags,
++    StackOverflowGuard guard) {
++  return searchWithSimpleRegexImpl<char, ASCIIRegexTraits>(
++      descriptor, first, start, length, captures, matchFlags, guard);
++}
++
+ /// Entry point for searching a string via regex compiled bytecode.
+ /// Given the bytecode \p bytecode, search the range starting at \p first up to
+ /// (not including) \p last with the flags \p matchFlags. If the search
+@@ -1635,7 +1815,7 @@ MatchRuntimeResult searchWithBytecodeImpl(
+     const CharT *first,
+     uint32_t start,
+     uint32_t length,
+-    std::vector<CapturedRange> *m,
++    CaptureRangeSink captures,
+     constants::MatchFlagType matchFlags,
+     StackOverflowGuard guard) {
+   assert(
+@@ -1675,14 +1855,13 @@ MatchRuntimeResult searchWithBytecodeImpl(
+   if (const CharT *matchStartLoc = res.getValue()) {
+     // Match succeeded. Return captured ranges. The first range is the total
+     // match, followed by any capture groups.
+-    if (m != nullptr) {
++    if (captures) {
+       uint32_t totalStart = static_cast<uint32_t>(matchStartLoc - first);
+       uint32_t totalEnd =
+           static_cast<uint32_t>(state.cursor_.currentPointer() - first);
+-      m->clear();
+-      m->push_back(CapturedRange{totalStart, totalEnd});
+-      std::copy_n(
+-          state.capturedRanges_.begin(), markedCount, std::back_inserter(*m));
++      captures(
++          CapturedRange{totalStart, totalEnd},
++          llvh::makeArrayRef(state.capturedRanges_.data(), markedCount));
+     }
+     return MatchRuntimeResult::Match;
+   }
+@@ -1694,11 +1873,11 @@ MatchRuntimeResult searchWithBytecode(
+     const char16_t *first,
+     uint32_t start,
+     uint32_t length,
+-    std::vector<CapturedRange> *m,
++    CaptureRangeSink captures,
+     constants::MatchFlagType matchFlags,
+     StackOverflowGuard guard) {
+   return searchWithBytecodeImpl<char16_t, UTF16RegexTraits>(
+-      bytecode, first, start, length, m, matchFlags, guard);
++      bytecode, first, start, length, captures, matchFlags, guard);
+ }
+ 
+ MatchRuntimeResult searchWithBytecode(
+@@ -1706,11 +1885,63 @@ MatchRuntimeResult searchWithBytecode(
+     const char *first,
+     uint32_t start,
+     uint32_t length,
+-    std::vector<CapturedRange> *m,
++    CaptureRangeSink captures,
+     constants::MatchFlagType matchFlags,
+     StackOverflowGuard guard) {
+   return searchWithBytecodeImpl<char, ASCIIRegexTraits>(
+-      bytecode, first, start, length, m, matchFlags, guard);
++      bytecode, first, start, length, captures, matchFlags, guard);
++}
++
++// Keep the vector interface for compiler and embedding callers. The VM writes
++// directly into its own range representation through the sink overload.
++template <typename CharT>
++static MatchRuntimeResult searchWithVectorOutput(
++    llvh::ArrayRef<uint8_t> bytecode,
++    const CharT *first,
++    uint32_t start,
++    uint32_t length,
++    std::vector<CapturedRange> *output,
++    constants::MatchFlagType matchFlags,
++    StackOverflowGuard guard) {
++  auto write = [output](
++                   CapturedRange full, llvh::ArrayRef<CapturedRange> captures) {
++    output->clear();
++    output->reserve(captures.size() + 1);
++    output->push_back(full);
++    output->insert(output->end(), captures.begin(), captures.end());
++  };
++  return searchWithBytecode(
++      bytecode,
++      first,
++      start,
++      length,
++      output ? CaptureRangeSink{write} : CaptureRangeSink{},
++      matchFlags,
++      guard);
++}
++
++MatchRuntimeResult searchWithBytecode(
++    llvh::ArrayRef<uint8_t> bytecode,
++    const char16_t *first,
++    uint32_t start,
++    uint32_t length,
++    std::vector<CapturedRange> *output,
++    constants::MatchFlagType matchFlags,
++    StackOverflowGuard guard) {
++  return searchWithVectorOutput(
++      bytecode, first, start, length, output, matchFlags, guard);
++}
++
++MatchRuntimeResult searchWithBytecode(
++    llvh::ArrayRef<uint8_t> bytecode,
++    const char *first,
++    uint32_t start,
++    uint32_t length,
++    std::vector<CapturedRange> *output,
++    constants::MatchFlagType matchFlags,
++    StackOverflowGuard guard) {
++  return searchWithVectorOutput(
++      bytecode, first, start, length, output, matchFlags, guard);
+ }
+ 
+ } // namespace regex
+diff --git a/lib/Regex/RegexAOT.cpp b/lib/Regex/RegexAOT.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..f83d1b61c02d092e446fe0e7dd9db5d4ed065514
+--- /dev/null
++++ b/lib/Regex/RegexAOT.cpp
+@@ -0,0 +1,587 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++#include "hermes/Regex/RegexAOT.h"
++#include "hermes/Platform/Unicode/CodePointSet.h"
++#include "hermes/Regex/RegexSerialization.h"
++#include "hermes/Regex/RegexTraits.h"
++#include "llvh/ADT/Twine.h"
++#include "llvh/Support/raw_ostream.h"
++
++#include <algorithm>
++#include <array>
++
++using namespace hermes;
++using namespace hermes::regex;
++
++namespace {
++// These bounds cover analysis, emitted control flow and fixed stack scratch.
++// No repetition is unrolled and no subject-dependent state is retained.
++constexpr size_t kMaxBytecode = 2048;
++constexpr size_t kMaxOperations = 64;
++constexpr size_t kMaxRanges = 64;
++constexpr size_t kMaxLoops = 8;
++constexpr size_t kMaxAlternations = 8;
++constexpr size_t kMaxSource = 24 * 1024;
++
++struct AOTOperation {
++  Opcode opcode;
++  std::string predicate;
++  uint32_t min = 1;
++  uint32_t max = 1;
++  uint32_t capture = 0;
++  // Bytecode offset during decoding, operation index after target validation.
++  uint32_t target = 0;
++  bool greedy = true;
++  bool invert = false;
++};
++
++std::string rangePredicate(uint32_t first, uint32_t last) {
++  if (first == last)
++    return "c == " + std::to_string(first) + "u";
++  return "(c >= " + std::to_string(first) + "u && c <= " +
++      std::to_string(last) + "u)";
++}
++
++const std::string &classPredicate(CharacterClass::Type type) {
++  // Derive these once from the same tables as the interpreter. In particular,
++  // JS whitespace must not drift when the platform Unicode support changes.
++  static const auto predicates = [] {
++    std::array<std::string, 3> result;
++    const CharacterClass::Type types[] = {
++        CharacterClass::Digits, CharacterClass::Spaces, CharacterClass::Words};
++    for (size_t i = 0; i < result.size(); ++i) {
++      result[i] = "(0";
++      for (uint32_t c = 0; c < 65536;) {
++        if (!UTF16RegexTraits::characterHasType(c, types[i])) {
++          ++c;
++          continue;
++        }
++        const uint32_t first = c++;
++        while (c < 65536 && UTF16RegexTraits::characterHasType(c, types[i]))
++          ++c;
++        result[i] += " || " + rangePredicate(first, c - 1);
++      }
++      result[i] += ')';
++    }
++    return result;
++  }();
++  switch (type) {
++    case CharacterClass::Digits:
++      return predicates[0];
++    case CharacterClass::Spaces:
++      return predicates[1];
++    case CharacterClass::Words:
++      return predicates[2];
++  }
++  llvm_unreachable("Unknown character class");
++}
++
++// Substitute an expression for the predicate's code-unit variable. Generated
++// expressions are numeric only; source pattern text never becomes C source.
++std::string at(std::string predicate, llvh::StringRef value) {
++  for (size_t i = 0; i < predicate.size(); ++i) {
++    if (predicate[i] == 'c') {
++      predicate.replace(i, 1, value.data(), value.size());
++      i += value.size() - 1;
++    }
++  }
++  return predicate;
++}
++
++// Decode precisely one width-one instruction. Case-insensitive literals use
++// the same compile-time case-equivalence expansion as character classes.
++// BracketICase ranges have already been expanded by the regexp compiler.
++bool readTerm(
++    const Insn *base,
++    std::string &predicate,
++    size_t &width,
++    size_t &rangeCount) {
++  uint32_t literal = 0;
++  bool icase = false;
++  switch (base->opcode) {
++    case Opcode::MatchChar8:
++      literal = static_cast<uint8_t>(llvh::cast<MatchChar8Insn>(base)->c);
++      width = sizeof(MatchChar8Insn);
++      break;
++    case Opcode::MatchChar16:
++      literal = llvh::cast<MatchChar16Insn>(base)->c;
++      width = sizeof(MatchChar16Insn);
++      break;
++    case Opcode::MatchCharICase8:
++      literal = static_cast<uint8_t>(llvh::cast<MatchCharICase8Insn>(base)->c);
++      width = sizeof(MatchCharICase8Insn);
++      icase = true;
++      break;
++    case Opcode::MatchCharICase16:
++      literal = llvh::cast<MatchCharICase16Insn>(base)->c;
++      width = sizeof(MatchCharICase16Insn);
++      icase = true;
++      break;
++    case Opcode::MatchAny:
++      predicate = "1";
++      width = sizeof(MatchAnyInsn);
++      return true;
++    case Opcode::MatchAnyButNewline:
++      predicate = "(c != 10u && c != 13u && c != 8232u && c != 8233u)";
++      width = sizeof(MatchAnyButNewlineInsn);
++      return true;
++    case Opcode::Bracket:
++    case Opcode::BracketICase: {
++      const BracketInsn *term = base->opcode == Opcode::Bracket
++          ? llvh::cast<BracketInsn>(base)
++          : llvh::cast<BracketICaseInsn>(base);
++      rangeCount += term->rangeCount;
++      if (rangeCount > kMaxRanges)
++        return false;
++      // Non-Unicode bracket ranges already contain their case equivalents.
++      // They need no runtime canonicalization, even for UTF-16 subjects.
++      // Unicode-mode classes are rejected by the analyzer.
++      width = term->totalWidth();
++      predicate = "(0";
++      for (auto type : {CharacterClass::Digits,
++                        CharacterClass::Spaces,
++                        CharacterClass::Words}) {
++        if (term->positiveCharClasses & type)
++          predicate += " || " + classPredicate(type);
++        if (term->negativeCharClasses & type)
++          predicate += " || !" + classPredicate(type);
++      }
++      const auto *ranges = reinterpret_cast<const BracketRange32 *>(term + 1);
++      for (uint32_t i = 0; i < term->rangeCount; ++i)
++        predicate += " || " + rangePredicate(ranges[i].start, ranges[i].end);
++      predicate += ')';
++      if (term->negate)
++        predicate = "!" + predicate;
++      return true;
++    }
++    default:
++      return false;
++  }
++  predicate = rangePredicate(literal, literal);
++  if (icase) {
++    CodePointSet singleton;
++    singleton.add(literal);
++    const auto equivalents = makeCanonicallyEquivalent(singleton, false);
++    predicate = "(0";
++    for (const auto &range : equivalents.ranges())
++      predicate += " || " + rangePredicate(range.first, range.end() - 1);
++    predicate += ')';
++  }
++  return true;
++}
++
++void emitBody(
++    llvh::raw_ostream &os,
++    llvh::ArrayRef<AOTOperation> ops,
++    bool anchored,
++    llvh::StringRef suffix) {
++  const std::string word = classPredicate(CharacterClass::Words);
++  const std::string newline = "(c == 10u || c == 13u || c == 8232u || c == 8233u)";
++  // A single character predicate is a linear scan with no backtracking. Avoid
++  // checking it twice per candidate or restarting a long scan at the work cap.
++  // Widen loads before predicates so 8-bit input can use the same class ranges.
++  if (ops.size() == 1 && !ops.front().predicate.empty() &&
++      ops.front().opcode != Opcode::Width1Loop) {
++    os << "    for (uint32_t p = start; p < length; ++p) {\n"
++          "      uint32_t c = s[p];\n"
++          "      if (" << ops.front().predicate << ") {\n"
++          "        ranges[0] = p; ranges[1] = p + 1;\n"
++          "        return HermesRegexAOTMatch;\n"
++          "      }\n"
++          "      if (flags & " << constants::matchOnlyAtStart << "u) break;\n"
++          "    }\n"
++          "    return HermesRegexAOTNoMatch;\n";
++    return;
++  }
++  auto label = [&](llvh::StringRef stem, size_t i) {
++    return (stem + suffix + "_" + std::to_string(i)).str();
++  };
++  const std::string next = ("next" + suffix).str();
++  const std::string backtrack = ("backtrack" + suffix).str();
++  std::string firstSet = "(0";
++  std::array<bool, kMaxOperations + 1> firstReachable{};
++  firstReachable[0] = true;
++  std::array<uint64_t, kMaxOperations + 1> minWidths{};
++  // Forward targets allow bounded passes over the graph. Candidate pruning
++  // must include every branch, including empty paths to a shared suffix.
++  for (size_t i = ops.size(); i-- > 0;) {
++    const auto &op = ops[i];
++    if (op.opcode == Opcode::Jump32)
++      minWidths[i] = minWidths[op.target];
++    else if (op.opcode == Opcode::Alternation)
++      minWidths[i] = std::min(minWidths[i + 1], minWidths[op.target]);
++    else
++      minWidths[i] = minWidths[i + 1] + (op.predicate.empty() ? 0 : op.min);
++  }
++  const AOTOperation *leadingBoundary = nullptr;
++  bool sawTerm = false;
++  bool fixedWidth = true;
++  bool endAnchored = false;
++  size_t loops = 0, alternatives = 0;
++  const uint64_t minWidth = minWidths[0];
++  for (size_t i = 0; i < ops.size(); ++i) {
++    const auto &op = ops[i];
++    if (!op.predicate.empty()) {
++      if (firstReachable[i])
++        firstSet += " || (" + op.predicate + ')';
++      sawTerm = true;
++      fixedWidth &= op.min == op.max;
++    } else if (!sawTerm && op.opcode == Opcode::WordBoundary) {
++      leadingBoundary = &op;
++    }
++    if (op.opcode == Opcode::Alternation || op.opcode == Opcode::Jump32) {
++      firstReachable[op.target] |= firstReachable[i];
++      // No assertion after a split is necessarily common to every path.
++      sawTerm = true;
++      fixedWidth = false;
++      alternatives += op.opcode == Opcode::Alternation;
++    }
++    if (op.opcode != Opcode::Jump32 &&
++        (op.predicate.empty() || op.min == 0))
++      firstReachable[i + 1] |= firstReachable[i];
++    if (op.opcode == Opcode::Width1Loop)
++      ++loops;
++    if (op.opcode == Opcode::RightAnchor)
++      endAnchored = true;
++  }
++  firstSet += ')';
++  os << "    uint32_t p, candidate = start, c;\n";
++  for (size_t i = 0; i < loops; ++i)
++    os << "    uint32_t lo" << i << ", hi" << i << ", pos" << i << ";\n";
++  if (alternatives) {
++    // Forward-only branches visit each site at most once on any active path.
++    // A loop has one resumable choice, regardless of its repetition count.
++    os << "    uint32_t choices[" << loops + alternatives << "], depth;\n";
++    for (size_t i = 0; i < alternatives; ++i)
++      os << "    uint32_t alternative" << i << ";\n";
++  }
++  if (minWidth > UINT32_MAX) {
++    os << "    return HermesRegexAOTNoMatch;\n";
++    return;
++  }
++  os << "    if (" << minWidth
++     << "u > length - start) return HermesRegexAOTNoMatch;\n";
++  // A fixed-width match with an ordinary end anchor has only one possible
++  // start. Preserve the shared fixed-width matcher's shortcut; sticky and
++  // start-anchored searches must still use their original start.
++  if (fixedWidth && endAnchored && !anchored) {
++    os << "    if ((flags & " << constants::matchOnlyAtStart
++       << "u) && start != length - " << minWidth
++       << "u) return HermesRegexAOTNoMatch;\n"
++       << "    candidate = length - " << minWidth << "u;\n";
++  }
++  os << "    for (;;) {\n"
++     << "      if (candidate > length - " << minWidth
++     << "u) return HermesRegexAOTNoMatch;\n";
++  // Reject impossible starts before initializing captures or repetition state.
++  // Leading word-boundary checks also skip the interiors of word runs.
++  if (!firstReachable[ops.size()]) {
++    os << "      c = s[candidate];\n"
++       << "      if (!(" << firstSet << ")) goto " << next << ";\n";
++  }
++  if (leadingBoundary) {
++    os << "      if (((candidate != 0 && " << at(word, "s[candidate - 1]")
++       << ") != (candidate != length && " << at(word, "s[candidate]")
++       << ")) == " << (leadingBoundary->invert ? 1 : 0) << ") goto " << next
++       << ";\n";
++  }
++  // First-character/boundary rejection is a single forward scan. Charge the
++  // budget only when entering the matcher, where repeated work can backtrack;
++  // otherwise a long irrelevant prefix makes the interpreter scan it again.
++  os << "      if (!work--) return HermesRegexAOTFallback;\n"
++        "      p = candidate;\n";
++  if (alternatives)
++    os << "      depth = 0;\n";
++  std::string fail = alternatives ? backtrack : next;
++  std::vector<std::string> choices;
++  loops = 0;
++  size_t alternative = 0;
++  for (size_t index = 0; index < ops.size(); ++index) {
++    const auto &op = ops[index];
++    if (alternatives)
++      os << "    " << label("op", index) << ":\n";
++    if (op.opcode == Opcode::Width1Loop) {
++      const auto i = loops++;
++      os << "      if (" << op.min << "u > length - p) goto " << fail << ";\n"
++         << "      lo" << i << " = p + " << op.min << "u;\n"
++         << "      hi" << i << " = p;\n"
++         << "      c = length - p < " << op.max << "u ? length : p + "
++         << op.max << "u;\n"
++         << "      while (hi" << i << " < c && ("
++         << at(op.predicate, "s[hi" + std::to_string(i) + "]")
++         << ")) {\n"
++         << "        if (!work--) return HermesRegexAOTFallback;\n"
++         << "        ++hi" << i << ";\n      }\n"
++         << "      if (hi" << i << " < lo" << i << ") goto " << fail << ";\n"
++         << "      pos" << i << " = " << (op.greedy ? "hi" : "lo") << i
++         << ";\n"
++         << "      goto " << label("resume", i) << ";\n"
++         << "    " << label("backtrack", i) << ":\n"
++         << "      if (!work--) return HermesRegexAOTFallback;\n"
++         << "      if (pos" << i << " == " << (op.greedy ? "lo" : "hi")
++         << i << ") goto " << fail << ";\n"
++         << "      " << (op.greedy ? "--pos" : "++pos") << i << ";\n"
++         << "    " << label("resume", i) << ":\n";
++      if (alternatives) {
++        os << "      choices[depth++] = " << choices.size() << "u;\n";
++        choices.push_back(label("backtrack", i));
++      } else {
++        fail = label("backtrack", i);
++      }
++      os << "      p = pos" << i << ";\n";
++      continue;
++    }
++    if (!op.predicate.empty()) {
++      os << "      if (p == length || !(" << at(op.predicate, "s[p]")
++         << ")) goto " << fail << ";\n      ++p;\n";
++      continue;
++    }
++    switch (op.opcode) {
++      case Opcode::Alternation: {
++        const auto i = alternative++;
++        os << "      alternative" << i << " = p;\n"
++           << "      choices[depth++] = " << choices.size() << "u;\n"
++           << "      goto " << label("op", index + 1) << ";\n"
++           << "    " << label("alternative", i) << ":\n"
++           << "      p = alternative" << i << ";\n"
++           << "      goto " << label("op", op.target) << ";\n";
++        choices.push_back(label("alternative", i));
++        break;
++      }
++      case Opcode::Jump32:
++        os << "      goto " << label("op", op.target) << ";\n";
++        break;
++      case Opcode::BeginMarkedSubexpression:
++      case Opcode::EndMarkedSubexpression:
++        os << "      ranges[" << (op.capture + 1) * 2 +
++                (op.opcode == Opcode::EndMarkedSubexpression)
++           << "] = p;\n";
++        break;
++      case Opcode::LeftAnchor:
++        os << "      if (p != 0) goto " << fail << ";\n";
++        break;
++      case Opcode::LeftAnchorMultiline:
++        os << "      if (p != 0 && !(" << at(newline, "s[p - 1]")
++           << ")) goto " << fail << ";\n";
++        break;
++      case Opcode::RightAnchor:
++      case Opcode::RightAnchorMultiline:
++        os << "      if (!((p == length && !(flags & "
++           << constants::matchNotEndOfLine << "u))";
++        if (op.opcode == Opcode::RightAnchorMultiline)
++          os << " || (p != length && " << at(newline, "s[p]") << ')';
++        os << ")) goto " << fail << ";\n";
++        break;
++      case Opcode::WordBoundary:
++        os << "      if (((p != 0 && " << at(word, "s[p - 1]")
++           << ") != (p != length && " << at(word, "s[p]") << ")) == "
++           << (op.invert ? 1 : 0) << ") goto " << fail << ";\n";
++        break;
++      default:
++        llvm_unreachable("Unsupported operation in compiled matcher");
++    }
++  }
++  // Every capture in a straight-line program is visited on a successful
++  // path. Resuming a loop rewrites all subsequent captures; no capture can be
++  // inside a loop, alternative or assertion requiring restoration.
++  if (alternatives)
++    os << "    " << label("op", ops.size()) << ":\n";
++  os << "      ranges[0] = candidate; ranges[1] = p;\n"
++     << "      return HermesRegexAOTMatch;\n";
++  if (alternatives) {
++    os << "    " << backtrack << ":\n"
++       << "      if (!work--) return HermesRegexAOTFallback;\n"
++       << "      if (depth) switch (choices[--depth]) {\n";
++    for (size_t i = 0; i < choices.size(); ++i)
++      os << "        case " << i << ": goto " << choices[i] << ";\n";
++    os << "      }\n";
++  }
++  os << "    " << next << ":\n"
++     << "      if (candidate == length";
++  if (anchored)
++    os << " || 1";
++  else
++    os << " || (flags & " << constants::matchOnlyAtStart << "u)";
++  os << ") return HermesRegexAOTNoMatch;\n"
++     << "      ++candidate;\n    }\n";
++}
++} // namespace
++
++llvh::Optional<std::string> CompiledRegExp::compileAOTRegex(
++    llvh::StringRef name) const {
++  auto bytes = getBytecode();
++  const auto *header =
++      reinterpret_cast<const RegexBytecodeHeader *>(bytes.data());
++  const auto flags = SyntaxFlags::fromByte(header->syntaxFlags);
++  if (flags.unicode || bytes.size() > kMaxBytecode ||
++      header->markedCount > HERMES_REGEX_AOT_MAX_CAPTURES ||
++      header->loopCount > kMaxLoops)
++    return llvh::None;
++
++  size_t ranges = 0, loops = 0, alternatives = 0, offset = sizeof(*header);
++  // Only decoded operation boundaries may be branch destinations. In
++  // particular, a run's payload and a width-one loop's body are not entries.
++  std::array<size_t, kMaxBytecode> operationAt;
++  operationAt.fill(kMaxOperations + 1);
++  std::vector<AOTOperation> ops;
++  uint32_t begun = 0, ended = 0;
++  while (offset < bytes.size()) {
++    const auto *base = reinterpret_cast<const Insn *>(bytes.data() + offset);
++    // Goal validates completion but does not add an operation. A program that
++    // exactly fills the operation budget must still be allowed to terminate.
++    if (ops.size() == kMaxOperations && base->opcode != Opcode::Goal)
++      return llvh::None;
++    operationAt[offset - sizeof(*header)] = ops.size();
++    AOTOperation op{base->opcode, {}};
++    size_t width = 0;
++    if (readTerm(base, op.predicate, width, ranges)) {
++      offset += width;
++      ops.push_back(std::move(op));
++      continue;
++    }
++    switch (base->opcode) {
++      case Opcode::Alternation:
++      case Opcode::Jump32:
++        // Captures require restoration across alternatives; leave those
++        // programs on the interpreter. Only forward control flow is emitted.
++        if (header->markedCount)
++          return llvh::None;
++        if (base->opcode == Opcode::Alternation) {
++          if (++alternatives > kMaxAlternations)
++            return llvh::None;
++          op.target = llvh::cast<AlternationInsn>(base)->secondaryBranch;
++          width = sizeof(AlternationInsn);
++        } else {
++          op.target = llvh::cast<Jump32Insn>(base)->target;
++          width = sizeof(Jump32Insn);
++        }
++        if (op.target <= offset - sizeof(*header) ||
++            op.target >= bytes.size() - sizeof(*header))
++          return llvh::None;
++        offset += width;
++        ops.push_back(std::move(op));
++        break;
++      case Opcode::Goal:
++        if (offset + sizeof(GoalInsn) != bytes.size() ||
++            begun != (1u << header->markedCount) - 1 || ended != begun)
++          return llvh::None;
++        offset = bytes.size();
++        break;
++      case Opcode::MatchNChar8:
++      case Opcode::MatchNCharICase8: {
++        // The two instruction layouts have identical count and payload fields.
++        const bool icase = base->opcode == Opcode::MatchNCharICase8;
++        const uint32_t count = icase
++            ? llvh::cast<MatchNCharICase8Insn>(base)->charCount
++            : llvh::cast<MatchNChar8Insn>(base)->charCount;
++        const size_t prefix =
++            icase ? sizeof(MatchNCharICase8Insn) : sizeof(MatchNChar8Insn);
++        const auto *chars = reinterpret_cast<const uint8_t *>(base) + prefix;
++        for (uint32_t i = 0; i < count; ++i) {
++          if (ops.size() == kMaxOperations)
++            return llvh::None;
++          MatchCharICase8Insn folded{};
++          folded.opcode = Opcode::MatchCharICase8;
++          folded.c = chars[i];
++          AOTOperation term{
++              Opcode::MatchChar8, rangePredicate(chars[i], chars[i])};
++          if (icase && !readTerm(&folded, term.predicate, width, ranges))
++            return llvh::None;
++          ops.push_back(std::move(term));
++        }
++        offset += prefix + count;
++        break;
++      }
++      case Opcode::Width1Loop: {
++        if (++loops > kMaxLoops)
++          return llvh::None;
++        const auto *loop = llvh::cast<Width1LoopInsn>(base);
++        if (!readTerm(
++                reinterpret_cast<const Insn *>(loop + 1),
++                op.predicate,
++                width,
++                ranges) ||
++            offset + sizeof(*loop) + width !=
++                sizeof(*header) + loop->notTakenTarget)
++          return llvh::None;
++        op.min = loop->min;
++        op.max = loop->max;
++        op.greedy = loop->greedy;
++        offset += sizeof(*loop) + width;
++        ops.push_back(std::move(op));
++        break;
++      }
++      case Opcode::BeginMarkedSubexpression:
++      case Opcode::EndMarkedSubexpression: {
++        const bool begin = base->opcode == Opcode::BeginMarkedSubexpression;
++        op.capture = begin
++            ? llvh::cast<BeginMarkedSubexpressionInsn>(base)->mexp
++            : llvh::cast<EndMarkedSubexpressionInsn>(base)->mexp;
++        if (op.capture >= header->markedCount)
++          return llvh::None;
++        const uint32_t bit = 1u << op.capture;
++        if (begin ? (begun & bit) : (!(begun & bit) || (ended & bit)))
++          return llvh::None;
++        (begin ? begun : ended) |= bit;
++        offset += begin ? sizeof(BeginMarkedSubexpressionInsn)
++                        : sizeof(EndMarkedSubexpressionInsn);
++        ops.push_back(std::move(op));
++        break;
++      }
++      case Opcode::WordBoundary:
++      case Opcode::WordBoundaryICase:
++        // Non-Unicode folding cannot turn a non-ASCII code unit into ASCII.
++        op.invert = base->opcode == Opcode::WordBoundary
++            ? llvh::cast<WordBoundaryInsn>(base)->invert
++            : llvh::cast<WordBoundaryICaseInsn>(base)->invert;
++        op.opcode = Opcode::WordBoundary;
++        offset += base->opcode == Opcode::WordBoundary
++            ? sizeof(WordBoundaryInsn)
++            : sizeof(WordBoundaryICaseInsn);
++        ops.push_back(std::move(op));
++        break;
++      case Opcode::LeftAnchor:
++      case Opcode::LeftAnchorMultiline:
++      case Opcode::RightAnchor:
++      case Opcode::RightAnchorMultiline:
++        offset += sizeof(Insn);
++        ops.push_back(std::move(op));
++        break;
++      default:
++        return llvh::None;
++    }
++  }
++  for (size_t i = 0; i < ops.size(); ++i) {
++    auto &op = ops[i];
++    if (op.opcode != Opcode::Alternation && op.opcode != Opcode::Jump32)
++      continue;
++    const auto target = operationAt[op.target];
++    if (!alternatives || target > ops.size() || target <= i)
++      return llvh::None;
++    op.target = target;
++  }
++  std::string source;
++  llvh::raw_string_ostream os(source);
++  os << "HERMES_REGEX_AOT_HIDDEN int32_t " << name
++     << "(const void *input, uint32_t length, uint32_t start, "
++        "uint32_t flags, uint32_t *ranges) {\n"
++        "  uint32_t work = 262144u;\n";
++  const bool anchored = header->constraints & MatchConstraintAnchoredAtStart;
++  if (anchored)
++    os << "  if (start != 0) return HermesRegexAOTNoMatch;\n";
++  os << "  if (flags & " << constants::matchInputAllAscii << "u) {\n"
++        "    const uint8_t *s = (const uint8_t *)input;\n";
++  emitBody(os, ops, anchored, "8");
++  os << "  } else {\n    const uint16_t *s = (const uint16_t *)input;\n";
++  emitBody(os, ops, anchored, "16");
++  os << "  }\n}\n";
++  os.flush();
++  if (source.size() > kMaxSource)
++    return llvh::None;
++  return source;
++}
+diff --git a/lib/Regex/RegexSerialization.cpp b/lib/Regex/RegexSerialization.cpp
+index 2c681137f77e8fe872e7fb9903e707f0a4c5f009..826a4f3e69bb3f3e0cdc305f0190f0bdb42b01e6 100644
+--- a/lib/Regex/RegexSerialization.cpp
++++ b/lib/Regex/RegexSerialization.cpp
+@@ -14,6 +14,7 @@
+ #include "llvh/Support/raw_ostream.h"
+ 
+ #include <cctype>
++#include <cstring>
+ 
+ using llvh::StringRef;
+ using namespace hermes;
+@@ -423,6 +424,121 @@ llvh::ArrayRef<uint8_t> CompiledRegExp::getBytecode() const {
+   return bytecode_;
+ }
+ 
++llvh::Optional<std::vector<uint8_t>> CompiledRegExp::compileSimpleRegex() const {
++  using namespace regex;
++  auto bytes = getBytecode();
++  const auto *header =
++      reinterpret_cast<const RegexBytecodeHeader *>(bytes.data());
++  const auto flags = SyntaxFlags::fromByte(header->syntaxFlags);
++  // Keep Unicode decoding, folded literals, captures and repetition in the
++  // interpreter. Non-Unicode BracketICase already contains expanded ranges.
++  // The bounded input also limits work spent rejecting large literal sites.
++  if (flags.unicode || header->markedCount ||
++      header->loopCount || bytes.size() > 1024)
++    return llvh::None;
++
++  SimpleRegexHeader simple{};
++  simple.constraints = header->constraints;
++  std::vector<uint8_t> result(sizeof(simple));
++  uint32_t rangeCount = 0;
++  auto append = [&](const void *data, size_t size) {
++    const auto *first = static_cast<const uint8_t *>(data);
++    result.insert(result.end(), first, first + size);
++  };
++  auto appendTerm = [&](BracketInsn term,
++                        llvh::ArrayRef<BracketRange32> ranges) {
++    if (simple.anchoredAtEnd || simple.termCount == kSimpleRegexMaxTerms ||
++        ranges.size() > kSimpleRegexMaxRanges - rangeCount)
++      return false;
++    term.opcode = Opcode::Bracket;
++    term.rangeCount = ranges.size();
++    append(&term, sizeof(term));
++    if (!ranges.empty())
++      append(ranges.data(), ranges.size() * sizeof(BracketRange32));
++    ++simple.termCount;
++    rangeCount += ranges.size();
++    return true;
++  };
++  auto appendChar = [&](uint32_t ch) {
++    BracketRange32 range{ch, ch};
++    return appendTerm(BracketInsn{}, llvh::makeArrayRef(&range, 1));
++  };
++
++  size_t offset = sizeof(*header);
++  while (offset < bytes.size()) {
++    const auto *base = reinterpret_cast<const Insn *>(bytes.data() + offset);
++    switch (base->opcode) {
++      case Opcode::Goal:
++        if (!simple.termCount || offset + sizeof(GoalInsn) != bytes.size())
++          return llvh::None;
++        memcpy(result.data(), &simple, sizeof(simple));
++        return result;
++      case Opcode::LeftAnchor:
++        if (simple.termCount || simple.anchoredAtStart)
++          return llvh::None;
++        simple.anchoredAtStart = true;
++        offset += sizeof(LeftAnchorInsn);
++        break;
++      case Opcode::RightAnchor:
++        if (!simple.termCount || simple.anchoredAtEnd)
++          return llvh::None;
++        simple.anchoredAtEnd = true;
++        offset += sizeof(RightAnchorInsn);
++        break;
++      case Opcode::MatchChar8: {
++        const auto *insn = llvh::cast<MatchChar8Insn>(base);
++        if (!appendChar(static_cast<unsigned char>(insn->c)))
++          return llvh::None;
++        offset += sizeof(*insn);
++        break;
++      }
++      case Opcode::MatchChar16: {
++        const auto *insn = llvh::cast<MatchChar16Insn>(base);
++        if (!appendChar(insn->c))
++          return llvh::None;
++        offset += sizeof(*insn);
++        break;
++      }
++      case Opcode::MatchNChar8: {
++        const auto *insn = llvh::cast<MatchNChar8Insn>(base);
++        const auto *chars = reinterpret_cast<const uint8_t *>(insn + 1);
++        for (uint32_t i = 0; i < insn->charCount; ++i)
++          if (!appendChar(chars[i]))
++            return llvh::None;
++        offset += insn->totalWidth();
++        break;
++      }
++      case Opcode::Bracket:
++      case Opcode::BracketICase: {
++        const BracketInsn *insn = base->opcode == Opcode::Bracket
++            ? llvh::cast<BracketInsn>(base)
++            : llvh::cast<BracketICaseInsn>(base);
++        const auto *ranges = reinterpret_cast<const BracketRange32 *>(insn + 1);
++        if (!appendTerm(*insn, llvh::makeArrayRef(ranges, insn->rangeCount)))
++          return llvh::None;
++        offset += insn->totalWidth();
++        break;
++      }
++      case Opcode::MatchAny:
++      case Opcode::MatchAnyButNewline: {
++        BracketInsn term{};
++        term.negate = true;
++        const BracketRange32 newlines[] = {{10, 10}, {13, 13}, {0x2028, 0x2029}};
++        const auto ranges = base->opcode == Opcode::MatchAny
++            ? llvh::ArrayRef<BracketRange32>{}
++            : llvh::makeArrayRef(newlines);
++        if (!appendTerm(term, ranges))
++          return llvh::None;
++        offset += sizeof(MatchAnyInsn);
++        break;
++      }
++      default:
++        return llvh::None;
++    }
++  }
++  llvm_unreachable("Validated regex bytecode must end in Goal");
++}
++
+ void UniquingRegExpTable::disassemble(llvh::raw_ostream &OS) const {
+   uint32_t index = 0;
+   // Note that regexp patterns and flags are read without interpreting escapes
+diff --git a/lib/VM/Interpreter-slowpaths.cpp b/lib/VM/Interpreter-slowpaths.cpp
+index 53959769951032fc0453f61781b838ac60e2b0ae..1cc57ff1a4c684542dc27d11d7ecc61c08a6ac3d 100644
+--- a/lib/VM/Interpreter-slowpaths.cpp
++++ b/lib/VM/Interpreter-slowpaths.cpp
+@@ -623,7 +623,13 @@ PseudoHandle<JSRegExp> Interpreter::createRegExp(
+   lv.pattern = runtime.getStringPrimFromSymbolID(patternID);
+   lv.flags = runtime.getStringPrimFromSymbolID(flagsID);
+   auto bytecode = runtimeModule->getRegExpBytecodeFromRegExpID(regexpID);
+-  JSRegExp::initialize(lv.re, runtime, lv.pattern, lv.flags, bytecode);
++  JSRegExp::initialize(
++      lv.re,
++      runtime,
++      lv.pattern,
++      lv.flags,
++      bytecode,
++      JSRegExp::BytecodeOwnership::Copy);
+ 
+   return createPseudoHandle(*lv.re);
+ }
+diff --git a/lib/VM/JSLib/RegExp.cpp b/lib/VM/JSLib/RegExp.cpp
+index 95f4ff27608550503a7e8bc5047992562c040d47..0c8624352552168b3122b321f4b80ed78c8d546d 100644
+--- a/lib/VM/JSLib/RegExp.cpp
++++ b/lib/VM/JSLib/RegExp.cpp
+@@ -895,20 +895,16 @@ static ExecutionStatus makeMatchIndicesIndexPairArray(
+   return ExecutionStatus::RETURNED;
+ }
+ 
+-// ES6 21.2.5.2.2
+-ExecutionStatus directRegExpExec(
++// Match and update observable state before deciding whether a JS result is
++// needed. In particular, test must retain captures and lastIndex writes.
++static CallResult<RegExpMatch> directRegExpMatch(
+     Handle<JSRegExp> regexp,
+     Runtime &runtime,
+-    Handle<StringPrimitive> S,
+-    MutableHandle<JSArray> resultOut) {
++    Handle<StringPrimitive> S) {
+   struct : public Locals {
+-    PinnedValue<JSArray> A;
+     PinnedValue<> propHandle;
+-    PinnedValue<StringPrimitive> strHandle;
+-    PinnedValue<JSArray> indicesArray;
+   } lv;
+   LocalsRAII lraii(runtime, &lv);
+-
+   GCScope gcScope{runtime};
+ 
+   // Let length be the number of code units in S.
+@@ -931,13 +927,10 @@ ExecutionStatus directRegExpExec(
+ 
+   // If flags contains "g", let global be true, else let global be false
+   // If flags contains "y", let sticky be true, else let sticky be false.
+-  // If flags contains "d", let hasIndices be true, else let hasIndices be
+-  // false.
+   // If flags contains "u", let fullUnicode be true, else let fullUnicode be
+   // false.
+   const bool global = flags.global;
+   const bool sticky = flags.sticky;
+-  const bool hasIndices = flags.hasIndices;
+   const bool fullUnicode = flags.unicode;
+ 
+   // If global is false and sticky is false, set lastIndex to 0.
+@@ -980,8 +973,7 @@ ExecutionStatus directRegExpExec(
+         return ExecutionStatus::EXCEPTION;
+       }
+     }
+-    resultOut.clear();
+-    return ExecutionStatus::RETURNED;
++    return std::move(match);
+   }
+ 
+   // We have a match!
+@@ -1011,6 +1003,33 @@ ExecutionStatus directRegExpExec(
+     }
+   }
+ 
++  return std::move(match);
++}
++
++// ES6 21.2.5.2.2
++ExecutionStatus directRegExpExec(
++    Handle<JSRegExp> regexp,
++    Runtime &runtime,
++    Handle<StringPrimitive> S,
++    MutableHandle<JSArray> resultOut) {
++  struct : public Locals {
++    PinnedValue<JSArray> A;
++    PinnedValue<StringPrimitive> strHandle;
++    PinnedValue<JSArray> indicesArray;
++  } lv;
++  LocalsRAII lraii(runtime, &lv);
++  GCScope gcScope{runtime};
++
++  auto matchResult = directRegExpMatch(regexp, runtime, S);
++  if (LLVM_UNLIKELY(matchResult == ExecutionStatus::EXCEPTION))
++    return ExecutionStatus::EXCEPTION;
++  RegExpMatch &match = *matchResult;
++  if (match.empty()) {
++    resultOut.clear();
++    return ExecutionStatus::RETURNED;
++  }
++  const bool hasIndices = JSRegExp::getSyntaxFlags(regexp.get()).hasIndices;
++
+   auto arrRes = JSArray::createAndAllocPropStorage(
+       runtime,
+       Handle<JSObject>::vmcast(&runtime.arrayPrototype),
+@@ -1111,10 +1130,7 @@ ExecutionStatus directRegExpExec(
+ }
+ 
+ /// ES9.0 21.2.5.2.2 Runtime Semantics: RegExpBuiltinExec ( R, S )
+-/// TODO: this is a wrapper around \f directRegExpExec right now, and it is
+-/// semantically equivalent to the spec definition without unicode support.
+-/// After updating this to exactly match the spec, replace usages of \f
+-/// directRegExpExec with this function.
++/// Adapt directRegExpExec's nullable array output to a JavaScript value.
+ static CallResult<HermesValue> regExpBuiltinExec(
+     Runtime &runtime,
+     Handle<JSRegExp> R,
+@@ -1145,9 +1161,47 @@ advanceStringIndex(const StringPrimitive *S, uint64_t index, bool unicode) {
+   return index + 1;
+ }
+ 
+-/// ES6.0 21.2.5.2.1 Runtime Semantics: RegExpExec ( R, S )
+-CallResult<HermesValue>
+-regExpExec(Runtime &runtime, Handle<JSObject> R, Handle<StringPrimitive> S) {
++enum class RegExpExecResult { MatchObject, Boolean };
++
++// Only an ordinary data property can establish this shortcut. Accessors and
++// proxy/host prototype chains must use Get and retain all of its side effects.
++static bool hasBuiltinRegExpExec(JSRegExp *regexp, Runtime &runtime) {
++  for (JSObject *object = regexp; object; object = object->getParent(runtime)) {
++    if (object->isProxyObject() || object->isHostObject())
++      return false;
++    NamedPropertyDescriptor desc;
++    auto found = JSObject::tryGetOwnNamedDescriptorFast(
++        object, runtime, Predefined::getSymbolID(Predefined::exec), desc);
++    // An absent property map is inconclusive. The heuristic no-allocation
++    // lookup cannot recover the slot of a flags-only hidden-class transition.
++    if (!found)
++      return false;
++    if (!*found)
++      continue;
++    if (desc.flags.accessor)
++      return false;
++    auto value = JSObject::getNamedSlotValueUnsafe(object, runtime, desc);
++    auto *native = dyn_vmcast<NativeFunction>(value.unboxToHV(runtime));
++    return native && native->getFunctionPtr() == regExpPrototypeExec &&
++        native->getContext() == nullptr;
++  }
++  return false;
++}
++
++/// RegExpExec with an internal boolean consumer that can omit result objects.
++static CallResult<HermesValue> regExpExecImpl(
++    Runtime &runtime,
++    Handle<JSObject> R,
++    Handle<StringPrimitive> S,
++    RegExpExecResult resultKind) {
++  auto regExpObj = Handle<JSRegExp>::dyn_vmcast(R);
++  if (resultKind == RegExpExecResult::Boolean && regExpObj &&
++      hasBuiltinRegExpExec(regExpObj.get(), runtime)) {
++    auto match = directRegExpMatch(regExpObj, runtime, S);
++    if (LLVM_UNLIKELY(match == ExecutionStatus::EXCEPTION))
++      return ExecutionStatus::EXCEPTION;
++    return HermesValue::encodeBoolValue(!match->empty());
++  }
+   struct : public Locals {
+     PinnedValue<> exec;
+   } lv;
+@@ -1161,8 +1215,15 @@ regExpExec(Runtime &runtime, Handle<JSObject> R, Handle<StringPrimitive> S) {
+     return ExecutionStatus::EXCEPTION;
+   }
+   lv.exec = std::move(propRes.getValue());
++  // Resolve exec exactly once, after input coercion. A getter may change the
++  // receiver or prototypes; only the callable actually returned is authoritative.
++  auto execCallable = Handle<Callable>::dyn_vmcast(Handle<>{lv.exec});
++  auto *nativeExec = dyn_vmcast<NativeFunction>(lv.exec.getHermesValue());
++  const bool builtinTest = resultKind == RegExpExecResult::Boolean && regExpObj &&
++      nativeExec && nativeExec->getFunctionPtr() == regExpPrototypeExec &&
++      nativeExec->getContext() == nullptr;
+   // 5. If IsCallable(exec) is true, then
+-  if (auto execCallable = Handle<Callable>::dyn_vmcast(Handle<>{lv.exec})) {
++  if (execCallable && !builtinTest) {
+     // a. Let result be Call(exec, R, «S»).
+     // b. ReturnIfAbrupt(result).
+     auto callRes =
+@@ -1176,28 +1237,39 @@ regExpExec(Runtime &runtime, Handle<JSObject> R, Handle<StringPrimitive> S) {
+       return runtime.raiseTypeError(
+           "The result of exec can only be object or null.");
+     }
+-    // d. Return result.
++    // d. Return result (or its presence for the internal test consumer).
++    if (resultKind == RegExpExecResult::Boolean)
++      return HermesValue::encodeBoolValue(!(*callRes)->isNull());
+     return callRes.toCallResultHermesValue();
+   }
+   // 6. If R does not have a [[RegExpMatcher]] internal slot, throw a TypeError
+   // exception.
+   // In our implementation, having a [[RegExpMatcher]] internal slot is
+   // equivalent to being a JSRegExp class instance.
+-  auto regExpObj = Handle<JSRegExp>::dyn_vmcast(R);
+   if (LLVM_UNLIKELY(!regExpObj)) {
+     return runtime.raiseTypeError(
+         "Failed to execute an invalid regular expression object.");
+   }
+   // 7. Return RegExpBuiltinExec(R, S).
++  if (resultKind == RegExpExecResult::Boolean) {
++    auto match = directRegExpMatch(regExpObj, runtime, S);
++    if (LLVM_UNLIKELY(match == ExecutionStatus::EXCEPTION))
++      return ExecutionStatus::EXCEPTION;
++    return HermesValue::encodeBoolValue(!match->empty());
++  }
+   return regExpBuiltinExec(runtime, regExpObj, S);
+ }
+ 
++/// ES6.0 21.2.5.2.1 Runtime Semantics: RegExpExec ( R, S )
++CallResult<HermesValue>
++regExpExec(Runtime &runtime, Handle<JSObject> R, Handle<StringPrimitive> S) {
++  return regExpExecImpl(runtime, R, S, RegExpExecResult::MatchObject);
++}
++
+ /// Implementation of RegExp.prototype.exec
+ /// Returns an Array if a match is found, null if no match is found
+-/// Helper function for regExpPrototypeExec that takes NativeArgs directly
+-static CallResult<HermesValue> regExpPrototypeExecImpl(
+-    Runtime &runtime,
+-    NativeArgs args) {
++CallResult<HermesValue> regExpPrototypeExec(void *, Runtime &runtime) {
++  NativeArgs args = runtime.getCurrentFrame().getNativeArgs();
+   struct : public Locals {
+     PinnedValue<StringPrimitive> S;
+     PinnedValue<JSArray> result;
+@@ -1227,27 +1299,36 @@ static CallResult<HermesValue> regExpPrototypeExecImpl(
+   return lv.result.getHermesValue();
+ }
+ 
+-CallResult<HermesValue> regExpPrototypeExec(void *, Runtime &runtime) {
++/// Implementation of RegExp.prototype.test.
++CallResult<HermesValue> regExpPrototypeTest(void *, Runtime &runtime) {
+   NativeArgs args = runtime.getCurrentFrame().getNativeArgs();
+-  return regExpPrototypeExecImpl(runtime, args);
+-}
++  struct : public Locals {
++    PinnedValue<StringPrimitive> S;
++  } lv;
++  LocalsRAII lraii(runtime, &lv);
+ 
+-/// Implementation of RegExp.prototype.test
+-/// Returns true if a match is found, false otherwise
+-/// TODO optimization: avoid constructing the submatch array. Instead simply
+-/// check for a match.
+-CallResult<HermesValue> regExpPrototypeTest(void *context, Runtime &runtime) {
+-  NativeArgs args = runtime.getCurrentFrame().getNativeArgs();
+-  CallResult<HermesValue> res = regExpPrototypeExecImpl(runtime, args);
+-  if (res == ExecutionStatus::EXCEPTION)
++  auto receiver = args.dyncastThis<JSObject>();
++  if (!receiver)
++    return runtime.raiseTypeError("RegExp.prototype.test requires an object");
++  auto strRes = toString_RJS(runtime, args.getArgHandle(0));
++  if (LLVM_UNLIKELY(strRes == ExecutionStatus::EXCEPTION))
+     return ExecutionStatus::EXCEPTION;
++  lv.S = std::move(*strRes);
++  return regExpExecImpl(runtime, receiver, lv.S, RegExpExecResult::Boolean);
++}
+ 
+-  return HermesValue::encodeBoolValue(!res.getValue().isNull());
++static void materializeLegacyRegExpInput(Runtime &runtime) {
++  if (!runtime.regExpLastInputChar->isNumber())
++    return;
++  auto character = static_cast<char16_t>(runtime.regExpLastInputChar->getNumber());
++  runtime.regExpLastInput = runtime.getCharacterString(character);
++  runtime.regExpLastInputChar = HermesValue::encodeUndefinedValue();
+ }
+ 
+ /// Return the ith capture group in the most recent successful RegExp search.
+ /// If there was no ith capture group, return "".
+ CallResult<HermesValue> regExpDollarNumberGetter(void *ctx, Runtime &runtime) {
++  materializeLegacyRegExpInput(runtime);
+   size_t i = reinterpret_cast<size_t>(ctx);
+ 
+   auto match = runtime.regExpLastMatch;
+@@ -1294,9 +1375,8 @@ CallResult<HermesValue> regExpSourceGetter(void *ctx, Runtime &runtime) {
+   // "Let src be the value of R’s [[OriginalSource]] internal slot."
+   // "Let flags be the value of R’s [[OriginalFlags]] internal slot."
+   // "Return EscapeRegExpPattern(src, flags)."
+-  // Note that ES6 specifies that we provide the flags to EscapeRegExpPattern,
+-  // however this is only to distinguish a Unicode from a non-Unicode regexp.
+-  // Beacuse we do not yet support Unicode regexps we can omit the flags.
++  // Escaping slashes and line terminators preserves the source in both Unicode
++  // and non-Unicode modes, so escapePattern does not need the flags.
+   struct : public Locals {
+     PinnedValue<StringPrimitive> patternHandle;
+   } lv;
+@@ -1351,6 +1431,7 @@ CallResult<HermesValue> regExpFlagPropertyGetter(void *ctx, Runtime &runtime) {
+ }
+ 
+ CallResult<HermesValue> regExpLeftContextGetter(void *ctx, Runtime &runtime) {
++  materializeLegacyRegExpInput(runtime);
+   auto match = runtime.regExpLastMatch;
+   if (match.size() >= 1 && *runtime.regExpLastInput) {
+     auto strRes = StringPrimitive::slice(
+@@ -1366,6 +1447,7 @@ CallResult<HermesValue> regExpLeftContextGetter(void *ctx, Runtime &runtime) {
+ }
+ 
+ CallResult<HermesValue> regExpRightContextGetter(void *ctx, Runtime &runtime) {
++  materializeLegacyRegExpInput(runtime);
+   auto match = runtime.regExpLastMatch;
+   if (match.size() >= 1 && *runtime.regExpLastInput) {
+     Handle<StringPrimitive> S{runtime.regExpLastInput};
+@@ -1385,6 +1467,7 @@ CallResult<HermesValue> regExpRightContextGetter(void *ctx, Runtime &runtime) {
+ }
+ 
+ CallResult<HermesValue> regExpInputGetter(void *ctx, Runtime &runtime) {
++  materializeLegacyRegExpInput(runtime);
+   if (*runtime.regExpLastInput) {
+     return runtime.regExpLastInput.getHermesValue();
+   }
+@@ -1394,6 +1477,7 @@ CallResult<HermesValue> regExpInputGetter(void *ctx, Runtime &runtime) {
+ }
+ 
+ CallResult<HermesValue> regExpLastMatchGetter(void *ctx, Runtime &runtime) {
++  materializeLegacyRegExpInput(runtime);
+   auto match = runtime.regExpLastMatch;
+   if (match.size() >= 1 && *runtime.regExpLastInput) {
+     auto strRes = StringPrimitive::slice(
+@@ -1409,6 +1493,7 @@ CallResult<HermesValue> regExpLastMatchGetter(void *ctx, Runtime &runtime) {
+ }
+ 
+ CallResult<HermesValue> regExpLastParenGetter(void *ctx, Runtime &runtime) {
++  materializeLegacyRegExpInput(runtime);
+   auto match = runtime.regExpLastMatch;
+   if (match.size() >= 2 && *runtime.regExpLastInput) {
+     const auto &cap = match.back();
+@@ -1984,6 +2069,46 @@ CallResult<HermesValue> regExpPrototypeSymbolSearch(void *, Runtime &runtime) {
+       .toCallResultHermesValue();
+ }
+ 
++// The caller has performed input/replacement coercion, global/unicode Gets and
++// the initial lastIndex write. With an ordinary builtin exec and internal g,
++// matching cannot call JS: lastIndex remains numeric and non-configurable.
++// Therefore its temporary result objects are unobservable, and an empty
++// replacement can copy unmatched spans directly while retaining legacy state.
++static CallResult<HermesValue> replaceRegExpWithEmptyString(
++    Runtime &runtime,
++    Handle<JSRegExp> regexp,
++    Handle<StringPrimitive> input,
++    bool fullUnicode) {
++  auto view = StringPrimitive::createStringView(runtime, input);
++  SmallU16String<32> output;
++  uint32_t nextSource = 0;
++  bool matched = false;
++  for (;;) {
++    GCScopeMarkerRAII marker{runtime};
++    auto result = directRegExpMatch(regexp, runtime, input);
++    if (LLVM_UNLIKELY(result == ExecutionStatus::EXCEPTION))
++      return ExecutionStatus::EXCEPTION;
++    if (result->empty())
++      break;
++    const auto range = *result->front();
++    assert(range.location >= nextSource && "global matches must advance");
++    view.slice(nextSource, range.location - nextSource).appendUTF16String(output);
++    nextSource = range.location + range.length;
++    matched = true;
++    if (range.length == 0 &&
++        setLastIndex(
++            regexp,
++            runtime,
++            advanceStringIndex(input.get(), nextSource, fullUnicode)) ==
++            ExecutionStatus::EXCEPTION)
++      return ExecutionStatus::EXCEPTION;
++  }
++  if (!matched)
++    return input.getHermesValue();
++  view.slice(nextSource).appendUTF16String(output);
++  return StringPrimitive::createEfficient(runtime, output);
++}
++
+ /// ES6.0 21.2.5.8
+ CallResult<HermesValue> regExpPrototypeSymbolReplace(void *, Runtime &runtime) {
+   struct : public Locals {
+@@ -2067,6 +2192,13 @@ CallResult<HermesValue> regExpPrototypeSymbolReplace(void *, Runtime &runtime) {
+       return ExecutionStatus::EXCEPTION;
+     }
+   }
++  auto regexp = Handle<JSRegExp>::dyn_vmcast(rx);
++  if (!replaceFn && lv.replaceValueStr->getStringLength() == 0 && global &&
++      regexp && JSRegExp::getSyntaxFlags(regexp.get()).global &&
++      hasBuiltinRegExpExec(regexp.get(), runtime)) {
++    return replaceRegExpWithEmptyString(runtime, regexp, lv.S, fullUnicode);
++  }
++
+   // 11. Let results be a new empty List.
+   auto arrRes = ArrayStorageSmall::create(runtime, 16 /* capacity */);
+   if (LLVM_UNLIKELY(arrRes == ExecutionStatus::EXCEPTION)) {
+@@ -2665,7 +2797,6 @@ CallResult<HermesValue> regExpPrototypeSymbolSplit(void *, Runtime &runtime) {
+ }
+ 
+ // ES2022 22.2.5.4
+-// Note that we don't yet support unicode.
+ CallResult<HermesValue> regExpFlagsGetter(void *ctx, Runtime &runtime) {
+   NativeArgs args = runtime.getCurrentFrame().getNativeArgs();
+   // Let R be the this value.
+diff --git a/lib/VM/JSRegExp.cpp b/lib/VM/JSRegExp.cpp
+index 61ac894c0832b3763f7636845224f97fe77eadba..22d0a93b9f24c094aa809a0aa9b7a6ad104fac4b 100644
+--- a/lib/VM/JSRegExp.cpp
++++ b/lib/VM/JSRegExp.cpp
+@@ -98,7 +98,10 @@ void JSRegExp::initialize(
+     Runtime &runtime,
+     Handle<StringPrimitive> pattern,
+     Handle<StringPrimitive> flags,
+-    llvh::ArrayRef<uint8_t> bytecode) {
++    llvh::ArrayRef<uint8_t> bytecode,
++    BytecodeOwnership ownership,
++    const uint8_t *simpleRegex,
++    HermesRegexAOTMatcher aotMatcher) {
+   assert(
+       pattern && flags &&
+       "Null pattern and/or flags passed to JSRegExp::initialize");
+@@ -119,7 +122,14 @@ void JSRegExp::initialize(
+       res != ExecutionStatus::EXCEPTION && *res &&
+       "defineOwnProperty() failed");
+ 
+-  selfHandle->initializeBytecode(bytecode);
++  assert(
++      (!(simpleRegex || aotMatcher) ||
++       ownership == BytecodeOwnership::BorrowPersistent) &&
++      "Specialized descriptors require persistent storage");
++  assert(!(simpleRegex && aotMatcher) && "Only one matcher tier is selected");
++  selfHandle->initializeBytecode(bytecode, ownership);
++  selfHandle->simpleRegex_ = simpleRegex;
++  selfHandle->aotMatcher_ = aotMatcher;
+ }
+ 
+ ExecutionStatus JSRegExp::initialize(
+@@ -150,7 +160,8 @@ ExecutionStatus JSRegExp::initialize(
+         runtime,
+         lv.pattern,
+         flags,
+-        {otherHandle->bytecode_, otherHandle->bytecodeSize_});
++        {otherHandle->bytecode_, otherHandle->bytecodeSize_},
++        BytecodeOwnership::Copy);
+     // The group name mapping depends only on the pattern, and it is never
+     // modified after initialization, so share it rather than rebuilding it.
+     selfHandle->groupNameMappings_.set(
+@@ -194,7 +205,8 @@ ExecutionStatus JSRegExp::initialize(
+               regex.getGroupNamesMapping()) == ExecutionStatus::EXCEPTION)) {
+     return ExecutionStatus::EXCEPTION;
+   }
+-  initialize(selfHandle, runtime, pattern, flags, bytecode);
++  initialize(
++      selfHandle, runtime, pattern, flags, bytecode, BytecodeOwnership::Copy);
+   return ExecutionStatus::RETURNED;
+ }
+ 
+@@ -252,7 +264,10 @@ void JSRegExp::setGroupNameMappings(Runtime &runtime, JSObject *groupObj) {
+   groupNameMappings_.set(runtime, groupObj, runtime.getHeap());
+ }
+ 
+-void JSRegExp::initializeBytecode(llvh::ArrayRef<uint8_t> bytecode) {
++void JSRegExp::initializeBytecode(
++    llvh::ArrayRef<uint8_t> bytecode,
++    BytecodeOwnership ownership) {
++  assert(!bytecode_ && "RegExp bytecode may only be initialized once");
+   size_t sz = bytecode.size();
+   assert(
+       sz <= std::numeric_limits<uint32_t>::max() &&
+@@ -261,8 +276,14 @@ void JSRegExp::initializeBytecode(llvh::ArrayRef<uint8_t> bytecode) {
+       reinterpret_cast<const regex::RegexBytecodeHeader *>(bytecode.data());
+   syntaxFlags_ = regex::SyntaxFlags::fromByte(header->syntaxFlags);
+   bytecodeSize_ = sz;
+-  bytecode_ = (uint8_t *)checkedMalloc(sz);
+-  memcpy(bytecode_, bytecode.data(), sz);
++  bytecodeOwnership_ = ownership;
++  if (ownership == BytecodeOwnership::BorrowPersistent) {
++    bytecode_ = bytecode.data();
++  } else {
++    auto *owned = static_cast<uint8_t *>(checkedMalloc(sz));
++    memcpy(owned, bytecode.data(), sz);
++    bytecode_ = owned;
++  }
+ }
+ 
+ PseudoHandle<StringPrimitive> JSRegExp::getPattern(
+@@ -271,42 +292,65 @@ PseudoHandle<StringPrimitive> JSRegExp::getPattern(
+   return createPseudoHandle(self->pattern_.get(base));
+ }
+ 
+-template <typename CharT, typename Traits>
++template <typename CharT>
+ CallResult<RegExpMatch> performSearch(
+     Runtime &runtime,
+     llvh::ArrayRef<uint8_t> bytecode,
++    const uint8_t *simpleRegex,
++    HermesRegexAOTMatcher aotMatcher,
+     const CharT *start,
+     uint32_t stringLength,
+     uint32_t searchStartOffset,
+     regex::constants::MatchFlagType matchFlags) {
+-  std::vector<regex::CapturedRange> nativeMatchRanges;
+-  auto matchResult = regex::searchWithBytecode(
+-      bytecode,
+-      start,
+-      searchStartOffset,
+-      stringLength,
+-      &nativeMatchRanges,
+-      matchFlags,
+-      runtime.getOverflowGuardForRegex());
++  RegExpMatch match;
++  // This sink only grows native storage. It must not allocate GC cells or call
++  // JS while the executor holds raw pointers into the subject string.
++  auto writeMatch = [&match](
++                        regex::CapturedRange full,
++                        llvh::ArrayRef<regex::CapturedRange> captures) {
++    match.reserve(captures.size() + 1);
++    match.push_back(RegExpMatchRange{full.start, full.end - full.start});
++    for (const auto &capture : captures) {
++      if (capture.matched()) {
++        match.push_back(
++            RegExpMatchRange{capture.start, capture.end - capture.start});
++      } else {
++        match.push_back(llvh::None);
++      }
++    }
++  };
++  const auto guard = runtime.getOverflowGuardForRegex();
++  const auto matchResult = aotMatcher
++      ? regex::searchWithAOTRegex(
++            aotMatcher,
++            bytecode,
++            start,
++            searchStartOffset,
++            stringLength,
++            writeMatch,
++            matchFlags,
++            guard)
++      : simpleRegex
++      ? regex::searchWithSimpleRegex(
++            simpleRegex,
++            start,
++            searchStartOffset,
++            stringLength,
++            writeMatch,
++            matchFlags,
++            guard)
++      : regex::searchWithBytecode(
++            bytecode,
++            start,
++            searchStartOffset,
++            stringLength,
++            writeMatch,
++            matchFlags,
++            guard);
+   if (matchResult == regex::MatchRuntimeResult::StackOverflow) {
+     return runtime.raiseRangeError("Maximum regex stack depth reached");
+   } else if (matchResult == regex::MatchRuntimeResult::NoMatch) {
+-    return RegExpMatch{}; // not found.
+-  }
+-  size_t matchRangeCount = nativeMatchRanges.size();
+-  assert(matchRangeCount > 0);
+-  RegExpMatch match;
+-  match.reserve(matchRangeCount);
+-  for (size_t i = 0; i < matchRangeCount; i++) {
+-    const auto &submatch = nativeMatchRanges[i];
+-    if (!submatch.matched()) {
+-      assert(i > 0 && "match_result[0] should always match");
+-      match.push_back(llvh::None);
+-    } else {
+-      uint32_t pos = submatch.start;
+-      uint32_t length = submatch.end - submatch.start;
+-      match.push_back(RegExpMatchRange{pos, length});
+-    }
++    return RegExpMatch{};
+   }
+   assert(!match.empty() && "Unexpected empty match");
+   return match;
+@@ -337,17 +381,21 @@ CallResult<RegExpMatch> JSRegExp::search(
+   CallResult<RegExpMatch> matchResult = RegExpMatch{};
+   if (input.isASCII()) {
+     matchFlags |= regex::constants::matchInputAllAscii;
+-    matchResult = performSearch<char, regex::ASCIIRegexTraits>(
++    matchResult = performSearch<char>(
+         runtime,
+         llvh::makeArrayRef(selfHandle->bytecode_, selfHandle->bytecodeSize_),
++        selfHandle->simpleRegex_,
++        selfHandle->aotMatcher_,
+         input.castToCharPtr(),
+         input.length(),
+         searchStartOffset,
+         matchFlags);
+   } else {
+-    matchResult = performSearch<char16_t, regex::UTF16RegexTraits>(
++    matchResult = performSearch<char16_t>(
+         runtime,
+         llvh::makeArrayRef(selfHandle->bytecode_, selfHandle->bytecodeSize_),
++        selfHandle->simpleRegex_,
++        selfHandle->aotMatcher_,
+         input.castToChar16Ptr(),
+         input.length(),
+         searchStartOffset,
+@@ -359,19 +407,21 @@ CallResult<RegExpMatch> JSRegExp::search(
+     return ExecutionStatus::EXCEPTION;
+   } else if (!matchResult->empty()) {
+     runtime.regExpLastInput = strHandle;
+-    runtime.regExpLastRegExp = selfHandle;
++    runtime.regExpLastInputChar = HermesValue::encodeUndefinedValue();
+     runtime.regExpLastMatch = *matchResult;
+   }
+   return matchResult;
+ }
+ 
+ JSRegExp::~JSRegExp() {
+-  free(bytecode_);
++  if (bytecodeOwnership_ == BytecodeOwnership::Copy)
++    free(const_cast<uint8_t *>(bytecode_));
+ }
+ 
+ void JSRegExp::_finalizeImpl(GCCell *cell, GC &gc) {
+   JSRegExp *self = vmcast<JSRegExp>(cell);
+-  if (self->bytecode_) {
++  if (self->bytecode_ &&
++      self->bytecodeOwnership_ == BytecodeOwnership::Copy) {
+     gc.getIDTracker().untrackNative(self->bytecode_);
+   }
+   self->~JSRegExp();
+@@ -379,7 +429,9 @@ void JSRegExp::_finalizeImpl(GCCell *cell, GC &gc) {
+ 
+ size_t JSRegExp::_mallocSizeImpl(GCCell *cell) {
+   auto *self = vmcast<JSRegExp>(cell);
+-  return self->bytecodeSize_;
++  return self->bytecodeOwnership_ == BytecodeOwnership::Copy
++      ? self->bytecodeSize_
++      : 0;
+ }
+ 
+ #ifdef HERMES_MEMORY_INSTRUMENTATION
+@@ -392,7 +444,8 @@ void JSRegExp::_snapshotAddEdgesImpl(GCCell *cell, GC &gc, HeapSnapshot &snap) {
+   auto *const self = vmcast<JSRegExp>(cell);
+   // Call the super type to add any other custom edges.
+   JSObject::_snapshotAddEdgesImpl(self, gc, snap);
+-  if (self->bytecode_) {
++  if (self->bytecode_ &&
++      self->bytecodeOwnership_ == BytecodeOwnership::Copy) {
+     snap.addNamedEdge(
+         HeapSnapshot::EdgeType::Internal,
+         "bytecode",
+@@ -402,7 +455,8 @@ void JSRegExp::_snapshotAddEdgesImpl(GCCell *cell, GC &gc, HeapSnapshot &snap) {
+ 
+ void JSRegExp::_snapshotAddNodesImpl(GCCell *cell, GC &gc, HeapSnapshot &snap) {
+   auto *const self = vmcast<JSRegExp>(cell);
+-  if (self->bytecode_) {
++  if (self->bytecode_ &&
++      self->bytecodeOwnership_ == BytecodeOwnership::Copy) {
+     // Add a native node for regex bytecode, to account for native size
+     // directly owned by the regex.
+     snap.beginNode();
+diff --git a/lib/VM/StaticH.cpp b/lib/VM/StaticH.cpp
+index 25893912943e50d8a55996dd029c3bcb9ffba4f0..0f1f317f040ae02b69aa9ad388bbae93115454a4 100644
+--- a/lib/VM/StaticH.cpp
++++ b/lib/VM/StaticH.cpp
+@@ -8,6 +8,7 @@
+ #include "SHUnitExt.h"
+ #include "hermes/BCGen/SerializedLiteralParser.h"
+ #include "hermes/Platform/Unicode/PlatformUnicode.h"
++#include "hermes/Regex/Executor.h"
+ #include "hermes/Support/UTF8.h"
+ #include "hermes/VM/ArrayStorage.h"
+ #include "hermes/VM/Callable.h"
+@@ -2668,6 +2669,196 @@ _sh_ljs_create_regexp(SHRuntime *shr, SHSymbolID pattern, SHSymbolID flags) {
+   return *cr;
+ }
+ 
++static SHLegacyValue createRegExpPrecompiled(
++    SHRuntime *shr,
++    SHSymbolID pattern,
++    SHSymbolID flags,
++    const uint8_t *bytecode,
++    uint32_t bytecodeSize,
++    const uint8_t *simpleRegex,
++    HermesRegexAOTMatcher aotMatcher) {
++  Runtime &runtime = getRuntime(shr);
++  GCScopeMarkerRAII marker{runtime};
++  Handle<JSRegExp> re = runtime.makeHandle(JSRegExp::create(runtime));
++  auto patternHandle = runtime.makeHandle(
++      runtime.getStringPrimFromSymbolID(SymbolID::unsafeCreate(pattern)));
++  auto flagsHandle = runtime.makeHandle(
++      runtime.getStringPrimFromSymbolID(SymbolID::unsafeCreate(flags)));
++  JSRegExp::initialize(
++      re,
++      runtime,
++      patternHandle,
++      flagsHandle,
++      {bytecode, bytecodeSize},
++      JSRegExp::BytecodeOwnership::BorrowPersistent,
++      simpleRegex,
++      aotMatcher);
++  return re.getHermesValue();
++}
++
++LLVM_ATTRIBUTE_NOINLINE
++extern "C" SHLegacyValue _sh_ljs_create_regexp_precompiled(
++    SHRuntime *shr,
++    SHSymbolID pattern,
++    SHSymbolID flags,
++    const uint8_t *bytecode,
++    uint32_t bytecodeSize) {
++  return createRegExpPrecompiled(
++      shr, pattern, flags, bytecode, bytecodeSize, nullptr, nullptr);
++}
++
++LLVM_ATTRIBUTE_NOINLINE
++extern "C" SHLegacyValue _sh_ljs_create_regexp_specialized(
++    SHRuntime *shr,
++    SHSymbolID pattern,
++    SHSymbolID flags,
++    const uint8_t *bytecode,
++    uint32_t bytecodeSize,
++    const uint8_t *simpleRegex,
++    HermesRegexAOTMatcher aotMatcher) {
++  return createRegExpPrecompiled(
++      shr, pattern, flags, bytecode, bytecodeSize, simpleRegex, aotMatcher);
++}
++
++static bool hasRegExpFlagGetter(
++    Runtime &runtime, Predefined::Str key, char flag) {
++  NamedPropertyDescriptor descriptor;
++  if (!JSObject::getOwnNamedDescriptor(
++          runtime.regExpPrototype, runtime, Predefined::getSymbolID(key),
++          descriptor) || !descriptor.flags.accessor)
++    return false;
++  auto value = JSObject::getNamedSlotValueUnsafe(
++      *runtime.regExpPrototype, runtime, descriptor).unboxToHV(runtime);
++  auto *accessor = vmcast<PropertyAccessor>(value);
++  auto *getter = dyn_vmcast<NativeFunction>(accessor->getter.get(runtime));
++  return getter && getter->getFunctionPtr() == regExpFlagPropertyGetter &&
++      getter->getContext() == reinterpret_cast<void *>(uintptr_t(flag));
++}
++
++static CallResult<HermesValue> tryFastRegExp(
++    Runtime &runtime, const uint8_t *descriptor, uint32_t operation,
++    Handle<> input, Handle<> index) {
++  auto string = Handle<StringPrimitive>::dyn_vmcast(input);
++  if (!string)
++    return HermesValue::encodeUndefinedValue();
++  const bool test = operation == HermesRegexTest ||
++      operation == HermesRegexTestIndexed;
++  const bool lower = operation == HermesRegexLowerReplaceEmpty ||
++      operation == HermesRegexLowerReplaceEmptyEqual;
++  const bool equal = operation == HermesRegexReplaceEmptyEqual ||
++      operation == HermesRegexLowerReplaceEmptyEqual;
++  uint32_t charIndex = 0;
++  if (operation == HermesRegexTestIndexed) {
++    if (!index->isNumber())
++      return HermesValue::encodeUndefinedValue();
++    double number = index->getNumber();
++    if (!(number >= 0 && number < string->getStringLength()) ||
++        std::floor(number) != number)
++      return HermesValue::encodeUndefinedValue();
++    charIndex = static_cast<uint32_t>(number);
++  }
++  // Own data methods/accessors on the intrinsic prototypes prove the entire
++  // lookup chain for a fresh literal and a primitive string. No user code can
++  // run between these checks and use; the compiler keeps argument effects on
++  // the original path. Do not replace these checks with a slot-only heuristic.
++  if (!hasOwnNativeMethod(runtime, runtime.regExpPrototype,
++                          Predefined::exec, regExpPrototypeExec))
++    return HermesValue::encodeUndefinedValue();
++  if (test) {
++    if (!hasOwnNativeMethod(runtime, runtime.regExpPrototype,
++                            Predefined::test, regExpPrototypeTest))
++      return HermesValue::encodeUndefinedValue();
++  } else {
++    if (!hasOwnNativeMethod(runtime, runtime.stringPrototype,
++                            Predefined::replace, stringPrototypeReplace) ||
++        !hasOwnNativeMethod(runtime, runtime.regExpPrototype,
++                            Predefined::SymbolReplace,
++                            regExpPrototypeSymbolReplace) ||
++        !hasRegExpFlagGetter(runtime, Predefined::global, 'g') ||
++        !hasRegExpFlagGetter(runtime, Predefined::unicode, 'u') ||
++        (lower && !hasOwnNativeMethod(runtime, runtime.stringPrototype,
++                                     Predefined::toLowerCase,
++                                     stringPrototypeToLowerCase)))
++      return HermesValue::encodeUndefinedValue();
++  }
++
++  auto guard = runtime.getOverflowGuardForRegex();
++#ifndef HERMES_CHECK_NATIVE_STACK
++  StackOverflowGuard::CallFrameRAII frame{guard};
++#endif
++  if (guard.isOverflowing())
++    return HermesValue::encodeUndefinedValue();
++
++  auto view = StringPrimitive::createStringView(runtime, string);
++  uint32_t lastMatch = UINT32_MAX;
++  SmallU16String<32> output;
++  const uint32_t length = operation == HermesRegexTestIndexed ? 1 : view.length();
++  for (uint32_t i = 0; i < length; ++i) {
++    const char16_t character = view[charIndex + i];
++    if (lower) {
++      bool unchanged;
++#if HERMES_PLATFORM_UNICODE == HERMES_PLATFORM_UNICODE_LITE || \
++    HERMES_PLATFORM_UNICODE == HERMES_PLATFORM_UNICODE_HERMES || \
++    HERMES_PLATFORM_UNICODE == HERMES_PLATFORM_UNICODE_EMSCRIPTEN
++      unchanged = unicode::isUnchangedLowercaseCodeUnit(character);
++#else
++      // Platform casing tables can differ from the compiler's tables. ASCII
++      // has identical root semantics; other characters use the platform path.
++      unchanged = character < 128 && (character < 'A' || character > 'Z');
++#endif
++      if (!unchanged)
++        return HermesValue::encodeUndefinedValue();
++    }
++    if (regex::matchSimpleRegexCharacter(descriptor, character)) {
++      if (!test && !equal && lastMatch == UINT32_MAX)
++        view.slice(0, i).appendUTF16String(output);
++      lastMatch = i;
++      if (test)
++        break;
++    } else if (!test && !equal && lastMatch != UINT32_MAX) {
++      output.push_back(character);
++    }
++  }
++
++  if (lastMatch != UINT32_MAX) {
++    // A failed test leaves previous state intact. Global replacement publishes
++    // the LAST successful match, even when the consumer needs only equality.
++    // No capture groups exist in this descriptor shape.
++    if (operation == HermesRegexTestIndexed) {
++      runtime.regExpLastInput = nullptr;
++      runtime.regExpLastInputChar =
++          HermesValue::encodeTrustedNumberValue(view[charIndex]);
++    } else {
++      runtime.regExpLastInput = string;
++      runtime.regExpLastInputChar = HermesValue::encodeUndefinedValue();
++    }
++    runtime.regExpLastMatch.resize(1);
++    runtime.regExpLastMatch[0] = RegExpMatchRange{lastMatch, 1};
++  }
++  if (test)
++    return HermesValue::encodeBoolValue(lastMatch != UINT32_MAX);
++  if (equal)
++    return HermesValue::encodeBoolValue(lastMatch == UINT32_MAX);
++  if (lastMatch == UINT32_MAX)
++    return string.getHermesValue();
++  return StringPrimitive::createEfficient(runtime, output);
++}
++
++extern "C" SHLegacyValue _sh_ljs_try_fast_regexp(
++    SHRuntime *shr, const uint8_t *descriptor, uint32_t operation,
++    const SHLegacyValue *input, const SHLegacyValue *index) {
++  auto &runtime = getRuntime(shr);
++  CallResult<HermesValue> result{ExecutionStatus::EXCEPTION};
++  {
++    GCScopeMarkerRAII marker{runtime};
++    result = tryFastRegExp(runtime, descriptor, operation,
++                          Handle<>(toPHV(input)), Handle<>(toPHV(index)));
++  }
++  if (LLVM_UNLIKELY(result == ExecutionStatus::EXCEPTION))
++    _sh_throw_current(shr);
++  return *result;
++}
++
+ LLVM_ATTRIBUTE_NOINLINE
+ extern "C" SHLegacyValue
+ _sh_ljs_create_bigint(SHRuntime *shr, const uint8_t *value, uint32_t size) {
+diff --git a/test/shermes/regexp-aot-bundle.js b/test/shermes/regexp-aot-bundle.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e08c73aca85d67c1b19e6bac5dd0ffe3e16b141
+--- /dev/null
++++ b/test/shermes/regexp-aot-bundle.js
+@@ -0,0 +1,18 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++// REQUIRES: linux, shermes
++// RUN: rm -rf %t.bundle && mkdir %t.bundle
++// RUN: cd %t.bundle && %shermes -O -emit-c -Xemit-c-bundle -Xemit-c-shard-size=65536 -o unit.c.json %S/regexp-aot.js
++// RUN: cd %t.bundle && for source in sh_this_unit_*.c; do %c_compiler -O2 -DNDEBUG -I%static_h_config -I%S/../../include -c "$source" -o "${source%.c}.o" || exit; done
++// RUN: cd %t.bundle && %c_compiler sh_this_unit_*.o -L%hermesvm_lib_dir -L%shermes_console_lib_dir -Wl,-rpath,%hermesvm_lib_dir -Wl,-rpath,%shermes_console_lib_dir -lshermes_console -lhermesvm -lm -o regexp-aot
++// RUN: cd %t.bundle && ./regexp-aot | %FileCheck --match-full-lines %S/regexp-aot.js
++
++// Run the existing parity cases across separately compiled translation units.
++// Matcher definitions live in metadata while literal references can occur in
++// function shards and outlined helpers; emitted-text checks cannot verify this
++// linkage or the runtime function pointers.
+diff --git a/test/shermes/regexp-aot.js b/test/shermes/regexp-aot.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..71459d14b873648ba07aa908ac043d0c62d30f51
+--- /dev/null
++++ b/test/shermes/regexp-aot.js
+@@ -0,0 +1,152 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++// RUN: %hermes -O %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -exec %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -emit-c -o %t.c %s
++// RUN: %FileCheck --check-prefix=C --input-file=%t.c %s
++// RUN: rm -rf %t.bundle && mkdir %t.bundle
++// RUN: cd %t.bundle && %shermes -O -emit-c -Xemit-c-bundle -Xemit-c-shard-size=65536 -exported-unit=regex_aot -o unit.c.json %s
++// RUN: cat %t.bundle/sh_regex_aot_metadata.c | %FileCheck --check-prefix=C %s
++
++// C: int32_t sh_regex_
++// C: uint32_t work = 262144u;
++// C: backtrack8_
++// C: HermesRegexAOTFallback
++// C: uint32_t choices[
++// C: alternative16_
++
++// Leave room for the parity driver's control-flow wrapper: outlining moves
++// instruction runs into helpers but keeps the block labels and branches.
++
++function assert(value) {
++  if (!value) throw new Error('Compiled regexp mismatch');
++}
++function seedMatchState() {
++  /(seed)(ed)/.exec('!seeded?');
++}
++function matchState() {
++  return [RegExp.input, RegExp.lastMatch, RegExp.lastParen,
++    RegExp.leftContext, RegExp.rightContext, RegExp.$1, RegExp.$2, RegExp.$3];
++}
++function snapshot(re, input, start) {
++  seedMatchState();
++  re.lastIndex = start;
++  var m = re.exec(input);
++  return JSON.stringify([m, m && m.index, m && m.input, m && m.groups,
++    m && m.indices, re.lastIndex, matchState()]);
++}
++function testSnapshot(re, input, start) {
++  seedMatchState();
++  re.lastIndex = start;
++  var matched = re.test(input);
++  return JSON.stringify([matched, re.lastIndex, matchState()]);
++}
++// The constructor consumes a runtime property, so it uses the interpreter.
++// Literal matches must agree on priority, captures and state, not only success.
++var patterns = [
++  /a[0-9]x/, /^a[0-9]x$/, /([a-z]+)([0-9]*)/d,
++  /\b([a-z]+)\s*[:=]\s*(\d+)\b/i,
++  /(a*)(a+)b/d, /(a*?)(a+?)b/d, /(a{1,3})(a{0,2})b/d,
++  /(a{1,3}?)(a{0,2}?)b/d, /((a*)(b*))c/d,
++  // Backtracking an earlier loop must rewrite nested and empty later captures.
++  /(a*)(()(a*))(a+)b/d, /((a*)(a*))ab/d,
++  /(a{0})(a{0,4294967295})/d, /a{4294967295}a/,
++  // End-anchored fixed widths have one candidate; sticky still fixes the start.
++  /([a-z])$/d, /(a{2})(b{0})$/dgy, /()$/dgy, /$(a)/d,
++  /(?m:^)(a)$/dg, /a$/m,
++  /a?b?c?/, /()/d, /a*/g, /a*?/y, /(a*)(b*)/dgy,
++  /a+b/y, /a+b/g, /(?<key>[a-z]+)=(?<value>[0-9]+)/dg, /^([a-z]+)$/m, /(^a*)/m, /(a*$)/m,
++  /\ba+\b/, /\Ba+\B/, /[\d\S][^\w]+/,
++  /[\D\s]+/, /[\s]+/, /[^]+/, /[]*/, /(.+)(.*)/s,
++  /\u0100+(\ud800*)/d, /[\u0100-\uffff]+/,
++  /(?i:a+)(?-i:B+)/, /(?s:.+)(?-s:.)/,
++  // Non-Unicode folded literals, literal runs and width-one repetitions use
++  // the same equivalence classes for ASCII and UTF-16 subjects.
++  /abc/i, /\u00e9cho/i, /\u0101+end/i, /\ud800+end/i,
++  /[a-z]+\u00e9[\s\S]*?fin/i,
++  /k/i, /s/i, /\u212a/i, /\u017f/i, /\u03c3/i,
++  /\u00b5/i, /\u0131/i, /\u00df/i,
++  // Ordered alternatives must retry after their shared continuation fails.
++  /(?:a|ab)c/d, /(?:ab|a)b/d, /(?:ab|a)/dg, /(?:a|ab)/dy,
++  /(?:|ab)c/d, /(?:ab|)c/d, /(?:|ab)/dgy, /(?:ab|)/dgy,
++  /(?:a*|ab)c/d, /(?:a*?|ab)c/d, /(?:a{1,3}?|ab)b/d,
++  /a*(?:ab|a)b/d, /a*?(?:ab|a)b/d,
++  /(?:ab|a)b*(?:bc|b)c/d, /(?:ab|a)b*?(?:bc|b)c/d,
++  /(?:(?:ab|a)c|a)b/d, /(?:a$|ab)c/, /(?:^a|b)c/,
++  /(?:\ba|b)c/, /(?:a|b\B)c/, /(?:^a|b$)/m,
++  /^(?:ab|a)b$/dgy, /(?:\u00e9cho|\u00e9clair)\s*[^]*?fin/ig,
++  /(?:\u00e9cho\s*|\u00e9cho[^]*?)fin/iy,
++  /(?:\ud800a|\ud800)end/ig,
++  /(?:ab|a)(?:ab|a)(?:ab|a)(?:ab|a)(?:ab|a)(?:ab|a)(?:ab|a)(?:ab|a)c/,
++  // Unsupported control flow and Unicode stay on the interpreter.
++  /(ab|cd)+/, /(a)?b/d, /(?=(a))a/, /(a)\1/,
++  /(?<=a)b/, /./u, /\u212a/iu, /\u017f/iu, /k/iu, /s/iu,
++  /(?:a|ab)+c/, /(?:a|ab)*?c/
++];
++var inputs = ['', 'a', 'b', 'ab', 'aaab', 'aaac', 'xaa', 'x\na', 'a1x', 'za7xz',
++  'abc: 123', 'ABC = 42', 'no delimiter', ' a: 1! ',
++  '\naaa\r\nbbb\u2028a\u2029', 'a\n', 'aaaBBB',
++  '\u0100\u0100\ud800\ud800', '\ud800a\udc00', '\u00e9a',
++  '\u212ak', '\u017fs', '\u00a0\ufeff\u1680\u2000\u202f\u3000',
++  '\u00e9ABC: 42', 'abc', 'abb', 'abbbbc', 'abab', 'acb',
++  'ABC', '\u00e9ABC', '\u00c9CHO', '\u00c9CLAIR \nFIN',
++  '\u00e9cho FIN', '\u00c9CHO missing suffix',
++  '\u0100\u0101END', '\ud800END', '\ud800aEND',
++  'kKsS', '\u212a\u017f', '\u03a3\u03c2\u03c3',
++  '\u00b5\u039c\u03bc', '\u0131I', '\u00dfSS',
++  'aaaaaaaac', 'ababababababababc', 'abababababababab!'];
++for (var i = 0; i < patterns.length; ++i) {
++  var re = patterns[i];
++  var dynamic = new RegExp(re.source, re.flags);
++  for (var j = 0; j < inputs.length; ++j) {
++    var input = inputs[j];
++    for (var start = 0; start <= input.length + 1; ++start) {
++      assert(snapshot(re, input, start) === snapshot(dynamic, input, start));
++      assert(testSnapshot(re, input, start) ===
++        testSnapshot(dynamic, input, start));
++    }
++  }
++}
++assert(!/k/i.test('\u212a') && !/s/i.test('\u017f'));
++assert(/k/iu.test('\u212a') && /s/iu.test('\u017f'));
++assert(/\u03c3/i.test('\u03c2') && /\u00b5/i.test('\u039c'));
++assert(!/i/i.test('\u0131') && !/ss/i.test('\u00df'));
++// Ambiguous loops exceed the compiled work budget and restart the interpreter.
++var expensive = /^(a*)(a*)(a*)b$/d;
++var text = new Array(141).join('a');
++assert(snapshot(expensive, text, 0) ===
++  snapshot(new RegExp(expensive.source, expensive.flags), text, 0));
++// The branch stack also restarts safely after excessive continuation retries.
++var expensiveAlternative = /^(?:a*a*a*b|a*a*a*c)$/d;
++assert(snapshot(expensiveAlternative, text, 0) ===
++  snapshot(new RegExp(expensiveAlternative.source, expensiveAlternative.flags),
++    text, 0));
++// Consuming a long capture exceeds the work budget even though the match
++// succeeds. An irrelevant prefix is pruned without spending that budget.
++var long = 'a' + new Array(270001).join('1') + 'b';
++var longPattern = /a(\d+)b/d;
++assert(snapshot(longPattern, long, 0) ===
++  snapshot(new RegExp(longPattern.source, longPattern.flags), long, 0));
++var longAlternative = /(?:\u00e9\d+|e\d+)b/id;
++var longUtf16 = '\u00c9' + new Array(270001).join('1') + 'b';
++assert(snapshot(longAlternative, longUtf16, 0) ===
++  snapshot(new RegExp(longAlternative.source, longAlternative.flags),
++    longUtf16, 0));
++// The result-free builtin still publishes generated captures and legacy state.
++var tested = /(?<left>a*)(a+)b/dg;
++assert(tested.test('xaaab') && tested.lastIndex === 5);
++assert(RegExp.$1 === 'aa' && RegExp.$2 === 'a' && RegExp.lastMatch === 'aaab');
++assert(!tested.test('xaaab') && tested.lastIndex === 0 && RegExp.$1 === 'aa');
++// Retained literals survive GC; copies have independent lastIndex and bytecode.
++var retained = /([a-z]+)=(\d+)/dg;
++var copy = new RegExp(retained);
++gc();
++assert(snapshot(retained, 'key=12', 0) === snapshot(copy, 'key=12', 0));
++assert(retained !== copy);
++print('compiled regexp parity');
++// CHECK: compiled regexp parity
+diff --git a/test/shermes/regexp-fusion.js b/test/shermes/regexp-fusion.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..459b7cd96cc5d7329714d301dbe77110137116b5
+--- /dev/null
++++ b/test/shermes/regexp-fusion.js
+@@ -0,0 +1,166 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++// RUN: %shermes -O -exec %s | %FileCheck --match-full-lines %s
++// RUN: %hermes -O %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -emit-c -o %t.c %s
++// RUN: %FileCheck --check-prefix=C --input-file=%t.c %s
++// Require every operation kind; parity alone would also pass if lowering
++// silently stopped recognizing one of these expression shapes.
++// C-DAG: = _sh_ljs_try_fast_regexp(shr, regexp_term, 0,
++// C-DAG: = _sh_ljs_try_fast_regexp(shr, regexp_term, 1,
++// C-DAG: = _sh_ljs_try_fast_regexp(shr, regexp_term, 2,
++// C-DAG: = _sh_ljs_try_fast_regexp(shr, regexp_term, 3,
++// C-DAG: = _sh_ljs_try_fast_regexp(shr, regexp_term, 4,
++// C-DAG: = _sh_ljs_try_fast_regexp(shr, regexp_term, 5,
++
++function assert(value) {
++  if (!value) throw new Error('RegExp fusion mismatch');
++}
++function state(value) {
++  return JSON.stringify([value, RegExp.input, RegExp.lastMatch, RegExp.$1,
++    RegExp.$2, RegExp.lastParen, RegExp.leftContext, RegExp.rightContext]);
++}
++function seed() { new RegExp('(seed)(!)').exec('a seed! z'); }
++function test(value) { return /[a-z\u0100-\u017f0-9]/i.test(value); }
++function indexed(value, index) { return /[a-z\u0100-\u017f0-9]/i.test(value[index]); }
++function indexedBefore(value, index) {
++  var character = value[index];
++  return /[a-z\u0100-\u017f0-9]/i.test(character);
++}
++function filter(value) { return value.replace(/[^a-z\u0100-\u017f0-9]/gi, ''); }
++function lowerFilter(value) {
++  return value.toLowerCase().replace(/[^a-z\u0100-\u017f0-9]/gi, '');
++}
++function equal(value) { return value === value.replace(/[^a-z\u0100-\u017f0-9]/gi, ''); }
++function lowerEqual(value) {
++  return value === value.toLowerCase().replace(/[^a-z\u0100-\u017f0-9]/gi, '');
++}
++var classSource = /[a-z\u0100-\u017f0-9]/.source;
++var filterSource = /[^a-z\u0100-\u017f0-9]/.source;
++function genericTest(value) { return new RegExp(classSource, 'i').test(value); }
++function genericIndexed(value, index) { return genericTest(value[index]); }
++function genericFilter(value) { return value.replace(new RegExp(filterSource, 'gi'), ''); }
++function genericLowerFilter(value) { return genericFilter(value.toLowerCase()); }
++function genericEqual(value) { return value === genericFilter(value); }
++function genericLowerEqual(value) { return value === genericLowerFilter(value); }
++function compare(fast, slow, input, index) {
++  seed();
++  var expected = state(slow(input, index));
++  seed();
++  assert(state(fast(input, index)) === expected);
++}
++var inputs = ['', 'az19', 'a!b?c!', 'ABC!', '\u0101 \u0105',
++  '\u0100\u0130', '\u039f\u03a3', '\u03bf\u03c3',
++  '\ud801\udc00', '\ud800a\udc00', '\u0000!', 'a!B', 'a!\u0130'];
++for (var input of inputs) {
++  compare(test, genericTest, input);
++  compare(filter, genericFilter, input);
++  compare(lowerFilter, genericLowerFilter, input);
++  compare(equal, genericEqual, input);
++  compare(lowerEqual, genericLowerEqual, input);
++  for (var index of [-1, -0, 0, 1, 2, 30, 0.5, NaN, Infinity, '1', 1n]) {
++    compare(indexed, genericIndexed, input, index);
++    compare(indexedBefore, genericIndexed, input, index);
++  }
++}
++
++// Single-unit lazy input survives collection, does not keep the original
++// string as its legacy input, and is replaced by the next ordinary match.
++assert(indexed('x\u0101z', 1));
++gc();
++assert(RegExp.input === '\u0101' && RegExp.lastMatch === '\u0101');
++assert(RegExp.$1 === '' && RegExp.leftContext === '' && RegExp.rightContext === '');
++new RegExp('(next)').test('a next z');
++assert(RegExp.input === 'a next z' && RegExp.$1 === 'next');
++
++// Failed operations retain prior captures, including a failed indexed test.
++seed();
++var previous = state(false);
++assert(!indexed('!', 0));
++assert(state(false) === previous);
++assert(filter('abc') === 'abc');
++assert(state(false) === previous);
++
++// Out-of-range access must still consult prototypes and then ToString.
++Object.defineProperty(String.prototype, '-1', {
++  configurable: true, get() { return 'a'; }
++});
++compare(indexed, genericIndexed, 'z', -1);
++delete String.prototype['-1'];
++compare(test, genericTest, {toString() { return 'a'; }});
++compare(indexed, genericIndexed, {0: 'a'}, 0);
++
++var builtinTest = RegExp.prototype.test;
++var builtinExec = RegExp.prototype.exec;
++RegExp.prototype.test = function(value) { return ['custom test', this.source, value]; };
++compare(test, genericTest, 'a');
++compare(indexed, genericIndexed, 'z', 0);
++RegExp.prototype.test = builtinTest;
++RegExp.prototype.exec = function(value) { return null; };
++compare(test, genericTest, 'a');
++compare(filter, genericFilter, 'a!');
++RegExp.prototype.exec = builtinExec;
++
++// Lookup order matters even when a getter returns the original builtin.
++var trace = '';
++Object.defineProperty(RegExp.prototype, 'test', {
++  configurable: true,
++  get() { trace += 't'; return builtinTest; }
++});
++function effectful() {
++  return /[a-z]/.test({toString() { trace += 's'; return 'a'; }});
++}
++assert(effectful() && trace === 'ts');
++Object.defineProperty(RegExp.prototype, 'test', {
++  configurable: true, writable: true, value: builtinTest
++});
++
++var globalDescriptor = Object.getOwnPropertyDescriptor(RegExp.prototype, 'global');
++Object.defineProperty(RegExp.prototype, 'global', {
++  configurable: true, get() { return false; }
++});
++compare(filter, genericFilter, 'a!b?');
++Object.defineProperty(RegExp.prototype, 'global', globalDescriptor);
++var unicodeDescriptor = Object.getOwnPropertyDescriptor(RegExp.prototype, 'unicode');
++var reads = 0;
++Object.defineProperty(RegExp.prototype, 'unicode', {
++  configurable: true, get() { ++reads; return false; }
++});
++filter('a!');
++assert(reads === 1);
++Object.defineProperty(RegExp.prototype, 'unicode', unicodeDescriptor);
++
++var builtinReplace = String.prototype.replace;
++Object.defineProperty(String.prototype, 'replace', {
++  configurable: true, get() { new RegExp('(getter)').test('getter'); return builtinReplace; }
++});
++compare(filter, genericFilter, 'abc');
++Object.defineProperty(String.prototype, 'replace', {
++  configurable: true, writable: true, value: builtinReplace
++});
++var builtinLower = String.prototype.toLowerCase;
++String.prototype.toLowerCase = function() { return 'changed!'; };
++compare(lowerFilter, genericLowerFilter, 'abc');
++compare(lowerEqual, genericLowerEqual, 'abc');
++String.prototype.toLowerCase = builtinLower;
++var symbolReplace = RegExp.prototype[Symbol.replace];
++RegExp.prototype[Symbol.replace] = function(value) { return 'symbol replacement'; };
++compare(filter, genericFilter, 'abc');
++RegExp.prototype[Symbol.replace] = symbolReplace;
++
++// Sticky matching, captures, anchors and Unicode classes stay on the original
++// path. In particular, the class scanner must not search beyond sticky start.
++function sticky(value) { return /[a-z]/y.test(value); }
++assert(!sticky('!a') && sticky('a!'));
++function captured(value) { return /([a-z])/.test(value); }
++assert(captured('!a') && RegExp.$1 === 'a');
++function unicode(value) { return /\w/iu.test(value); }
++assert(unicode('\u212a'));
++
++print('RegExp fusion passed');
++// CHECK: RegExp fusion passed
+diff --git a/test/shermes/regexp-specialized.js b/test/shermes/regexp-specialized.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..cdddec7d45cd6c9f937cc80a8523e3d11d1c744f
+--- /dev/null
++++ b/test/shermes/regexp-specialized.js
+@@ -0,0 +1,152 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++// RUN: %hermes -O %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -exec %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -emit-c -o %t.c %s
++// RUN: %FileCheck --check-prefix=C --input-file=%t.c %s
++// RUN: rm -rf %t.bundle && mkdir %t.bundle
++// RUN: cd %t.bundle && %shermes -O -emit-c -Xemit-c-bundle -Xemit-c-shard-size=4096 -exported-unit=regex_test -o unit.c.json %s
++// RUN: cat %t.bundle/sh_regex_test_functions_*.c | %FileCheck --check-prefix=C %s
++
++// Check calls, not declarations: the runtime checks below must exercise both
++// specialized literals and interpreter fallback in emitted C and bundle shards.
++// C-DAG: = _sh_ljs_create_regexp_specialized(shr,
++// C-DAG: = _sh_ljs_create_regexp_precompiled(shr,
++
++function assert(value) {
++  if (!value) throw new Error('RegExp regression');
++}
++function throwsTypeError(fn) {
++  var threw = false;
++  try { fn(); } catch (e) { threw = e instanceof TypeError; }
++  assert(threw);
++}
++var test = RegExp.prototype.test;
++var exec = RegExp.prototype.exec;
++var trace = '';
++var re = /a/g;
++Object.defineProperty(re, 'exec', {configurable: true, get() {
++  trace += 'e';
++  /(nested)/.test('nested');
++  gc();
++  Object.setPrototypeOf(re, null);
++  return exec;
++}});
++assert(test.call(re, {toString() {
++  trace += 's';
++  gc();
++  return 'a';
++}}));
++assert(trace === 'se' && re.lastIndex === 1 && RegExp.lastMatch === 'a');
++assert(RegExp.$1 === '');
++
++// Coercion can replace exec before it is resolved. Custom results must still
++// be objects or null, and test must not inspect properties of a returned object.
++re = /a/;
++assert(!test.call(re, {toString() {
++  re.exec = function(s) { assert(this === re && s === 'a'); return null; };
++  return 'a';
++}}));
++var ordinary = {exec(s) { assert(this === ordinary && s === '7'); return {}; }};
++assert(test.call(ordinary, 7));
++ordinary.exec = function() { return new Proxy({}, {get() { throw 1; }}); };
++assert(test.call(ordinary, 'a'));
++for (var value of [undefined, false, 1, 'a', Symbol('result')]) {
++  ordinary.exec = function() { return value; };
++  throwsTypeError(() => test.call(ordinary, 'a'));
++}
++var bound = /b/g;
++re.exec = exec.bind(bound);
++assert(test.call(re, 'b') && bound.lastIndex === 1);
++var calls = 0;
++re.exec = new Proxy(exec, {apply(target, receiver, args) {
++  ++calls;
++  assert(receiver === re);
++  return Reflect.apply(target, receiver, args);
++}});
++assert(re.test('a') && calls === 1);
++re.exec = 0;
++assert(re.test('a'));
++throwsTypeError(() => test.call({exec: 0}, 'a'));
++throwsTypeError(() => test.call(new Proxy(/a/, {}), 'a'));
++throwsTypeError(() => test.call(null, {toString() { throw 1; }}));
++throwsTypeError(() => /a/.test(Symbol('input')));
++assert(/7/.test(7n));
++var saved = /a/;
++saved.exec = exec;
++RegExp.prototype.exec = function() { throw 1; };
++assert(saved.test('a'));
++RegExp.prototype.exec = exec;
++
++re = /[a-z]/gy;
++re.lastIndex = {valueOf() { gc(); return 1; }};
++assert(re.test('!a') && re.lastIndex === 2);
++assert(!re.test('!a') && re.lastIndex === 0);
++for (var index of [-1, NaN, Infinity, 1e100]) {
++  re.lastIndex = index;
++  assert(re.test('a') === (index === -1 || Number.isNaN(index)));
++}
++re.lastIndex = 1n;
++throwsTypeError(() => re.test('a'));
++var plain = /a/;
++plain.lastIndex = {valueOf() { throw new TypeError(); }};
++throwsTypeError(() => plain.test('a'));
++var fixed = /(?<letter>a)(b)?/dg;
++Object.defineProperty(fixed, 'lastIndex', {writable: false});
++throwsTypeError(() => fixed.test('xa!'));
++assert(RegExp.input === 'xa!' && RegExp.$1 === 'a' && RegExp.$2 === '');
++assert(RegExp.leftContext === 'x' && RegExp.rightContext === '!');
++throwsTypeError(() => fixed.test('x'));
++assert(RegExp.input === 'xa!');
++var capture = /(?=(a))(a)(b)?/d;
++assert(capture.test('a') && RegExp.$1 === 'a' && RegExp.$3 === '');
++var result = capture.exec('a');
++assert(result.length === 4 && result[3] === undefined);
++assert(result.indices[2][0] === 0 && result.indices[2][1] === 1);
++assert(result.indices[3] === undefined && result.groups === undefined);
++
++function literal() { 'noinline'; return /a[0-9]./dgy; }
++var first = literal(), second = literal();
++assert(first !== second && first.test('a1!') && second.lastIndex === 0);
++result = second.exec('a1!');
++assert(result.index === 0 && result.indices[0][1] === 3);
++assert(!/^a.$/.test('a\n') && /^a.$/s.test('a\n'));
++assert(/(?s:a.b)/.test('a\nb') && !/(?-s:a.b)/s.test('a\nb'));
++assert(/^a/m.test('x\na') && /(?i:a)/.test('A'));
++assert(/[\d\S][^\w]/.test('a!') && !/[]/.test('a'));
++assert(/\u00e9/.test('\u00e9') && /\ud800/.test('\ud800\udc00'));
++assert(/\s/.test('\uFEFF') && !/./.test('\u2028'));
++var unicode = /./uy;
++unicode.lastIndex = 1;
++assert(unicode.test('\ud800\udc00') && unicode.lastIndex === 2);
++var empty = /(?:)/g;
++assert(empty.test('') && empty.lastIndex === 0);
++assert('xa1!'.match(/a[0-9]./)[0] === 'a1!');
++assert('xa1!'.search(/a[0-9]./) === 1);
++assert('xa1!'.replace(/a[0-9]./, '$&?') === 'xa1!?');
++assert('xay'.split(/a/).join(',') === 'x,y');
++
++// MatchAll uses the same-flags native copy route. Drop both an owned source
++// and a borrowed literal source before collecting and consuming the clones.
++function iterators() {
++  var owned = new RegExp('(?<letter>a)', 'dg');
++  var borrowed = /a/dg;
++  return [owned[Symbol.matchAll]('xa'), borrowed[Symbol.matchAll]('xa')];
++}
++var iter = iterators();
++gc();
++result = iter[0].next().value;
++assert(result.groups.letter === 'a' && result.indices.groups.letter[0] === 1);
++assert(iter[1].next().value.indices[0][0] === 1);
++assert(iter[0].next().done && iter[1].next().done);
++first = second = re = saved = capture = fixed = bound = null;
++iter = null;
++/z/.test('z');
++gc();
++print('RegExp specialized paths passed');
++// CHECK: RegExp specialized paths passed
+diff --git a/test/shermes/regexp-string-operations.js b/test/shermes/regexp-string-operations.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..09e34c22d86822c6c38f05b62e8ad6bf4db03fb3
+--- /dev/null
++++ b/test/shermes/regexp-string-operations.js
+@@ -0,0 +1,131 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++// RUN: %hermes -O %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -exec %s | %FileCheck --match-full-lines %s
++
++function assert(value) {
++  if (!value) throw new Error('RegExp string operation mismatch');
++}
++var builtinExec = RegExp.prototype.exec;
++function replacementSnapshot(re, input) {
++  /sentinel(x)/.test('sentinelx');
++  var value = input.replace(re, '');
++  return JSON.stringify([value, re.lastIndex, RegExp.lastMatch,
++    RegExp.$1, RegExp.$2, RegExp.leftContext, RegExp.rightContext]);
++}
++function compare(re, input) {
++  var generic = new RegExp(re.source, re.flags);
++  // Force the observable object-result path; dynamic regex compilation alone
++  // does not disable the builtin empty-replacement optimization.
++  generic.exec = function(text) { return builtinExec.call(this, text); };
++  assert(replacementSnapshot(re, input) === replacementSnapshot(generic, input));
++}
++
++var cases = [
++  /[^a-z\u0100-\u017f0-9]/gi, /[\u03a3-\u03c9]/gi,
++  /[^\w\u0100-\u017f]/gi, /[\W\u0100-\u017f]/gi,
++  /([a-z]+)(\d*)/g, /(?<word>[a-z]+)/dg, /a*/g,
++  /()/gu, /./gu, /./g, /a/gy, /a*/gy, /z/g, /a/
++];
++var inputs = ['', 'abc 123! a', '\u0100\u0101\u017f\u212a',
++  '\u03a3\u03c2\u03c3\u03c9', '\ud800a\udc00\ud83d\ude00', 'bbb'];
++for (var i = 0; i < cases.length; i++)
++  for (var j = 0; j < inputs.length; j++) compare(cases[i], inputs[j]);
++
++// Exercise the full code-unit domain, including case equivalents outside the
++// written range and lone surrogates. Compare generated and interpreted exec.
++var units = '';
++for (var i = 0; i < 65536; i++) units += String.fromCharCode(i);
++for (var i = 0; i < 4; i++) compare(cases[i], units);
++
++var log = [];
++var accessor = /a/g;
++Object.defineProperty(accessor, 'exec', { get: function() {
++  log.push(this.lastIndex);
++  return builtinExec;
++}});
++assert('aba'.replace(accessor, '') === 'b');
++assert(JSON.stringify(log) === '[0,1,3]');
++var overridden = /a/g;
++overridden.exec = function() { log.push('custom'); return null; };
++assert('aba'.replace(overridden, '') === 'aba');
++assert(log[log.length - 1] === 'custom');
++
++var alteredFlags = /a/;
++Object.defineProperty(alteredFlags, 'global', {value: true});
++alteredFlags.exec = function() { return null; };
++assert('a'.replace(alteredFlags, '') === 'a');
++var nonGlobal = /a/g;
++Object.defineProperty(nonGlobal, 'global', {value: false});
++assert('aba'.replace(nonGlobal, '') === 'ba' && nonGlobal.lastIndex === 1);
++
++var readonly = /a/g;
++Object.defineProperty(readonly, 'lastIndex', {writable: false});
++var threw = false;
++try { 'a'.replace(readonly, ''); } catch (e) { threw = e instanceof TypeError; }
++assert(threw);
++
++// Coercion may install an accessor or change exec before its first lookup.
++var coerced = /a/g;
++assert('a'.replace(coerced, {toString: function() {
++  coerced.exec = function() { return null; };
++  return '';
++}}) === 'a');
++var test = /[a-z]/;
++assert(test.test({toString: function() {
++  test.exec = function() { return null; };
++  return 'a';
++}}) === false);
++var getterTest = /[a-z]/;
++var gets = 0;
++Object.defineProperty(getterTest, 'exec', {get: function() {
++  gets++;
++  return builtinExec;
++}});
++assert(getterTest.test('a') && gets === 1);
++
++// A sibling can move the property map away from a flags-only hidden-class
++// transition. Its property count does not identify the changed exec slot.
++var builtinTest = RegExp.prototype.test;
++var builtinReplace = RegExp.prototype[Symbol.replace];
++for (var accessorExec of [false, true]) {
++  var execCalls = 0;
++  var execGets = 0;
++  function customExec() { execCalls++; return null; }
++  function prototypeWithExec() {
++    var proto = Object.create(RegExp.prototype);
++    if (accessorExec) {
++      Object.defineProperty(proto, 'exec', {
++        configurable: true, enumerable: true,
++        get: function() { execGets++; return customExec; }
++      });
++    } else {
++      proto.exec = customExec;
++    }
++    proto.decoy = builtinExec;
++    Object.defineProperty(proto, 'exec', {enumerable: false});
++    return proto;
++  }
++  for (var replacement of [false, true]) {
++    var guarded = /a/g;
++    // Keep the replace prelude's public property reads on the receiver, so they
++    // do not materialize the prototype's missing property map before the guard.
++    Object.defineProperty(guarded, 'global', {value: true});
++    Object.defineProperty(guarded, 'unicode', {value: false});
++    Object.setPrototypeOf(guarded, prototypeWithExec());
++    var sibling = prototypeWithExec();
++    sibling['extra' + accessorExec + replacement] = 1;
++    if (replacement)
++      assert(builtinReplace.call(guarded, 'a', '') === 'a');
++    else
++      assert(!builtinTest.call(guarded, 'a'));
++  }
++  assert(execCalls === 2 && execGets === (accessorExec ? 2 : 0));
++}
++print('regexp string operations passed');
++// CHECK: regexp string operations passed
+diff --git a/unittests/PlatformUnicode/CharacterPropertyTest.cpp b/unittests/PlatformUnicode/CharacterPropertyTest.cpp
+index f911c7a4e08173d622798594d2c93da3cd3db5de..b64a5d423649619764b773d839965d7c2a8c5876 100644
+--- a/unittests/PlatformUnicode/CharacterPropertyTest.cpp
++++ b/unittests/PlatformUnicode/CharacterPropertyTest.cpp
+@@ -13,6 +13,7 @@
+ #include "gtest/gtest.h"
+ 
+ #include <limits>
++#include <numeric>
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <vector>
+@@ -21,6 +22,31 @@ using namespace hermes;
+ 
+ namespace {
+ 
++namespace reference {
++#include "../../lib/Platform/Unicode/UnicodeData.inc"
++}
++
++TEST(UnicodeTest, CanonicalizationEveryCodePoint) {
++  for (bool unicode : {false, true}) {
++    std::vector<uint32_t> expected(UNICODE_MAX_VALUE + 1);
++    std::iota(expected.begin(), expected.end(), 0);
++    const auto *begin = unicode ? std::begin(reference::UNICODE_FOLDS)
++                                : std::begin(reference::LEGACY_CANONS);
++    const auto *end = unicode ? std::end(reference::UNICODE_FOLDS)
++                              : std::end(reference::LEGACY_CANONS);
++    for (auto *range = begin; range != end; ++range) {
++      for (uint32_t offset = 0; offset < range->count; offset += range->modulo)
++        expected[range->start + offset] =
++            int32_t(range->start + offset) + range->delta;
++    }
++    for (uint32_t cp = 0; cp <= UNICODE_MAX_VALUE; ++cp)
++      ASSERT_EQ(expected[cp], canonicalize(cp, unicode))
++          << "code point " << cp << ", unicode " << unicode;
++    EXPECT_EQ(UNICODE_MAX_VALUE + 1, canonicalize(UNICODE_MAX_VALUE + 1, unicode));
++    EXPECT_EQ(UINT32_MAX, canonicalize(UINT32_MAX, unicode));
++  }
++}
++
+ // This might look like a silly test, but it should be useful if we
+ // need to add tricky optimizations to isUnicodeOnlySpace
+ TEST(UnicodeTest, isUnicodeOnlySpace) {
+diff --git a/unittests/PlatformUnicode/PlatformUnicodeTest.cpp b/unittests/PlatformUnicode/PlatformUnicodeTest.cpp
+index 6c7edd8b5384e852d302b54ff7b63382337bbbd6..bbf8edd0c63967dfb42701fae8674b2b37c459d6 100644
+--- a/unittests/PlatformUnicode/PlatformUnicodeTest.cpp
++++ b/unittests/PlatformUnicode/PlatformUnicodeTest.cpp
+@@ -13,8 +13,6 @@ namespace {
+ 
+ using namespace hermes::platform_unicode;
+ 
+-// convertToCase is not implemented in PlatformUnicodeLite.
+-#if HERMES_PLATFORM_UNICODE != HERMES_PLATFORM_UNICODE_LITE
+ TEST(PlatformUnicode, CaseTest) {
+   llvh::SmallVector<char16_t, 16> str = {u'a', u'B', u'c', u'\u00df'};
+   convertToCase(str, CaseConversion::ToUpper, false /* useCurrentLocale */);
+@@ -48,6 +46,5 @@ TEST(PlatformUnicode, Normalize) {
+   EXPECT_EQ(u'\u0323', str[1]);
+   EXPECT_EQ(u'\u0307', str[2]);
+ }
+-#endif
+ 
+ } // namespace
+diff --git a/unittests/Support/RegexTest.cpp b/unittests/Support/RegexTest.cpp
+index 0d5c72abc0c9f74d1f91ecbeae14812fede3ec82..9bd89393461bf295761e3e7e33f22e86b21fbe7f 100644
+--- a/unittests/Support/RegexTest.cpp
++++ b/unittests/Support/RegexTest.cpp
+@@ -7,9 +7,11 @@
+ 
+ #include "hermes/Regex/Regex.h"
+ #include "hermes/Regex/Executor.h"
++#include "hermes/Regex/RegexSerialization.h"
+ #include "hermes/Regex/RegexTraits.h"
+ 
+ #include <string>
++#include <utility>
+ #include "gtest/gtest.h"
+ 
+ using namespace hermes::regex;
+@@ -80,6 +82,355 @@ TEST(Regex, Short) {
+   EXPECT_EQ("(0-6) (1-5)", flatten(matchRanges));
+ }
+ 
++TEST(Regex, AOTEligibility) {
++  for (const auto &pattern : {
++           "", "(a*)", "(a*?)(a{2,4})", "^([a-z]+)$", "(?m:^a+$)",
++           "\\b([a-z]+)\\s*[:=]\\s*(\\d+)\\b", "(?i:a+)(?-i:B)",
++           "(?<name>[^,]+),", "[\\d\\S]+", "\\u0100+(\\ud800*)",
++           "(?:a|ab)c", "(?:ab|a)b", "(?:|ab)c", "(?:ab|)c",
++           "(?:a*|ab)c", "(?:a*?|ab)c",
++           "(?i:\\u00e9(?:cho|clair)\\s*.*?END)"}) {
++    auto compiled = hermes::CompiledRegExp::tryCompile(pattern, "");
++    ASSERT_TRUE(compiled);
++    EXPECT_TRUE(compiled->compileAOTRegex("matcher")) << pattern;
++  }
++  for (const auto &pattern : {
++           "(ab|cd)", "(?=a)a", "(?<=a)b", "(a)\\1", "(a)+",
++           "(a)?", "(a)(?:b|c)", "(?:a|b)+", "(?:a|ab)*?c", "(?:ab|cd)+",
++           "(a)(b)(c)(d)(e)(f)(g)(h)(i)"}) {
++    auto compiled = hermes::CompiledRegExp::tryCompile(pattern, "");
++    ASSERT_TRUE(compiled);
++    EXPECT_FALSE(compiled->compileAOTRegex("matcher")) << pattern;
++  }
++  auto unicode = hermes::CompiledRegExp::tryCompile("a+", "u");
++  ASSERT_TRUE(unicode);
++  EXPECT_FALSE(unicode->compileAOTRegex("matcher"));
++  auto large = hermes::CompiledRegExp::tryCompile(std::string(2048, 'a'), "");
++  ASSERT_TRUE(large);
++  EXPECT_FALSE(large->compileAOTRegex("matcher"));
++  for (size_t count : {63u, 64u, 65u}) {
++    auto compiled =
++        hermes::CompiledRegExp::tryCompile(std::string(count, 'a'), "");
++    ASSERT_TRUE(compiled);
++    EXPECT_EQ(count <= 64, compiled->compileAOTRegex("matcher").hasValue())
++        << count;
++  }
++  for (size_t count : {8u, 9u}) {
++    std::string pattern;
++    for (size_t i = 0; i < count; ++i)
++      pattern += "(?:ab|a)";
++    auto compiled = hermes::CompiledRegExp::tryCompile(pattern, "");
++    ASSERT_TRUE(compiled);
++    EXPECT_EQ(count == 8, compiled->compileAOTRegex("matcher").hasValue());
++  }
++}
++
++TEST(Regex, AOTBranchTargets) {
++  // Literal runs require at least three characters; a two-character branch
++  // emits separate instructions, so its second character is a legal target.
++  for (const auto &pattern : {"abc|def", "a*|b*"}) {
++    auto compiled = hermes::CompiledRegExp::tryCompile(pattern, "");
++    ASSERT_TRUE(compiled);
++    ASSERT_TRUE(compiled->compileAOTRegex("matcher"));
++    // Corrupt only targets in an otherwise producer-validated program. AOT
++    // must not turn instruction payloads or loop bodies into entry points.
++    auto bytes = compiled->getBytecode();
++    auto *code = const_cast<uint8_t *>(bytes.data()) +
++        sizeof(RegexBytecodeHeader);
++    auto *alt = reinterpret_cast<AlternationInsn *>(code);
++    ASSERT_EQ(Opcode::Alternation, alt->opcode);
++    const uint32_t secondary = alt->secondaryBranch;
++    auto *jump = reinterpret_cast<Jump32Insn *>(
++        code + secondary - sizeof(Jump32Insn));
++    ASSERT_EQ(Opcode::Jump32, jump->opcode);
++    const uint32_t continuation = jump->target;
++    const uint32_t prefix = pattern[1] == '*' ? sizeof(Width1LoopInsn)
++                                            : sizeof(MatchNChar8Insn);
++    const uint32_t primaryPayload = sizeof(AlternationInsn) + prefix;
++    const uint32_t secondaryPayload = secondary + prefix;
++    const uint32_t pastGoal = bytes.size() - sizeof(RegexBytecodeHeader);
++    // The secondary payload is ahead of Jump32, so its rejection also checks
++    // operation boundaries rather than just the backward-branch guard.
++    for (uint32_t target :
++         {0u, 1u, primaryPayload, secondaryPayload, pastGoal, UINT32_MAX}) {
++      alt->secondaryBranch = target;
++      EXPECT_FALSE(compiled->compileAOTRegex("matcher")) << target;
++      alt->secondaryBranch = secondary;
++      jump->target = target;
++      EXPECT_FALSE(compiled->compileAOTRegex("matcher")) << target;
++      jump->target = continuation;
++    }
++    EXPECT_TRUE(compiled->compileAOTRegex("matcher"));
++  }
++}
++
++TEST(Regex, AOTFallbackRetainsCaptures) {
++  auto compiled = hermes::CompiledRegExp::tryCompile("(a*)(a+)b", "");
++  ASSERT_TRUE(compiled);
++  auto decline = +[](const void *, uint32_t, uint32_t, uint32_t, uint32_t *ranges)
++      -> int32_t {
++    // A budget decline can follow partial capture writes. None may escape.
++    ranges[0] = ranges[1] = ranges[2] = ranges[3] = kNotMatched;
++    return HermesRegexAOTFallback;
++  };
++  const std::string text = "xaaab";
++  cmatch actual;
++  auto sink = [&](CapturedRange full, llvh::ArrayRef<CapturedRange> captures) {
++    actual.push_back(full);
++    actual.insert(actual.end(), captures.begin(), captures.end());
++  };
++  auto guard =
++#ifdef HERMES_CHECK_NATIVE_STACK
++      hermes::StackOverflowGuard::nativeStackGuard(512 * 1024);
++#else
++      hermes::StackOverflowGuard::depthCounterGuard(1);
++#endif
++  EXPECT_EQ(
++      MatchRuntimeResult::Match,
++      searchWithAOTRegex(
++          decline,
++          compiled->getBytecode(),
++          text.data(),
++          2,
++          text.size(),
++          sink,
++          constants::matchInputAllAscii | constants::matchOnlyAtStart,
++          guard));
++  EXPECT_EQ("(2-5) (2-3) (3-4)", flatten(actual));
++}
++
++TEST(Regex, AOTInputRepresentation) {
++  auto compiled = hermes::CompiledRegExp::tryCompile("ab", "");
++  ASSERT_TRUE(compiled);
++  auto asciiMatcher = +[](const void *, uint32_t, uint32_t, uint32_t flags,
++                          uint32_t *) -> int32_t {
++    EXPECT_NE(0u, flags & constants::matchInputAllAscii);
++    EXPECT_NE(0u, flags & constants::matchOnlyAtStart);
++    return HermesRegexAOTNoMatch;
++  };
++  auto utf16Matcher = +[](const void *, uint32_t, uint32_t, uint32_t flags,
++                          uint32_t *) -> int32_t {
++    EXPECT_EQ(0u, flags & constants::matchInputAllAscii);
++    EXPECT_NE(0u, flags & constants::matchOnlyAtStart);
++    return HermesRegexAOTNoMatch;
++  };
++  auto guard =
++#ifdef HERMES_CHECK_NATIVE_STACK
++      hermes::StackOverflowGuard::nativeStackGuard(512 * 1024);
++#else
++      hermes::StackOverflowGuard::depthCounterGuard(1);
++#endif
++  // The hint is optional for ASCII storage and valid for ASCII text stored
++  // as UTF-16. Neither form may change the generated matcher's pointer width.
++  EXPECT_EQ(
++      MatchRuntimeResult::NoMatch,
++      searchWithAOTRegex(
++          asciiMatcher,
++          compiled->getBytecode(),
++          "ab",
++          0,
++          2,
++          {},
++          constants::matchOnlyAtStart,
++          guard));
++  EXPECT_EQ(
++      MatchRuntimeResult::NoMatch,
++      searchWithAOTRegex(
++          utf16Matcher,
++          compiled->getBytecode(),
++          u"ab",
++          0,
++          2,
++          {},
++          constants::matchInputAllAscii | constants::matchOnlyAtStart,
++          guard));
++}
++
++TEST(Regex, SimpleDescriptorMatchesInterpreter) {
++  const std::pair<const char *, const char *> patterns[] = {
++      {"abc", ""},
++      {"^a[0-9]", "gdy"},
++      {"[a-z]$", ""},
++      {"^a.$", ""},
++      {"[\\d\\S][^\\w]", ""},
++      {"[\\D\\s]", ""},
++      {"[^]", ""},
++      {"[]", ""},
++      {".", ""},
++      {".", "s"},
++      {"\\u00e9", ""},
++      {"[\\u0100-\\uffff]", ""},
++      {"\\ud800", ""},
++      {"(?s:.)", ""},
++      {"(?-s:.)", "s"},
++      {"(?-m:^a$)", "m"}};
++  const std::string ascii = "abc xa1\n\t!";
++  std::u16string utf16 = u"abc xa1\n\t!\u00e9\u2028\uFEFF";
++  utf16.push_back(0xd800);
++  utf16.push_back(0xdc00);
++  utf16.push_back(0xd800);
++  for (auto pattern : patterns) {
++    SCOPED_TRACE(pattern.first);
++    auto compiled =
++        hermes::CompiledRegExp::tryCompile(pattern.first, pattern.second);
++    ASSERT_TRUE(compiled);
++    auto descriptor = compiled->compileSimpleRegex();
++    ASSERT_TRUE(descriptor);
++    auto compare = [&](const auto &text, constants::MatchFlagType inputFlags) {
++      for (uint32_t start = 0; start <= text.size(); ++start) {
++        for (auto flags : {constants::matchDefault,
++                           constants::matchOnlyAtStart,
++                           constants::matchNotEndOfLine,
++                           constants::matchNotBeginningOfLine}) {
++          cmatch expected, actual;
++          auto sink = [&](
++                          CapturedRange full,
++                          llvh::ArrayRef<CapturedRange> captures) {
++            EXPECT_TRUE(captures.empty());
++            actual.push_back(full);
++          };
++          auto result = searchWithBytecode(
++              compiled->getBytecode(),
++              text.data(),
++              start,
++              text.size(),
++              &expected,
++              inputFlags | flags);
++          auto guard =
++#ifdef HERMES_CHECK_NATIVE_STACK
++              hermes::StackOverflowGuard::nativeStackGuard(512 * 1024);
++#else
++              hermes::StackOverflowGuard::depthCounterGuard(128);
++#endif
++          EXPECT_EQ(
++              result,
++              searchWithSimpleRegex(
++                  descriptor->data(),
++                  text.data(),
++                  start,
++                  text.size(),
++                  sink,
++                  inputFlags | flags,
++                  guard));
++          EXPECT_EQ(flatten(expected), flatten(actual));
++        }
++      }
++    };
++    compare(ascii, constants::matchInputAllAscii);
++    compare(utf16, constants::matchDefault);
++  }
++}
++
++TEST(Regex, SimpleDescriptorEligibility) {
++  for (const char *pattern : {"",
++                             "(a)",
++                             "(?=a)a",
++                             "a|b",
++                             "a*",
++                             "a{2}",
++                             "(?i:a)",
++                             "(?m:^a)",
++                             "abcdefghijklmnopq"}) {
++    auto compiled = hermes::CompiledRegExp::tryCompile(pattern, "");
++    ASSERT_TRUE(compiled);
++    EXPECT_FALSE(compiled->compileSimpleRegex()) << pattern;
++  }
++  for (const char *flags : {"i", "u"}) {
++    auto compiled = hermes::CompiledRegExp::tryCompile("a", flags);
++    ASSERT_TRUE(compiled);
++    EXPECT_FALSE(compiled->compileSimpleRegex());
++  }
++  auto maxTerms = hermes::CompiledRegExp::tryCompile("abcdefghijklmnop", "");
++  ASSERT_TRUE(maxTerms);
++  EXPECT_TRUE(maxTerms->compileSimpleRegex());
++  std::string ranges = "[";
++  for (unsigned i = 0; i < 33; ++i) {
++    // Separated singleton ranges cannot coalesce during bytecode generation.
++    ranges += "\\u01";
++    ranges += "01234"[i / 8];
++    ranges += "02468ace"[i % 8];
++    if (i == 31 || i == 32) {
++      auto compiled = hermes::CompiledRegExp::tryCompile(ranges + "]", "");
++      ASSERT_TRUE(compiled);
++      EXPECT_EQ(i == 31, compiled->compileSimpleRegex().hasValue());
++    }
++  }
++  auto large = hermes::CompiledRegExp::tryCompile(std::string(1024, 'a'), "");
++  ASSERT_TRUE(large);
++  EXPECT_FALSE(large->compileSimpleRegex());
++}
++
++#ifndef HERMES_CHECK_NATIVE_STACK
++TEST(Regex, SimpleDescriptorStackGuardOrdering) {
++  for (const char *pattern : {"a", "a$", "^a", "\\u0100"}) {
++    auto compiled = hermes::CompiledRegExp::tryCompile(pattern, "");
++    ASSERT_TRUE(compiled);
++    auto descriptor = compiled->compileSimpleRegex();
++    ASSERT_TRUE(descriptor);
++    for (std::string text : {"", "ab"}) {
++      for (uint32_t start = 0; start <= text.size(); ++start) {
++        auto guard = hermes::StackOverflowGuard::depthCounterGuard(0);
++        auto flags =
++            constants::matchInputAllAscii | constants::matchNotEndOfLine;
++        EXPECT_EQ(
++            searchWithBytecode(
++                compiled->getBytecode(),
++                text.data(),
++                start,
++                text.size(),
++                nullptr,
++                flags,
++                guard),
++            searchWithSimpleRegex(
++                descriptor->data(),
++                text.data(),
++                start,
++                text.size(),
++                {},
++                flags,
++                guard));
++      }
++    }
++  }
++}
++#endif
++
++TEST(Regex, CaptureSinkAndVectorFailure) {
++  auto bytecode = cregex(u"(?=(a))(a)(b)?").compile();
++  cmatch output;
++  unsigned calls = 0;
++  auto sink = [&](CapturedRange full, llvh::ArrayRef<CapturedRange> captures) {
++    ++calls;
++    output.push_back(full);
++    output.insert(output.end(), captures.begin(), captures.end());
++  };
++  auto guard =
++#ifdef HERMES_CHECK_NATIVE_STACK
++      hermes::StackOverflowGuard::nativeStackGuard(512 * 1024);
++#else
++      hermes::StackOverflowGuard::depthCounterGuard(128);
++#endif
++  EXPECT_EQ(
++      MatchRuntimeResult::Match,
++      searchWithBytecode(
++          bytecode, u"a", 0, 1, sink, constants::matchDefault, guard));
++  EXPECT_EQ("(0-1) (0-1) (0-1) nm", flatten(output));
++  EXPECT_EQ(
++      MatchRuntimeResult::NoMatch,
++      searchWithBytecode(
++          bytecode, u"x", 0, 1, sink, constants::matchDefault, guard));
++  EXPECT_EQ(1u, calls);
++  EXPECT_EQ(
++      MatchRuntimeResult::NoMatch,
++      searchWithBytecode(
++          bytecode, u"x", 0, 1, &output, constants::matchDefault, guard));
++  EXPECT_EQ("(0-1) (0-1) (0-1) nm", flatten(output));
++  EXPECT_EQ(
++      MatchRuntimeResult::Match,
++      searchWithBytecode(
++          bytecode, u"a", 0, 1, nullptr, constants::matchDefault, guard));
++}
++
+ MatchRuntimeResult searchResult(
+     const char16_t *text,
+     const char16_t *pattern,

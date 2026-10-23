@@ -1,0 +1,1731 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Mon, 28 Sep 2026 11:25:34 +0800
+Subject: [PATCH 10/15] gc: prepare reusable heaps and reclaim transient
+ storage
+
+Expose numeric heap/collection statistics and mutator-boundary prepared
+heap, dynamic-allocation and young-reclamation interfaces. Distinguish
+verified empty payload from live storage, defer young-only maintenance
+when old-generation progress is needed, and preserve finalization and
+ordinary collector authority.
+
+Describe ordinary literal shapes in generated units, prepare their
+classes and property maps, and root those layouts in per-unit GC storage.
+Keep ordinary, typed and private layouts distinct. Populate descendants
+before parents to preserve lookup storage through later construction.
+
+Visit newly inserted native roots during young collection while full
+tracing and compaction retain complete scans. Reclaim empty managed
+weak-slot chunks at the mutator boundary and account for their actual
+storage. Avoid rewriting unchanged pointers and calling disabled
+allocation instrumentation on the release fast path; retain debug IP
+validation and enabled allocation/sampling tracking.
+
+Carry root, weak-slot, prepared-layout and young-reclamation fixtures with
+the corresponding runtime and generated ABI changes.
+---
+ API/hermes/hermes.cpp                    |  27 ++-
+ include/hermes/ADT/ManagedChunkedList.h  |  66 +++++-
+ include/hermes/VM/GCBase.h               |  29 ++-
+ include/hermes/VM/HadesGC.h              |  80 +++++++-
+ include/hermes/VM/static_h.h             | 123 ++++++++++++
+ lib/BCGen/SH/SH.cpp                      |  26 +++
+ lib/VM/GCBase.cpp                        |  30 ++-
+ lib/VM/SHUnitExt.h                       |   6 +
+ lib/VM/StaticH.cpp                       | 192 ++++++++++++++++++
+ lib/VM/StaticHUnit.cpp                   |   3 +
+ lib/VM/gcs/HadesGC.cpp                   | 244 +++++++++++++++++++++--
+ unittests/ADT/CMakeLists.txt             |   1 +
+ unittests/ADT/ManagedChunkedListTest.cpp |  64 ++++++
+ unittests/VMRuntime/GCBasicsTest.cpp     | 168 ++++++++++++++++
+ unittests/VMRuntime/StaticHUnitTest.cpp  |  72 +++++++
+ 15 files changed, 1093 insertions(+), 38 deletions(-)
+
+diff --git a/API/hermes/hermes.cpp b/API/hermes/hermes.cpp
+index dbb2f0ad3dbeab3e2d77dd80b7166845ea129003..471dadec02102de90617bcee97459dd39fa956b1 100644
+--- a/API/hermes/hermes.cpp
++++ b/API/hermes/hermes.cpp
+@@ -353,21 +353,32 @@ class HermesRuntimeImpl final : public HermesRuntime,
+     compileFlags_.emitAsyncBreakCheck =
+         runtimeConfig.getAsyncBreakCheckInEval();
+     runtime_.addCustomRootsFunction(
+-        [this](vm::GC *, vm::RootAcceptor &acceptor) {
+-          hermesValues_.forEach([&acceptor](HermesPointerValue &element) {
++        [this](vm::GC *gc, vm::RootAcceptor &acceptor) {
++          auto visit = [&acceptor](HermesPointerValue &element) {
+             acceptor.accept(element.value());
+-          });
++          };
++          // Managed values acquire a referent only at insertion. Once nursery
++          // evacuation visits one, its surviving referent is old. Compaction
++          // and full tracing still visit every retained value.
++          if (gc->isYoungGenerationRootScan())
++            hermesValues_.forEachNew(visit);
++          else
++            hermesValues_.forEach(visit);
+         });
+     runtime_.addCustomWeakRootsFunction(
+-        [this](vm::GC *, vm::WeakRootAcceptor &acceptor) {
+-          weakHermesValues_.forEach([&acceptor](WeakRefPointerValue &element) {
++        [this](vm::GC *gc, vm::WeakRootAcceptor &acceptor) {
++          auto visit = [&acceptor](WeakRefPointerValue &element) {
+             // We need to use valueUnsafe() because the refernece count may
+             // be decremented to 0 after we check that it is not free and hence
+             // fires the assertion in value(). It is safe to accept the value
+             // here because it is not freed before the iteration begings and
+             // the iteration will not destroy the WeakRoot.
+             acceptor.acceptWeak(element.valueUnsafe());
+-          });
++          };
++          if (gc->isYoungGenerationRootScan())
++            weakHermesValues_.forEachNew(visit);
++          else
++            weakHermesValues_.forEach(visit);
+         });
+ #ifdef HERMES_MEMORY_INSTRUMENTATION
+     runtime_.addCustomSnapshotFunction(
+@@ -378,7 +389,7 @@ class HermesRuntimeImpl final : public HermesRuntime,
+               "ManagedValues",
+               vm::GCBase::IDTracker::reserved(
+                   vm::GCBase::IDTracker::ReservedObjectID::JSIHermesValueList),
+-              hermesValues_.capacity() * sizeof(HermesPointerValue),
++              hermesValues_.mallocSizeEstimate(),
+               0);
+           snap.beginNode();
+           snap.endNode(
+@@ -387,7 +398,7 @@ class HermesRuntimeImpl final : public HermesRuntime,
+               vm::GCBase::IDTracker::reserved(
+                   vm::GCBase::IDTracker::ReservedObjectID::
+                       JSIWeakHermesValueList),
+-              weakHermesValues_.capacity() * sizeof(WeakRefPointerValue),
++              weakHermesValues_.mallocSizeEstimate(),
+               0);
+         },
+         [](vm::HeapSnapshot &snap) {
+diff --git a/include/hermes/ADT/ManagedChunkedList.h b/include/hermes/ADT/ManagedChunkedList.h
+index effc06f9b369d801d395d36c20aacb7dfdd78d15..48ee5a4d4dc5193e33b206f6b99306d061d58222 100644
+--- a/include/hermes/ADT/ManagedChunkedList.h
++++ b/include/hermes/ADT/ManagedChunkedList.h
+@@ -15,6 +15,7 @@
+ #include <cmath>
+ #include <cstddef>
+ #include <utility>
++#include <vector>
+ 
+ namespace hermes {
+ 
+@@ -49,8 +50,14 @@ class ManagedChunkedList {
+         chunkCount_(other.chunkCount_),
+         targetChunkCount_(other.targetChunkCount_),
+         freeList_(other.freeList_),
+-        occupancyRatio_(other.occupancyRatio_) {
++        occupancyRatio_(other.occupancyRatio_),
++        recentlyAdded_(std::move(other.recentlyAdded_)),
++        visitAllNew_(other.visitAllNew_) {
+     other.chunks_ = nullptr;
++    other.chunkCount_ = 0;
++    other.freeList_ = nullptr;
++    other.recentlyAdded_.clear();
++    other.visitAllNew_ = true;
+   }
+ 
+   ManagedChunkedList(const ManagedChunkedList &) = delete;
+@@ -90,6 +97,10 @@ class ManagedChunkedList {
+ 
+     // Emplace the new value at the first location in the free list.
+     Element &element = *freeList_;
++    // Record before consuming the slot so an allocation failure cannot leave
++    // an occupied element missing from the next incremental visit.
++    if (!visitAllNew_)
++      recentlyAdded_.push_back(&element);
+     freeList_ = freeList_->getNextFree();
+     assert(element.isFree() && "Premature element reuse");
+     element.emplace(std::forward<Args>(args)...);
+@@ -111,12 +122,37 @@ class ManagedChunkedList {
+     }
+   }
+ 
++  // Visit additions since the previous call, including reused slots, skipping
++  // elements that have since been freed. The first visit, and the first visit
++  // after chunk collection, includes all occupied elements. Clients must allow
++  // those repeated visits. Ordinary forEach does not consume this history.
++  // Changes to occupied elements are not recorded: clients must not install
++  // new references in previously visited slots without adding a new element.
++  template <typename Func>
++  void forEachNew(Func accept) {
++    if (visitAllNew_) {
++      forEach(accept);
++    } else {
++      for (auto *element : recentlyAdded_)
++        if (!element->isFree())
++          accept(*element);
++    }
++    recentlyAdded_.clear();
++    visitAllNew_ = false;
++  }
++
+   // Determine the capacity of the list (i.e. the number of values it can hold
+   // without any additional chunk allocations).
+   size_t capacity() const {
+     return chunkCount_ * kElementsPerChunk;
+   }
+ 
++  // Include the optional incremental-visit index in native ownership reports.
++  size_t mallocSizeEstimate() const {
++    return chunkCount_ * sizeof(Chunk) +
++        recentlyAdded_.capacity() * sizeof(Element *);
++  }
++
+   // Determine the number of values contained in the list. Only used for testing
+   // purposes.
+   size_t sizeForTests() const {
+@@ -128,16 +164,31 @@ class ManagedChunkedList {
+   // Perform a garbage collection, building a free list of all free elements,
+   // and potentially deleting excess empty chunks.
+   void collect() {
++    // Use the preceding occupancy target so collection can delete chunks in
++    // one traversal before the new surviving-element count is known.
++    collectImpl(ceil(targetChunkCount_));
++  }
++
++  // A pressure boundary can release every empty chunk without moving live
++  // elements or discarding the occupancy history used for later allocation.
++  void trimEmptyChunks() {
++    collectImpl(0);
++    // The next visit already scans all occupied slots. Release the obsolete
++    // index too, so a temporary peak does not retain its native backing.
++    std::vector<Element *>().swap(recentlyAdded_);
++  }
++
++ private:
++  void collectImpl(size_t targetChunkCount) {
+     HERMES_SLOW_ASSERT(checkWellFormed());
+ 
++    // Pending pointers may name chunks deleted below or slots reused by add.
++    // Invalidate them at their owner, before either operation can happen.
++    recentlyAdded_.clear();
++    visitAllNew_ = true;
+     freeList_ = nullptr;
+     size_t occupiedElementCount = 0;
+ 
+-    // Delete chunks based on the target number of chunks from the previous
+-    // collection. This can make deletion lag by one collection cycle, but
+-    // simplifies the collection logic by allowing chunks to be deleted as they
+-    // are encountered, before knowing the number of surviving values.
+-    size_t targetChunkCount = ceil(targetChunkCount_);
+     Chunk **chunkListEndLoc = &chunks_;
+     for (Chunk *chunk = chunks_; chunk;) {
+       size_t chunkOccupiedElementCount = 0;
+@@ -237,6 +288,9 @@ class ManagedChunkedList {
+   ExponentialMovingAverage targetChunkCount_;
+   Element *freeList_ = nullptr;
+   double occupancyRatio_;
++  std::vector<Element *> recentlyAdded_;
++  // Lists that never use forEachNew do not allocate or maintain an index.
++  bool visitAllNew_{true};
+ };
+ 
+ } // namespace hermes
+diff --git a/include/hermes/VM/GCBase.h b/include/hermes/VM/GCBase.h
+index 009aabe854d7f07841ffd267721a0a5048b8c55c..4fdc65a65d79c59e248b3726946c2f0e165954d8 100644
+--- a/include/hermes/VM/GCBase.h
++++ b/include/hermes/VM/GCBase.h
+@@ -41,6 +41,7 @@
+ #include "llvh/ADT/BitVector.h"
+ #include "llvh/ADT/DenseMap.h"
+ #include "llvh/Support/ErrorHandling.h"
++#include "llvh/Support/SaveAndRestore.h"
+ 
+ #include <cassert>
+ #include <chrono>
+@@ -1113,6 +1114,16 @@ class GCBase {
+   /// \pre \p target must hold an Object or non-registered Symbol.
+   WeakRefSlot *allocWeakSlot(SmallHermesValue target);
+ 
++  /// Release empty weak-reference chunks at an exclusive mutator boundary.
++  /// This neither advances collection nor moves occupied slots.
++  size_t trimUnusedWeakSlots();
++
++  /// True only inside Hades's noncompacting nursery-root callbacks. Full
++  /// collections, compaction and diagnostic visitors require complete roots.
++  bool isYoungGenerationRootScan() const {
++    return youngGenerationRootScan_;
++  }
++
+   /// Allocate a slot to use in WeakMap/WeakSet when inserting a new entry.
+   /// \param key Pointer to the key object.
+   /// \param value The mapped value by the key \p key.
+@@ -1368,16 +1379,28 @@ class GCBase {
+   /// be allocated in the old gen, and references to them need not be
+   /// marked during young-gen collection.
+   void markRoots(RootAcceptorWithNames &acceptor, bool markLongLived) {
++    llvh::SaveAndRestore<bool> scope(
++        youngGenerationRootScan_,
++        heapKind_ == HeapKind::HadesGC && !markLongLived);
+     gcCallbacks_.markRoots(acceptor, markLongLived);
+   }
+ 
+   /// Convenience method to invoke the mark weak roots function provided at
+   /// initialization, using the context provided then (on this heap).
+   void markWeakRoots(WeakRootAcceptor &acceptor, bool markLongLived) {
++    llvh::SaveAndRestore<bool> scope(
++        youngGenerationRootScan_,
++        heapKind_ == HeapKind::HadesGC && !markLongLived);
+     gcCallbacks_.markWeakRoots(acceptor, markLongLived);
+     acceptor.beginRootSection(RootAcceptor::Section::WeakRefSlots);
+-    weakSlots_.forEach(
+-        [&acceptor](WeakRefSlot &slot) { slot.markWeakRoots(acceptor); });
++    auto visit = [&acceptor](WeakRefSlot &slot) { slot.markWeakRoots(acceptor); };
++    // A live WeakRefSlot's referent changes only through GC. Nursery evacuation
++    // leaves old or empty references, so only subsequently added slots need a
++    // later nursery visit. Mutable WeakMap values still require the full scan.
++    if (youngGenerationRootScan_)
++      weakSlots_.forEachNew(visit);
++    else
++      weakSlots_.forEach(visit);
+ 
+     weakMapEntrySlots_.forEach(
+         [&acceptor](WeakMapEntrySlot &slot) { slot.markWeakRoots(acceptor); });
+@@ -1493,6 +1516,8 @@ class GCBase {
+   /// Whether or not a GC cycle is currently occurring.
+   bool inGC_{false};
+ 
++  bool youngGenerationRootScan_{false};
++
+   /// Whether the GC has OOMed. Currently only useful for understanding crash
+   /// dumps, particularly when HERMESVM_EXCEPTION_ON_OOM is set.
+   bool hasOOMed_{false};
+diff --git a/include/hermes/VM/HadesGC.h b/include/hermes/VM/HadesGC.h
+index 983ec94b696265c32fccc5449a384e56b0f277f7..d4bfe1aa28a4a1a2d19509121ad7ffa378bc4e72 100644
+--- a/include/hermes/VM/HadesGC.h
++++ b/include/hermes/VM/HadesGC.h
+@@ -17,6 +17,7 @@
+ #include "hermes/VM/VMExperiments.h"
+ 
+ #include "llvh/ADT/SparseBitVector.h"
++#include "llvh/ADT/DenseSet.h"
+ #include "llvh/Support/ErrorOr.h"
+ #include "llvh/Support/PointerLikeTypeTraits.h"
+ #include "llvh/Support/SaveAndRestore.h"
+@@ -73,6 +74,37 @@ class HadesGC final : public GCBase {
+ 
+   ~HadesGC() override;
+ 
++  /// Separate existing storage from subsequent allocation after completing
++  /// ordinary collection. Prepared objects still participate in tracing,
++  /// sweeping and finalization; their free holes are not allocation candidates.
++  /// Requires exclusive mutator access and a nonconcurrent collector. Call once
++  /// after application preparation, before capturing an initialized image.
++  void beginPreparedHeap();
++
++  /// Occupied dynamic storage, its external storage, and positive external
++  /// growth on prepared owners. This is a collection-pressure estimate, not
++  /// private physical-memory accounting.
++  uint64_t dynamicOccupiedGrowth();
++
++  struct FreePayloadRange {
++    uintptr_t start;
++    uintptr_t end;
++  };
++  enum class FreePayloadStatus { Complete, Partial, Deferred };
++  struct FreePayloadResult {
++    FreePayloadStatus status;
++    uint32_t count;
++    uint32_t visited;
++  };
++
++  /// Export whole pages inside dynamic free cells, excluding their headers.
++  /// No allocation or collector progress may occur between export and discard.
++  /// Deferred results grant no ranges and do not advance collection.
++  FreePayloadResult exportDynamicFreePayload(
++      llvh::MutableArrayRef<FreePayloadRange> ranges,
++      uint32_t pageSize,
++      uint32_t visitLimit);
++
+   static bool classof(const GCBase *gc) {
+     return gc->getKind() == HeapKind::HadesGC;
+   }
+@@ -233,6 +265,25 @@ class HadesGC final : public GCBase {
+     return ygCumulativeStats_.numCollections;
+   }
+ 
++  enum class YoungReclaimStatus : uint32_t { Deferred = 0, Reclaimed = 1 };
++  struct YoungReclaimResult {
++    YoungReclaimStatus status;
++    char *payloadBegin;
++    char *payloadEnd;
++  };
++
++  /// Reclaim the young generation at a mutator-owned quiescent boundary.
++  /// Survivors, weak references and native finalizers follow ordinary GC rules.
++  /// The returned payload contains no live objects until allocation resumes.
++  /// Defer for promotion, pending old-generation work or worst-case survivor
++  /// pressure that would reach the old-generation collection threshold.
++  /// This has ordinary young-GC cost, not a fixed work or latency bound.
++  YoungReclaimResult tryReclaimYoungGeneration();
++
++  /// Observe an already empty nursery without advancing collection. The same
++  /// exclusive-access and range-lifetime contract as reclamation applies.
++  YoungReclaimResult emptyYoungPayload();
++
+   /// Run the finalizers for all heap objects.
+   void finalizeAll() override;
+ 
+@@ -716,6 +767,12 @@ class HadesGC final : public GCBase {
+    public:
+     explicit OldGen(HadesGC &gc);
+ 
++    void detachPreparedAllocation();
++    FreePayloadResult exportFreePayload(
++        llvh::MutableArrayRef<FreePayloadRange> ranges,
++        uint32_t pageSize,
++        uint32_t visitLimit);
++
+     size_t numSegments() const;
+ 
+     /// \return The deque of AlignedHeapSegments in the OG.
+@@ -1140,6 +1197,20 @@ class HadesGC final : public GCBase {
+   /// Protected by gcMutex_.
+   OldGen oldGen_;
+ 
++  // Prepared normal segments form a stable prefix: only later segments may
++  // compact. Jumbo segments can die, so remove their identity before returning
++  // storage to the allocator. No prepared-to-dynamic remembered set is needed:
++  // major collection retains ordinary whole-heap reachability processing.
++  llvh::DenseSet<const void *> preparedSegments_;
++  size_t preparedNormalSegments_{0};
++  uint64_t preparedAllocatedBytes_{0};
++  // Track current external storage on prepared owners separately from its
++  // initial ceiling. Growth and later shrinkage must not consume the baseline
++  // belonging to other prepared owners, or hide dynamic owners' allocations.
++  uint64_t preparedExternalBytes_{0};
++  uint64_t preparedExternalBytesAtPreparation_{0};
++  bool preparedHeapActive_{false};
++
+ #ifndef NDEBUG
+   /// Map an address aligned to AlignedHeapSegment::kSegmentUnitSize to the
+   /// start and end address of its owning segment.
+@@ -1349,7 +1420,14 @@ class HadesGC final : public GCBase {
+   ///   if one is not already active.
+   /// \post The YG is completely empty, and all bytes are available for new
+   ///   allocations.
+-  void youngGenCollection(std::string cause, bool forceOldGenCollection);
++  /// \param allowOldGenStart If false, old marking/sweeping must be settled and
++  ///   nursery promotion disabled. A pending compactee may still be evacuated
++  ///   to finish preparation; young-only reclamation separately excludes it.
++  ///   Allocation-pressure collections retain the normal start policy.
++  void youngGenCollection(
++      std::string cause,
++      bool forceOldGenCollection,
++      bool allowOldGenStart = true);
+ 
+   /// Implementation to actually do the YG collection. Mark roots, scan dirty
+   /// cards, and evacuate reachable objects.
+diff --git a/include/hermes/VM/static_h.h b/include/hermes/VM/static_h.h
+index 0607bd3bd9f4d9dfa9462741c932bd2cd0605ace..0ed43341dbae4d0e57a0122cd53c845991d966a8 100644
+--- a/include/hermes/VM/static_h.h
++++ b/include/hermes/VM/static_h.h
+@@ -149,6 +149,12 @@ typedef struct SHUnit {
+   /// barrier is needed to safely read out the value.
+   SHCompressedPointer *object_literal_class_cache;
+ 
++  /// Sorted shape indexes used by ordinary object-literal instructions in this
++  /// unit. Typed layouts and unused retained table slots are excluded by the
++  /// compiler; the key buffer alone does not establish allocation semantics.
++  const uint32_t *ordinary_literal_shapes;
++  uint32_t ordinary_literal_shape_count;
++
+   /// The module exports cache: a map from non-negative integer module indexes
+   /// to the export of the module.  An empty value indicates that the module has
+   /// not yet been initialized.
+@@ -180,6 +186,37 @@ typedef struct SHLocals {
+   SHLegacyValue locals[0];
+ } SHLocals;
+ 
++typedef enum SHYoungReclaimStatus {
++  SHYoungReclaimDeferred = 0,
++  SHYoungReclaimReclaimed = 1,
++  SHYoungReclaimUnsupported = 2,
++} SHYoungReclaimStatus;
++
++typedef struct SHYoungReclaimResult {
++  uint32_t status;
++  uintptr_t payload_begin;
++  uintptr_t payload_end;
++} SHYoungReclaimResult;
++
++typedef enum SHFreePayloadStatus {
++  SHFreePayloadComplete = 0,
++  SHFreePayloadPartial = 1,
++  SHFreePayloadDeferred = 2,
++  SHFreePayloadUnsupported = 3,
++} SHFreePayloadStatus;
++
++typedef struct SHFreePayloadRange {
++  uintptr_t start;
++  uintptr_t end;
++} SHFreePayloadRange;
++
++typedef struct SHFreePayloadResult {
++  uint32_t status;
++  uint32_t count;
++  uint32_t visited;
++  SHFreePayloadRange ranges[128];
++} SHFreePayloadResult;
++
+ /// Version for Static Hermes ABI contracts that are not represented by C
+ /// structure layout. Increment this when changing value encodings, calling
+ /// conventions, or other shared semantics without changing a field below.
+@@ -282,6 +319,10 @@ typedef struct SHLocals {
+   V(unit_shape_table_count_offset, offsetof(SHUnit, obj_shape_table_count))  \
+   V(unit_object_class_cache_offset,                                          \
+     offsetof(SHUnit, object_literal_class_cache))                            \
++  V(unit_ordinary_literal_shapes_offset,                                    \
++    offsetof(SHUnit, ordinary_literal_shapes))                              \
++  V(unit_ordinary_literal_shape_count_offset,                               \
++    offsetof(SHUnit, ordinary_literal_shape_count))                         \
+   V(unit_module_exports_offset, offsetof(SHUnit, moduleExports))             \
+   V(unit_source_locations_offset, offsetof(SHUnit, source_locations))        \
+   V(unit_source_locations_size_offset,                                       \
+@@ -290,6 +331,19 @@ typedef struct SHLocals {
+   V(unit_main_info_offset, offsetof(SHUnit, unit_main_info))                 \
+   V(unit_name_offset, offsetof(SHUnit, unit_name))                           \
+   V(unit_runtime_extension_offset, offsetof(SHUnit, runtime_ext))            \
++  V(young_reclaim_result_size, sizeof(SHYoungReclaimResult))                 \
++  V(young_reclaim_status_offset, offsetof(SHYoungReclaimResult, status))      \
++  V(young_reclaim_begin_offset,                                            \
++    offsetof(SHYoungReclaimResult, payload_begin))                          \
++  V(young_reclaim_end_offset, offsetof(SHYoungReclaimResult, payload_end))   \
++  V(free_payload_result_size, sizeof(SHFreePayloadResult))                  \
++  V(free_payload_status_offset, offsetof(SHFreePayloadResult, status))      \
++  V(free_payload_count_offset, offsetof(SHFreePayloadResult, count))        \
++  V(free_payload_visited_offset, offsetof(SHFreePayloadResult, visited))    \
++  V(free_payload_ranges_offset, offsetof(SHFreePayloadResult, ranges))      \
++  V(free_payload_range_size, sizeof(SHFreePayloadRange))                    \
++  V(free_payload_range_start_offset, offsetof(SHFreePayloadRange, start))   \
++  V(free_payload_range_end_offset, offsetof(SHFreePayloadRange, end))       \
+   V(locals_size, sizeof(SHLocals))                                           \
+   V(locals_prev_offset, offsetof(SHLocals, prev))                            \
+   V(locals_count_offset, offsetof(SHLocals, count))                          \
+@@ -361,6 +415,75 @@ _sh_init_with_error(int argc, char **argv, char **errorMessage);
+ /// Destroy a runtime instance created by \c _sh_init();
+ SHERMES_EXPORT void _sh_done(SHRuntime *shr);
+ 
++/// Cumulative GC counters and current heap occupancy. This reads counters,
++/// without collecting, traversing the heap, or allocating JS values.
++typedef struct SHHeapStatistics {
++  uint64_t collections;
++  uint64_t allocated_bytes;
++  uint64_t heap_bytes;
++  uint64_t gc_wall_nanos;
++  uint64_t gc_cpu_nanos;
++} SHHeapStatistics;
++SHERMES_EXPORT void _sh_get_heap_statistics(
++    SHRuntime *shr, SHHeapStatistics *statistics);
++
++/// Prepare and retain eligible ordinary literal layouts for registered units,
++/// without executing application functions. Call during request-independent
++/// preparation, with exclusive runtime access. Repeated successful calls are
++/// safe, including after additional units have initialized. Classes remain
++/// ordinary GC-managed objects; full collection and compaction still trace them.
++/// On failure, write the exception and return false. The caller must discard the
++/// partially prepared runtime. On success, write undefined and return true.
++SHERMES_EXPORT bool _sh_prepare_literal_layouts(
++    SHRuntime *shr, SHLegacyValue *resultOrException);
++
++/// Run ordinary young-generation survivor, weak-reference and finalizer
++/// processing without starting an old-generation cycle. Pending old-generation
++/// work, promotion or worst-case survivor pressure at the old-generation start
++/// threshold defers reclamation. Other collectors report unsupported.
++/// Call only with exclusive runtime access outside execution and collection.
++/// A reclaimed range contains no live objects or collector metadata, but is not
++/// necessarily page aligned. Its authority expires when guest allocation or
++/// collection resumes. The embedder must preserve that quiescence until discard
++/// finishes and retain any host resources that finalizers can still reference.
++/// Deferred calls make no collector progress; permit ordinary collection or
++/// restore/dispose instead of retrying in a loop. Work has ordinary young-GC
++/// cost, including native finalizers, with no fixed latency bound.
++/// Non-reclaimed outcomes always return an empty range.
++SHERMES_EXPORT void _sh_try_reclaim_young_generation(
++    SHRuntime *shr, SHYoungReclaimResult *result);
++
++/// Complete ordinary collection and separate prepared allocation storage.
++/// Objects in that storage retain normal liveness/finalization semantics, but
++/// their holes are excluded from allocation and their segments from compaction.
++/// Call once with exclusive runtime ownership before capturing an image.
++/// Returns false for collectors without this capability; success is required
++/// before dynamic occupancy or free-payload queries.
++SHERMES_EXPORT bool _sh_begin_prepared_heap(SHRuntime *shr);
++
++/// A constant-time collection-pressure estimate, not a physical-memory charge.
++SHERMES_EXPORT uint64_t _sh_prepared_heap_dynamic_bytes(SHRuntime *shr);
++
++/// Observe an already empty nursery without running collection. The range
++/// expires on subsequent allocation/collection, as with nursery reclamation.
++SHERMES_EXPORT void _sh_empty_young_payload(
++    SHRuntime *shr, SHYoungReclaimResult *result);
++
++/// Export collector-owned free payload at an exclusive mutator boundary.
++/// pageSize must be a power of two in [4096, 65536], visitLimit in [1, 4096].
++/// Only count ranges are initialized. Partial results grant those ranges;
++/// deferred/unsupported results grant none. Preserve allocation/collection
++/// quiescence until discard completes. Free-cell headers are always excluded.
++SHERMES_EXPORT void _sh_dynamic_free_payload(
++    SHRuntime *shr,
++    SHFreePayloadResult *result,
++    uint32_t pageSize,
++    uint32_t visitLimit);
++
++/// Release empty weak-slot chunks without collection or moving occupied slots.
++/// Requires exclusive runtime access with no collection in progress.
++SHERMES_EXPORT uint64_t _sh_trim_unused_weak_slots(SHRuntime *shr);
++
+ /// Check on the native stack and throw a stack overflow error if it overflows.
+ /// When compiled without HERMES_CHECK_NATIVE_STACK, does nothing.
+ /// TODO: Inline the fast path to allow for faster execution.
+diff --git a/lib/BCGen/SH/SH.cpp b/lib/BCGen/SH/SH.cpp
+index de238ebed9a599fa064d6fdfa118afe3a4344870..45b5c5114bc485945a1f4b54e81320ed9a0b5c38 100644
+--- a/lib/BCGen/SH/SH.cpp
++++ b/lib/BCGen/SH/SH.cpp
+@@ -190,6 +190,10 @@ class SHLiteralBuffers {
+   /// Table of object literal shapes.
+   std::vector<ShapeTableEntry> objShapeTable{};
+ 
++  /// Only live ordinary allocations authorize eager class preparation. Retained
++  /// literal tables can also contain unused slots or typed object shapes.
++  std::vector<uint32_t> ordinaryLiteralShapes{};
++
+   /// A map from instruction to literal offset in the corresponding buffers.
+   /// \c arrayBuffer, \c objKeyBuffer, \c objliteralValBuffer.
+   LiteralBufferBuilder::LiteralOffsetMapTy literalOffsetMap{};
+@@ -208,6 +212,21 @@ class SHLiteralBuffers {
+     objKeyBuffer = std::move(bufs.keyBuffer);
+     objShapeTable = std::move(bufs.shapeTable);
+     literalOffsetMap = std::move(bufs.offsetMap);
++    llvh::BitVector ordinary(objShapeTable.size());
++    llvh::BitVector other(objShapeTable.size());
++    for (const auto &entry : literalOffsetMap) {
++      const auto shape = entry.second.shapeTableIdx;
++      if (shape == UINT32_MAX)
++        continue; // Array literals have no object shape.
++      if (llvh::isa<LIRAllocObjectFromBufferInst>(entry.first))
++        ordinary.set(shape);
++      else
++        other.set(shape);
++    }
++    for (uint32_t shape = 0; shape < objShapeTable.size(); ++shape) {
++      if (ordinary.test(shape) && !other.test(shape))
++        ordinaryLiteralShapes.push_back(shape);
++    }
+   }
+ 
+   /// For a given instruction \p inst that has an associated serialized literal,
+@@ -233,6 +252,10 @@ class SHLiteralBuffers {
+          << ", .num_props = " << entry.numProps << " },\n";
+     }
+     os << "};\n";
++    os << "static const uint32_t s_ordinary_literal_shapes[] = {";
++    for (const auto shape : ordinaryLiteralShapes)
++      os << shape << ",";
++    os << "};\n";
+   }
+ 
+  private:
+@@ -3277,6 +3300,9 @@ void generateUnitData(
+      << ".obj_shape_table_count = "
+      << moduleGen.literalBuffers.objShapeTable.size() << ", "
+      << ".object_literal_class_cache = unit_data->object_literal_class_cache, "
++     << ".ordinary_literal_shapes = s_ordinary_literal_shapes, "
++     << ".ordinary_literal_shape_count = "
++     << moduleGen.literalBuffers.ordinaryLiteralShapes.size() << ", "
+      << ".source_locations = s_source_locations, "
+      << ".source_locations_size = " << moduleGen.srcLocationTable.size()
+      << ", " << ".unit_main = ";
+diff --git a/lib/VM/GCBase.cpp b/lib/VM/GCBase.cpp
+index e0b0e97eb59cdc99c8309a87b7a95c8e5d6a5e2a..516b98cb75f1adc566283ff130bc04424c6765c0 100644
+--- a/lib/VM/GCBase.cpp
++++ b/lib/VM/GCBase.cpp
+@@ -700,7 +700,7 @@ void GCBase::snapshotAddGCNativeNodes(HeapSnapshot &snap) {
+       HeapSnapshot::NodeType::Native,
+       "hermes::ManagedChunkedList<WeakRefSlot>",
+       IDTracker::reserved(IDTracker::ReservedObjectID::WeakRefSlotStorage),
+-      weakSlots_.capacity() * sizeof(decltype(weakSlots_)::value_type),
++      weakSlots_.mallocSizeEstimate(),
+       0);
+ }
+ 
+@@ -806,8 +806,7 @@ void GCBase::getHeapInfo(HeapInfo &info) {
+ 
+ void GCBase::getHeapInfoWithMallocSize(HeapInfo &info) {
+   // Assign to overwrite anything previously in the heap info.
+-  info.mallocSizeEstimate =
+-      weakSlots_.capacity() * sizeof(decltype(weakSlots_)::value_type);
++  info.mallocSizeEstimate = weakSlots_.mallocSizeEstimate();
+ }
+ 
+ #ifndef NDEBUG
+@@ -994,6 +993,14 @@ WeakRefSlot *GCBase::allocWeakSlot(SmallHermesValue target) {
+   return &weakSlots_.add(target);
+ }
+ 
++size_t GCBase::trimUnusedWeakSlots() {
++  if (inGC())
++    hermes_fatal("Weak-slot trimming requires the mutator boundary");
++  const auto before = weakSlots_.capacity();
++  weakSlots_.trimEmptyChunks();
++  return before - weakSlots_.capacity();
++}
++
+ WeakMapEntrySlot *GCBase::allocWeakMapEntrySlot(
+     SmallHermesValue key,
+     HermesValue value,
+@@ -1039,8 +1046,17 @@ bool GCBase::hasObjectID(const GCCell *cell) {
+ 
+ void GCBase::newAlloc(const GCCell *ptr, uint32_t sz) {
+ #ifdef HERMES_MEMORY_INSTRUMENTATION
++#if !defined(NDEBUG) || defined(HERMES_SLOW_DEBUG)
++  // Debug allocations also validate the captured IP when tracking is disabled.
+   allocationLocationTracker_.newAlloc(ptr, sz);
+-  samplingAllocationTracker_.newAlloc(ptr, sz);
++#else
++  // Keep disabled instrumentation off the allocation call path. In Wasm the
++  // otherwise unused virtual IP lookup also incurs an indirect-call check.
++  if (allocationLocationTracker_.isEnabled())
++    allocationLocationTracker_.newAlloc(ptr, sz);
++#endif
++  if (samplingAllocationTracker_.isEnabled())
++    samplingAllocationTracker_.newAlloc(ptr, sz);
+ #endif
+ }
+ 
+@@ -1384,10 +1400,8 @@ void GCBase::AllocationLocationTracker::disable() {
+ void GCBase::AllocationLocationTracker::newAlloc(
+     const GCCell *ptr,
+     uint32_t sz) {
+-  // Note we always get the current IP even if allocation tracking is not
+-  // enabled as it allows us to assert this feature works across many tests.
+-  // Note it's not very slow, it's slower than the non-virtual version
+-  // in Runtime though.
++  // The allocation hook calls this while disabled only in debug builds, to
++  // exercise IP-capture assertions without charging release allocations.
+   const auto *ip = gc_->gcCallbacks_.getCurrentIPSlow();
+   if (!enabled_) {
+     return;
+diff --git a/lib/VM/SHUnitExt.h b/lib/VM/SHUnitExt.h
+index ec164b3bc3eacf68cfd555b48480a9209e8037a7..098f2851058b5e405f0cc7c6ad548657fb877c21 100644
+--- a/lib/VM/SHUnitExt.h
++++ b/lib/VM/SHUnitExt.h
+@@ -8,6 +8,7 @@
+ #pragma once
+ 
+ #include "hermes/ADT/TransparentConservativeVector.h"
++#include "hermes/VM/ArrayStorage.h"
+ #include "hermes/VM/PropertyCache.h"
+ #include "hermes/VM/static_h.h"
+ 
+@@ -20,6 +21,11 @@ struct SHUnitExt {
+   /// A map from template object ids to template objects.
+   llvh::DenseMap<uint32_t, hermes::vm::JSObject *> templateMap{};
+ 
++  /// Strong root for prepared literal classes. Old GC-managed storage avoids
++  /// enumerating every stable class on each young collection. Writes must use
++  /// ArrayStorage barriers; full collection may move both storage and classes.
++  hermes::vm::ArrayStorage *preparedLiteralLayouts{nullptr};
++
+   /// Vector of AddPropertyCacheEntry, where each element is lazily allocated
+   /// whenever a CodeBlock needs a new entry.
+   /// Stored in a central location here for easier marking of roots.
+diff --git a/lib/VM/StaticH.cpp b/lib/VM/StaticH.cpp
+index b31b6c985e54f0cd7a9bb45fbdb46ac06cfb5aa7..715c3310d5332c318ce59b39c8e5257629d0ec92 100644
+--- a/lib/VM/StaticH.cpp
++++ b/lib/VM/StaticH.cpp
+@@ -44,6 +44,198 @@ using namespace hermes::vm;
+ 
+ extern "C" void _SH_MODEL(void) {}
+ 
++extern "C" void _sh_get_heap_statistics(
++    SHRuntime *shr, SHHeapStatistics *statistics) {
++  GCBase::HeapInfo info;
++  getRuntime(shr).getHeap().getHeapInfo(info);
++  *statistics = {
++      info.numCollections,
++      info.totalAllocatedBytes,
++      info.allocatedBytes,
++      static_cast<uint64_t>(info.generalStats.gcWallTime.sum() * 1e9),
++      static_cast<uint64_t>(info.generalStats.gcCPUTime.sum() * 1e9)};
++}
++
++extern "C" void _sh_try_reclaim_young_generation(
++    SHRuntime *shr, SHYoungReclaimResult *result) {
++#if HERMESVM_GCKIND == _HERMESVM_GCVALUE_HADES
++  const auto reclaimed = getRuntime(shr).getHeap().tryReclaimYoungGeneration();
++  *result = {
++      reclaimed.status == HadesGC::YoungReclaimStatus::Reclaimed
++          ? SHYoungReclaimReclaimed
++          : SHYoungReclaimDeferred,
++      reinterpret_cast<uintptr_t>(reclaimed.payloadBegin),
++      reinterpret_cast<uintptr_t>(reclaimed.payloadEnd)};
++#else
++  *result = {SHYoungReclaimUnsupported, 0, 0};
++#endif
++}
++
++extern "C" bool _sh_begin_prepared_heap(SHRuntime *shr) {
++#if HERMESVM_GCKIND == _HERMESVM_GCVALUE_HADES
++  if (kConcurrentGC)
++    return false;
++  getRuntime(shr).getHeap().beginPreparedHeap();
++  return true;
++#else
++  return false;
++#endif
++}
++
++extern "C" uint64_t _sh_prepared_heap_dynamic_bytes(SHRuntime *shr) {
++#if HERMESVM_GCKIND == _HERMESVM_GCVALUE_HADES
++  return getRuntime(shr).getHeap().dynamicOccupiedGrowth();
++#else
++  hermes_fatal("Prepared allocation is unsupported by this collector");
++#endif
++}
++
++extern "C" void _sh_empty_young_payload(
++    SHRuntime *shr, SHYoungReclaimResult *result) {
++#if HERMESVM_GCKIND == _HERMESVM_GCVALUE_HADES
++  const auto payload = getRuntime(shr).getHeap().emptyYoungPayload();
++  *result = {
++      payload.status == HadesGC::YoungReclaimStatus::Reclaimed
++          ? SHYoungReclaimReclaimed
++          : SHYoungReclaimDeferred,
++      reinterpret_cast<uintptr_t>(payload.payloadBegin),
++      reinterpret_cast<uintptr_t>(payload.payloadEnd)};
++#else
++  *result = {SHYoungReclaimUnsupported, 0, 0};
++#endif
++}
++
++extern "C" void _sh_dynamic_free_payload(
++    SHRuntime *shr,
++    SHFreePayloadResult *result,
++    uint32_t pageSize,
++    uint32_t visitLimit) {
++  result->count = result->visited = 0;
++#if HERMESVM_GCKIND == _HERMESVM_GCVALUE_HADES
++  HadesGC::FreePayloadRange ranges[128];
++  const auto exported = getRuntime(shr).getHeap().exportDynamicFreePayload(
++      ranges, pageSize, visitLimit);
++  switch (exported.status) {
++    case HadesGC::FreePayloadStatus::Complete:
++      result->status = SHFreePayloadComplete;
++      break;
++    case HadesGC::FreePayloadStatus::Partial:
++      result->status = SHFreePayloadPartial;
++      break;
++    case HadesGC::FreePayloadStatus::Deferred:
++      result->status = SHFreePayloadDeferred;
++      break;
++  }
++  result->count = exported.count;
++  result->visited = exported.visited;
++  for (uint32_t i = 0; i < exported.count; ++i)
++    result->ranges[i] = {ranges[i].start, ranges[i].end};
++#else
++  result->status = SHFreePayloadUnsupported;
++#endif
++}
++
++extern "C" uint64_t _sh_trim_unused_weak_slots(SHRuntime *shr) {
++  return getRuntime(shr).getHeap().trimUnusedWeakSlots();
++}
++
++extern "C" bool _sh_prepare_literal_layouts(
++    SHRuntime *shr, SHLegacyValue *resultOrException) {
++  Runtime &runtime = getRuntime(shr);
++  GCScope scope{runtime};
++  const auto marker = scope.createMarker();
++  for (auto *unit : runtime.units) {
++    if (!unit || !unit->ordinary_literal_shape_count ||
++        unit->runtime_ext->preparedLiteralLayouts)
++      continue;
++    if (!unit->ordinary_literal_shapes ||
++        unit->ordinary_literal_shape_count > unit->obj_shape_table_count)
++      hermes_fatal("Invalid ordinary literal shape table");
++    auto storageResult = ArrayStorage::createLongLived(
++        runtime, unit->ordinary_literal_shape_count);
++    if (LLVM_UNLIKELY(storageResult == ExecutionStatus::EXCEPTION)) {
++      *resultOrException = _sh_get_clear_thrown_value(shr);
++      return false;
++    }
++    auto storage = runtime.makeHandle<ArrayStorage>(*storageResult);
++    ArrayStorage::resizeWithinCapacity(
++        *storage, runtime, unit->ordinary_literal_shape_count);
++    // Publish the root before creating classes, which may collect. Unsupported
++    // dictionary-sized shapes leave an empty slot in the initialized storage.
++    unit->runtime_ext->preparedLiteralLayouts = *storage;
++    const auto classMarker = scope.createMarker();
++    for (uint32_t i = 0; i < unit->ordinary_literal_shape_count; ++i) {
++      scope.flushToMarker(classMarker);
++      const auto shapeIndex = unit->ordinary_literal_shapes[i];
++      if (shapeIndex >= unit->obj_shape_table_count ||
++          (i && shapeIndex <= unit->ordinary_literal_shapes[i - 1]))
++        hermes_fatal("Invalid ordinary literal shape index");
++      const auto &shape = unit->obj_shape_table[shapeIndex];
++      if (shape.num_props > HiddenClass::kDictionaryThreshold)
++        continue;
++      if (shape.key_buffer_offset > unit->obj_key_buffer_size)
++        hermes_fatal("Invalid ordinary literal key buffer");
++      auto *entry = reinterpret_cast<WeakRoot<HiddenClass> *>(
++          &unit->object_literal_class_cache[shapeIndex]);
++      auto clazz = runtime.makeMutableHandle<HiddenClass>(nullptr);
++      if (*entry) {
++        clazz = entry->getNonNull(runtime, runtime.getHeap());
++      } else {
++        const llvh::ArrayRef<uint8_t> keys{
++            unit->obj_key_buffer, unit->obj_key_buffer_size};
++        // Ordinary buffer allocations use this same root even with an explicit
++        // prototype: getHiddenClassForPrototype depends only on reserved slots.
++        clazz = addBufferPropertiesToHiddenClass(
++            runtime,
++            keys.slice(shape.key_buffer_offset),
++            shape.num_props,
++            *runtime.getHiddenClassForPrototype(
++                nullptr, JSObject::numOverlapSlots<JSObject>()),
++            [unit](StringID id) {
++              if (id >= unit->num_symbols)
++                hermes_fatal("Invalid ordinary literal symbol");
++              return SymbolID::unsafeCreate(unit->symbols[id]);
++            });
++      }
++      if (clazz->isDictionary() || clazz->isTyped() ||
++          clazz->getNumProperties() != shape.num_props)
++        hermes_fatal("Incompatible ordinary literal class");
++      entry->set(runtime, *clazz);
++      storage->set(i, HermesValue::encodeObjectValue(*clazz), runtime.getHeap());
++    }
++    scope.flushToMarker(marker);
++  }
++  // Even initializing an existing child's map can steal its parent's map.
++  // Prepare descendants before parents across all units, including on repeated
++  // calls after initialization has transferred maps out of prepared classes.
++  // Temporary handles also protect completed maps from MallocGC's debug clearing
++  // while another map allocation collects. Only the array roots persist.
++  GCScope mapScope{
++      runtime, "prepareLiteralMaps", std::numeric_limits<unsigned>::max()};
++  std::vector<Handle<HiddenClass>> layouts;
++  for (auto *unit : runtime.units) {
++    if (!unit || !unit->runtime_ext->preparedLiteralLayouts)
++      continue;
++    auto *storage = unit->runtime_ext->preparedLiteralLayouts;
++    for (uint32_t i = 0; i < storage->size(); ++i) {
++      if (storage->at(i).isObject())
++        layouts.push_back(runtime.makeHandle<HiddenClass>(storage->at(i)));
++    }
++  }
++  std::stable_sort(layouts.begin(), layouts.end(), [](auto left, auto right) {
++    return left->getNumProperties() > right->getNumProperties();
++  });
++  const auto mapMarker = mapScope.createMarker();
++  for (auto clazz : layouts) {
++    HiddenClass::forEachPropertyWhile(
++        clazz, runtime,
++        [](Runtime &, SymbolID, NamedPropertyDescriptor) { return false; });
++    mapScope.flushToMarker(mapMarker);
++  }
++  *resultOrException = HermesValue::encodeUndefinedValue();
++  return true;
++}
++
+ namespace {
+ /// Convert the given \p cr to a \c CallResult<HermesValue>.
+ template <typename T>
+diff --git a/lib/VM/StaticHUnit.cpp b/lib/VM/StaticHUnit.cpp
+index 57ea558d44fa78c32dcbcc5dd78b84450db000f8..78db63ae8ff058935acb3f016a8d0c133e427a93 100644
+--- a/lib/VM/StaticHUnit.cpp
++++ b/lib/VM/StaticHUnit.cpp
+@@ -266,6 +266,9 @@ void hermes::vm::sh_unit_mark_roots(
+     SHUnit *unit,
+     RootAcceptorWithNames &acceptor,
+     bool markLongLived) {
++  if (unit->runtime_ext->preparedLiteralLayouts)
++    acceptor.acceptPtr(unit->runtime_ext->preparedLiteralLayouts);
++
+   for (auto &it : unit->runtime_ext->templateMap) {
+     acceptor.acceptPtr(it.second);
+   }
+diff --git a/lib/VM/gcs/HadesGC.cpp b/lib/VM/gcs/HadesGC.cpp
+index 6ee38260da3aca49ca252e67a892b55cb5e4cfc1..f641f10f81f11a0b0f6bb08384c14ccc53c8a906 100644
+--- a/lib/VM/gcs/HadesGC.cpp
++++ b/lib/VM/gcs/HadesGC.cpp
+@@ -69,6 +69,125 @@ void FreelistBuildMeta(const GCCell *cell, Metadata::Builder &mb) {
+   mb.setVTable(&HadesGC::OldGen::FreelistCell::vt);
+ }
+ 
++void HadesGC::beginPreparedHeap() {
++  if (kConcurrentGC || preparedHeapActive_ || inGC())
++    hermes_fatal("Prepared heap requires a fresh nonconcurrent mutator boundary");
++  collect("prepared allocation boundary");
++  auto lk = ensureBackgroundTaskPaused();
++  waitForCollectionToFinish("prepared allocation boundary");
++  // collect() may start a follow-up major cycle during its last evacuation.
++  // Finish that cycle's compactee without starting yet another major cycle.
++  if (compactee_.segment)
++    youngGenCollection("prepared allocation boundary", false, false);
++  if (youngGen_.used() || concurrentPhase_ != Phase::None ||
++      compactee_.segment || promoteYGToOG_)
++    hermes_fatal("Prepared heap requires completed collection");
++  for (const auto &segment : oldGen_.getSegments())
++    preparedSegments_.insert(segment.lowLim());
++  for (const auto &segment : oldGen_.getJumboSegments())
++    preparedSegments_.insert(segment.lowLim());
++  preparedNormalSegments_ = oldGen_.numSegments();
++  preparedAllocatedBytes_ = oldGen_.allocatedBytes();
++  preparedExternalBytes_ = oldGen_.externalBytes();
++  preparedExternalBytesAtPreparation_ = preparedExternalBytes_;
++  oldGen_.detachPreparedAllocation();
++  preparedHeapActive_ = true;
++}
++
++uint64_t HadesGC::dynamicOccupiedGrowth() {
++  std::lock_guard<Mutex> lk{gcMutex_};
++  if (!preparedHeapActive_ || allocatedBytes() < preparedAllocatedBytes_ ||
++      externalBytes() < preparedExternalBytes_)
++    hermes_fatal("Invalid prepared occupancy boundary");
++  return allocatedBytes() - preparedAllocatedBytes_ +
++      externalBytes() -
++      std::min(preparedExternalBytes_, preparedExternalBytesAtPreparation_);
++}
++
++void HadesGC::OldGen::detachPreparedAllocation() {
++  allocChunk_ = nullptr;
++  for (auto &segment : segmentBuckets_) {
++    for (auto &bucket : segment) {
++      bucket.next = nullptr;
++      bucket.prev = nullptr;
++      bucket.head = nullptr;
++    }
++  }
++  for (size_t i = 0; i < kNumFreelistBuckets; ++i) {
++    buckets_[i].next = nullptr;
++    buckets_[i].prev = nullptr;
++    buckets_[i].head = nullptr;
++    freelistBucketBitArray_.set(i, false);
++  }
++}
++
++HadesGC::FreePayloadResult HadesGC::exportDynamicFreePayload(
++    llvh::MutableArrayRef<FreePayloadRange> ranges,
++    uint32_t pageSize,
++    uint32_t visitLimit) {
++  if (!preparedHeapActive_ || ranges.empty() || ranges.size() > 128 ||
++      pageSize < 4096 || pageSize > 65536 || (pageSize & (pageSize - 1)) ||
++      visitLimit == 0 || visitLimit > 4096 || inGC())
++    hermes_fatal("Invalid dynamic free-payload boundary");
++  auto lk = ensureBackgroundTaskPaused();
++  // A sweep can rebuild the free list and a compactee has different ownership.
++  // Neither permits an export, even if some cells currently look disposable.
++  if (concurrentPhase_ != Phase::None || compactee_.segment || promoteYGToOG_)
++    return {FreePayloadStatus::Deferred, 0, 0};
++  return oldGen_.exportFreePayload(ranges, pageSize, visitLimit);
++}
++
++HadesGC::FreePayloadResult HadesGC::OldGen::exportFreePayload(
++    llvh::MutableArrayRef<FreePayloadRange> ranges,
++    uint32_t pageSize,
++    uint32_t visitLimit) {
++  FreePayloadResult result{FreePayloadStatus::Complete, 0, 0};
++  const uintptr_t mask = pageSize - 1;
++  const auto append = [&](FreelistCell *cell) {
++    if (result.count == ranges.size() || result.visited == visitLimit) {
++      result.status = FreePayloadStatus::Partial;
++      return false;
++    }
++    ++result.visited;
++    if (!FreelistCell::classof(cell) ||
++        gc_.preparedSegments_.count(FixedSizeHeapSegment::storageStart(cell)))
++      hermes_fatal("Invalid dynamic free-cell owner");
++    const uintptr_t address = reinterpret_cast<uintptr_t>(cell);
++    const uintptr_t end = address + cell->getAllocatedSize();
++    if (end < address || end - address < sizeof(FreelistCell))
++      hermes_fatal("Invalid dynamic free-cell extent");
++    // The size/next link lives in the header and cell-boundary metadata lives
++    // in the segment. There is no footer in the disposable payload.
++    const uintptr_t payload = address + sizeof(FreelistCell);
++    const uintptr_t padding = (pageSize - (payload & mask)) & mask;
++    if (padding > end - payload)
++      return true;
++    const uintptr_t start = payload + padding;
++    const uintptr_t stop = end & ~mask;
++    if (start < stop)
++      ranges[result.count++] = {start, stop};
++    return true;
++  };
++  // allocChunk_ is detached from the bucket lists, so include it exactly once.
++  if (allocChunk_ && !append(allocChunk_))
++    return result;
++  const auto first = getFreelistBucket(pageSize + sizeof(FreelistCell));
++  for (size_t bucket = kNumFreelistBuckets; bucket-- > first;) {
++    for (auto *segment = buckets_[bucket].next; segment; segment = segment->next) {
++      auto current = segment->head;
++      if (!current)
++        hermes_fatal("Empty free-list bucket is linked");
++      while (current) {
++        auto *cell = vmcast<FreelistCell>(current.getNonNull(gc_.getPointerBase()));
++        if (!append(cell))
++          return result;
++        current = cell->next_;
++      }
++    }
++  }
++  return result;
++}
++
+ GCCell *HadesGC::OldGen::finishAlloc(GCCell *cell, uint32_t sz) {
+   // Track the number of allocated bytes in a segment.
+   incrementAllocatedBytes(sz);
+@@ -147,12 +266,27 @@ void HadesGC::OldGen::addCellToFreelistFromSweep(
+       gc_.concurrentPhase_ == Phase::Sweep &&
+       "addCellToFreelistFromSweep should only be called during sweeping.");
+   size_t newCellSize = freeRangeEnd - freeRangeStart;
++  const bool prepared = gc_.preparedSegments_.count(
++      FixedSizeHeapSegment::storageStart(freeRangeStart));
++  // Prepared holes never reenter allocation. Preserve already identical free
++  // headers so an ordinary full collection need not privatize their pages.
++  // An identical extent consumed just this free cell: its boundary table and
++  // poisoned payload are still valid, while coalescing must update both below.
++  auto *oldCell = reinterpret_cast<GCCell *>(freeRangeStart);
++  if (prepared && vmisa<FreelistCell>(oldCell) &&
++      oldCell->getAllocatedSize() == newCellSize)
++    return;
+   // While coalescing, sweeping may generate new cells, so make sure the cell
+   // head is updated.
+   if (setHead)
+     FixedSizeHeapSegment::setCellHead(
+         reinterpret_cast<GCCell *>(freeRangeStart), newCellSize);
+   auto *newCell = constructCell<FreelistCell>(freeRangeStart, newCellSize);
++  if (prepared) {
++    newCell->next_ = nullptr;
++    ASAN_POISON_FREE_CELL(newCell);
++    return;
++  }
+   // Get the size bucket for the cell being added;
+   const uint32_t bucket = getFreelistBucket(newCellSize);
+   // Push onto the size-specific free list for this bucket and segment.
+@@ -527,11 +661,18 @@ class HadesGC::EvacAcceptor final : public RootAcceptor,
+   }
+ 
+   void accept(GCCell *&ptr) override {
+-    ptr = acceptRoot(ptr);
++    GCCell *forwarded = acceptRoot(ptr);
++    // An unchanged reference needs no write to its backing. Keep tracing and
++    // forwarding unconditional; acceptHeap also records incoming compaction
++    // edges even when it returns the original pointer.
++    if (forwarded != ptr)
++      ptr = forwarded;
+   }
+ 
+   void accept(GCPointerBase &ptr) {
+-    ptr.setInGC(acceptHeap(ptr, &ptr));
++    CompressedPointer forwarded = acceptHeap(ptr, &ptr);
++    if (forwarded != ptr)
++      ptr.setInGC(forwarded);
+   }
+ 
+   void accept(PinnedHermesValue &hv) override {
+@@ -542,7 +683,8 @@ class HadesGC::EvacAcceptor final : public RootAcceptor,
+   void acceptNullable(PinnedHermesValue &hv) override {
+     if (hv.isPointer()) {
+       GCCell *forwardedPtr = acceptRoot(static_cast<GCCell *>(hv.getPointer()));
+-      hv.setInGC(hv.updatePointer(forwardedPtr), gc);
++      if (forwardedPtr != hv.getPointer())
++        hv.setInGC(hv.updatePointer(forwardedPtr), gc);
+     }
+   }
+ 
+@@ -550,7 +692,8 @@ class HadesGC::EvacAcceptor final : public RootAcceptor,
+     if (shv.isPointer()) {
+       GCCell *ptr = shv.getPointer(pointerBase_);
+       GCCell *forwardedPtr = acceptRoot(ptr);
+-      shv.setInGC(shv.updatePointer(forwardedPtr, pointerBase_), gc);
++      if (forwardedPtr != ptr)
++        shv.setInGC(shv.updatePointer(forwardedPtr, pointerBase_), gc);
+     }
+   }
+ 
+@@ -558,14 +701,16 @@ class HadesGC::EvacAcceptor final : public RootAcceptor,
+     if (hv.isPointer()) {
+       GCCell *forwardedPtr =
+           acceptHeap(static_cast<GCCell *>(hv.getPointer()), &hv);
+-      hv.setInGC(hv.updatePointer(forwardedPtr), gc);
++      if (forwardedPtr != hv.getPointer())
++        hv.setInGC(hv.updatePointer(forwardedPtr), gc);
+     }
+   }
+ 
+   void accept(GCSmallHermesValueBase &hv) {
+     if (hv.isPointer()) {
+       CompressedPointer forwardedPtr = acceptHeap(hv.getPointer(), &hv);
+-      hv.setInGC(hv.updatePointer(forwardedPtr), gc);
++      if (forwardedPtr != hv.getPointer())
++        hv.setInGC(hv.updatePointer(forwardedPtr), gc);
+     }
+   }
+ 
+@@ -1191,6 +1336,11 @@ bool HadesGC::OldGen::sweepNext(bool backgroundThread) {
+   }
+ 
+   // Correct the allocated byte count.
++  if (gc_.preparedSegments_.count(seg.lowLim())) {
++    if (uint64_t(segmentSweptBytes) > gc_.preparedAllocatedBytes_)
++      hermes_fatal("Prepared sweep exceeds occupied storage");
++    gc_.preparedAllocatedBytes_ -= segmentSweptBytes;
++  }
+   decrementAllocatedBytes(segmentSweptBytes);
+   sweepIterator_.sweptBytes += segmentSweptBytes;
+   sweepIterator_.sweptExternalBytes += externalBytesBefore - externalBytes();
+@@ -1334,6 +1484,7 @@ void HadesGC::getHeapInfoWithMallocSize(HeapInfo &info) {
+   std::lock_guard<Mutex> lk{gcMutex_};
+   // First add the usage by the runtime's roots.
+   info.mallocSizeEstimate += gcCallbacks_.mallocSize();
++  info.mallocSizeEstimate += preparedSegments_.getMemorySize();
+   // Scan all objects for their malloc size. This operation is what makes
+   // getHeapInfoWithMallocSize O(heap size).
+   forAllObjs([&info](GCCell *cell) {
+@@ -1504,6 +1655,43 @@ void HadesGC::collectWithOptions(
+       /*forceOldGenCollection*/ options.type == GCType::Major);
+ }
+ 
++HadesGC::YoungReclaimResult HadesGC::emptyYoungPayload() {
++  auto lk = ensureBackgroundTaskPaused();
++  if (inGC())
++    hermes_fatal("Young payload requires the mutator boundary");
++  if (!youngGen_ || concurrentPhase_ != Phase::None || compactee_.segment ||
++      promoteYGToOG_ || youngGen_.used() || !youngGenFinalizables_.empty())
++    return {YoungReclaimStatus::Deferred, nullptr, nullptr};
++  return {YoungReclaimStatus::Reclaimed, youngGen_.start(), youngGen_.hiLim()};
++}
++
++HadesGC::YoungReclaimResult HadesGC::tryReclaimYoungGeneration() {
++  auto lk = ensureBackgroundTaskPaused();
++  if (inGC())
++    hermes_fatal("Young reclamation requires the mutator boundary");
++  // Promotion changes ownership of the nursery; compaction can rewrite old
++  // objects. Neither establishes disposable young payload for the embedder.
++  if (!youngGen_ || concurrentPhase_ != Phase::None || compactee_.segment ||
++      promoteYGToOG_) {
++    return {YoungReclaimStatus::Deferred, nullptr, nullptr};
++  }
++  // Repeated boundary collections must not keep emptying YG while bypassing
++  // the old-generation start threshold. Reserve for every possible survivor
++  // before mutating the heap; a deferred caller must allow ordinary GC progress
++  // or restore/dispose, rather than retrying this operation to force progress.
++  const uint64_t maximumOldBytes = oldGen_.allocatedBytes() +
++      oldGen_.externalBytes() + youngGen_.used() + getYoungGenExternalBytes();
++  if (static_cast<double>(maximumOldBytes) >=
++      oldGen_.targetSizeBytes() * static_cast<double>(ogThreshold_))
++    return {YoungReclaimStatus::Deferred, nullptr, nullptr};
++  youngGenCollection("boundary", false, false);
++  // These checks protect a memory-discard authority, including release builds.
++  if (concurrentPhase_ != Phase::None || compactee_.segment ||
++      youngGen_.used() != 0 || !youngGenFinalizables_.empty())
++    hermes_fatal("Young reclamation did not leave an empty nursery");
++  return {YoungReclaimStatus::Reclaimed, youngGen_.start(), youngGen_.hiLim()};
++}
++
+ void HadesGC::waitForCollectionToFinish(std::string cause) {
+   assert(
+       gcMutex_ &&
+@@ -1754,7 +1942,7 @@ void HadesGC::prepareCompactee(bool forceCompaction) {
+   uint64_t threshold = oldGen_.targetSizeBytes() + buffer;
+   uint64_t totalBytes = oldGen_.size() + oldGen_.externalBytes();
+   if ((forceCompaction || totalBytes > threshold) &&
+-      oldGen_.numSegments() > 1) {
++      oldGen_.numSegments() > preparedNormalSegments_ + 1) {
+     compactee_.segment =
+         std::make_shared<FixedSizeHeapSegment>(oldGen_.popSegment());
+     addSegmentExtentToCrashManager(
+@@ -1953,7 +2141,7 @@ void HadesGC::OldGen::freeUnusedJumboSegments() {
+       continue;
+     }
+     // Cell must be dead now.
+-
++    const bool prepared = gc_.preparedSegments_.count(it->lowLim());
+     auto sz = cell->getAllocatedSizeSlow();
+     // Run its finalizer first if it has one.
+     cell->getVT()->finalizeIfExists(cell, gc_);
+@@ -1977,6 +2165,14 @@ void HadesGC::OldGen::freeUnusedJumboSegments() {
+     }
+ #endif
+ 
++    if (prepared) {
++      if (sz > gc_.preparedAllocatedBytes_)
++        hermes_fatal("Prepared jumbo exceeds occupied storage");
++      gc_.preparedAllocatedBytes_ -= sz;
++      // The native allocator can reuse this address for dynamic storage.
++      // Remove its prepared identity before destroying the segment.
++      gc_.preparedSegments_.erase(it->lowLim());
++    }
+     // Remove the entire segment.
+     const size_t segIdx =
+         AlignedHeapSegment::getSegmentIndexFromStart(it->lowLim());
+@@ -2049,6 +2245,8 @@ void HadesGC::creditExternalMemory(GCCell *cell, uint32_t sz) {
+   } else {
+     std::lock_guard<Mutex> lk{gcMutex_};
+     oldGen_.creditExternalMemory(sz);
++    if (preparedSegments_.count(FixedSizeHeapSegment::storageStart(cell)))
++      preparedExternalBytes_ += sz;
+     uint64_t totalBytes = oldGen_.allocatedBytes() + oldGen_.externalBytes();
+     if (totalBytes > oldGen_.targetSizeBytes())
+       youngGen_.setEffectiveEnd(youngGen_.level());
+@@ -2067,6 +2265,13 @@ void HadesGC::debitExternalMemory(GCCell *cell, uint32_t sz) {
+   } else {
+     std::lock_guard<Mutex> lk{gcMutex_};
+     oldGen_.debitExternalMemory(sz);
++    // Finalization, buffer detachment and native-container shrinkage all pass
++    // here. Update ownership before a dead jumbo segment can lose its identity.
++    if (preparedSegments_.count(FixedSizeHeapSegment::storageStart(cell))) {
++      if (sz > preparedExternalBytes_)
++        hermes_fatal("Prepared external debit exceeds owned storage");
++      preparedExternalBytes_ -= sz;
++    }
+   }
+ }
+ 
+@@ -2666,7 +2871,13 @@ uint64_t HadesGC::youngGenEvacuateImpl(bool doCompaction) {
+ 
+ void HadesGC::youngGenCollection(
+     std::string cause,
+-    bool forceOldGenCollection) {
++    bool forceOldGenCollection,
++    bool allowOldGenStart) {
++  assert(
++      (allowOldGenStart ||
++       (!forceOldGenCollection && concurrentPhase_ == Phase::None &&
++        !promoteYGToOG_)) &&
++      "Collection without an old-gen start requires settled marking/sweeping");
+   assert(gcMutex_ && "gcMutex_ must be held during YG collection");
+   assert(
+       gcMutex_.depth() == 1 &&
+@@ -2821,7 +3032,9 @@ void HadesGC::youngGenCollection(
+   // handles the rare case where an OG collection was completed during this YG
+   // collection, and the compaction will therefore only be completed in the next
+   // collection.
+-  if (concurrentPhase_ == Phase::None && !compactee_.segment) {
++  // Boundary reclamation cannot turn into an old-generation cycle. Ordinary
++  // allocation-pressure collections retain their existing policy and limits.
++  if (allowOldGenStart && concurrentPhase_ == Phase::None && !compactee_.segment) {
+     // There is no OG collection running, check the tripwire in case this is the
+     // first YG after an OG completed.
+     checkTripwireAndSubmitStats();
+@@ -3334,6 +3547,8 @@ void HadesGC::OldGen::addSegment(FixedSizeHeapSegment seg) {
+ }
+ 
+ FixedSizeHeapSegment HadesGC::OldGen::popSegment() {
++  if (gc_.preparedSegments_.count(segments_.back().lowLim()))
++    hermes_fatal("Cannot compact prepared storage");
+   const auto &segBuckets = segmentBuckets_.back();
+   for (size_t bucket = 0; bucket < kNumFreelistBuckets; ++bucket) {
+     if (segBuckets[bucket].head) {
+@@ -3571,19 +3786,22 @@ void HadesGC::OldGen::verifyFreelists() {
+   llvh::DenseSet<const SegmentBucket *> occupiedSegBuckets;
+ 
+   for (size_t seg = 0; seg < segments_.size(); seg++) {
+-    // Records every free cell encountered while traversing the freelists. This
+-    // is used to ensure that a FreelistCell is always found in a freelist.
++    const bool prepared = gc_.preparedSegments_.count(segments_[seg].lowLim());
++    // Records allocatable free cells. Prepared holes stay parseable but must
++    // never occur in the allocation chunk or any bucket.
+     llvh::DenseSet<const FreelistCell *> freeCells;
+ 
+     // The allocChunk_ will not be encountered in the freelists, so make sure we
+     // record it.
+     if (segments_[seg].contains(allocChunk_))
+       freeCells.insert(allocChunk_);
++    assert((!prepared || freeCells.empty()) && "Prepared allocation chunk");
+ 
+     const auto &segBuckets = segmentBuckets_[seg];
+     for (size_t bucket = 0; bucket < kNumFreelistBuckets; bucket++) {
+       if (!segBuckets[bucket].head)
+         continue;
++      assert(!prepared && "Prepared segment has an allocation bucket");
+       // Record that this segment has cells for this bucket.
+       occupiedSegBuckets.insert(&segBuckets[bucket]);
+       auto *cell = vmcast<FreelistCell>(
+@@ -3600,7 +3818,7 @@ void HadesGC::OldGen::verifyFreelists() {
+     auto *cell = (GCCell *)segments_[seg].start();
+     auto *end = (GCCell *)segments_[seg].level();
+     while (cell < end) {
+-      if (FreelistCell *fcell = dyn_vmcast<FreelistCell>(cell))
++      if (FreelistCell *fcell = dyn_vmcast<FreelistCell>(cell); fcell && !prepared)
+         assert(freeCells.erase(fcell) && "Free cell not in list");
+       cell = cell->nextCell();
+     }
+diff --git a/unittests/ADT/CMakeLists.txt b/unittests/ADT/CMakeLists.txt
+index 69739dbd309f99989c0aa47add78fe69b90fe4db..5ddb4d965fec43dc29572be5be0c5b7f7e09882c 100644
+--- a/unittests/ADT/CMakeLists.txt
++++ b/unittests/ADT/CMakeLists.txt
+@@ -7,6 +7,7 @@ set(ADTSources
+   BitArrayTest.cpp
+   CompactArrayTest.cpp
+   ConsumableRangeTest.cpp
++  ManagedChunkedListTest.cpp
+   SafeIntTest.cpp
+   ScopedHashTable.cpp
+   PersistentScopedMapTest.cpp
+diff --git a/unittests/ADT/ManagedChunkedListTest.cpp b/unittests/ADT/ManagedChunkedListTest.cpp
+index 5edd31c01642f026cf9abee4db1d35addf6b9717..59abde7effc365aebf48e18da6178f32c96319fa 100644
+--- a/unittests/ADT/ManagedChunkedListTest.cpp
++++ b/unittests/ADT/ManagedChunkedListTest.cpp
+@@ -9,6 +9,8 @@
+ 
+ #include "gtest/gtest.h"
+ 
++#include <set>
++
+ namespace {
+ 
+ using namespace hermes;
+@@ -197,4 +199,66 @@ TEST(ManagedChunkListTest, ChunksAreFreed) {
+       kInitialElementCount / kOccupancyRatio / kReductionFactor);
+ }
+ 
++TEST(ManagedChunkListTest, NewVisitsSurviveCollectionReuseAndMove) {
++  ManagedChunkedList<ManagedValue, 2> list(kOccupancyRatio, kSizingWeight);
++  const auto visitNew = [](auto &values) {
++    std::set<int> seen;
++    values.forEachNew([&](ManagedValue &value) {
++      EXPECT_TRUE(seen.insert(value.value()).second);
++    });
++    return seen;
++  };
++  list.add(1);
++  EXPECT_EQ((std::set<int>{1}), visitNew(list));
++  list.add(2);
++  std::set<int> full;
++  list.forEach([&](ManagedValue &value) { full.insert(value.value()); });
++  EXPECT_EQ((std::set<int>{1, 2}), full);
++  EXPECT_EQ((std::set<int>{2}), visitNew(list));
++  EXPECT_TRUE(visitNew(list).empty());
++
++  auto &third = list.add(3);
++  visitNew(list);
++  auto &fourth = list.add(4);
++  third.free();
++  fourth.free();
++  // The pending fourth slot belongs to a chunk deleted by this trim. Visiting
++  // after trim must use surviving storage, even if the allocator reuses it.
++  list.trimEmptyChunks();
++  EXPECT_EQ(2, list.capacity());
++  EXPECT_EQ((std::set<int>{1, 2}), visitNew(list));
++  list.add(5);
++  auto moved = std::move(list);
++  EXPECT_EQ((std::set<int>{5}), visitNew(moved));
++  EXPECT_TRUE(visitNew(moved).empty());
++  // Reusing the moved-from list must not consume a slot owned by moved.
++  EXPECT_EQ(0, list.capacity());
++  EXPECT_TRUE(visitNew(list).empty());
++  list.add(6);
++  EXPECT_EQ((std::set<int>{6}), visitNew(list));
++  full.clear();
++  moved.forEach([&](ManagedValue &value) { full.insert(value.value()); });
++  EXPECT_EQ((std::set<int>{1, 2, 5}), full);
++}
++
++TEST(ManagedChunkListTest, TrimmingReleasesIncrementalIndex) {
++  IntegerList list(kOccupancyRatio, kSizingWeight);
++  list.add(0);
++  list.forEachNew([](ManagedValue &) {});
++  const auto chunkBytes = list.mallocSizeEstimate();
++  for (size_t value = 1; value < kElementsPerChunk; ++value)
++    list.add(value).free();
++  ASSERT_GT(list.mallocSizeEstimate(), chunkBytes);
++
++  list.trimEmptyChunks();
++  EXPECT_EQ(kElementsPerChunk, list.capacity());
++  EXPECT_EQ(chunkBytes, list.mallocSizeEstimate());
++  size_t visits = 0;
++  list.forEachNew([&](ManagedValue &value) {
++    EXPECT_EQ(0, value.value());
++    ++visits;
++  });
++  EXPECT_EQ(1, visits);
++}
++
+ } // namespace
+diff --git a/unittests/VMRuntime/GCBasicsTest.cpp b/unittests/VMRuntime/GCBasicsTest.cpp
+index 4d758161eb69f8caa23bb38295b1e0b3ea0b04ac..2adad80daed31588dceb48523aa1bc5482af1b4a 100644
+--- a/unittests/VMRuntime/GCBasicsTest.cpp
++++ b/unittests/VMRuntime/GCBasicsTest.cpp
+@@ -16,6 +16,7 @@
+ #include "hermes/VM/WeakRoot-inline.h"
+ 
+ #include <chrono>
++#include <cstring>
+ #include <functional>
+ #include <new>
+ #include <thread>
+@@ -399,6 +400,173 @@ TEST(GCCallbackTest, TestCallbackInvoked) {
+   }
+ }
+ 
++#if HERMESVM_GCKIND == _HERMESVM_GCVALUE_HADES && \
++    HERMESVM_SANITIZE_HANDLES == 0
++TEST(GCBasicsTestHades, PreparationCompletesFollowupCompaction) {
++  if (kConcurrentGC)
++    return;
++  using Cell = EmptyCell<FixedSizeHeapSegment::maxSize()>;
++  const auto config = GCConfig::Builder()
++                          .withInitHeapSize(2 * FixedSizeHeapSegment::storageSize())
++                          .withMaxHeapSize(16 * FixedSizeHeapSegment::storageSize())
++                          .withOccupancyTarget(1.0)
++                          .withAllocInYoung(true)
++                          .build();
++  auto runtime = DummyRuntime::create(config);
++  auto &rt = *runtime;
++  struct : Locals {
++    PinnedValue<Cell> cells[8];
++  } lv;
++  DummyLocalsRAII lraii{rt, &lv};
++  // Growing OG directly leaves its target below occupancy. collect() starts
++  // another compacting cycle after completing its explicitly forced cycle.
++  for (auto &cell : lv.cells)
++    cell = Cell::createLongLived(rt);
++  rt.getHeap().beginPreparedHeap();
++  EXPECT_EQ(0, rt.getHeap().dynamicOccupiedGrowth());
++  EXPECT_EQ(
++      HadesGC::YoungReclaimStatus::Reclaimed,
++      rt.getHeap().emptyYoungPayload().status);
++  for (auto &cell : lv.cells)
++    EXPECT_EQ(Cell::size(), cell->getAllocatedSize());
++}
++
++TEST(GCBasicsTestHades, PreparedExternalReleaseDoesNotHideDynamicGrowth) {
++  if (kConcurrentGC)
++    return;
++  auto runtime = DummyRuntime::create(TestGCConfigFixedSize(
++      8 * FixedSizeHeapSegment::storageSize()));
++  auto &rt = *runtime;
++  auto &gc = rt.getHeap();
++  struct : Locals {
++    PinnedValue<DummyObject> prepared;
++    PinnedValue<DummyObject> growingPrepared;
++    PinnedValue<DummyObject> dynamic;
++  } lv;
++  DummyLocalsRAII lraii{rt, &lv};
++  lv.prepared = DummyObject::createLongLived(gc);
++  lv.prepared->acquireExtMem(gc, 4096);
++  lv.growingPrepared = DummyObject::createLongLived(gc);
++  gc.beginPreparedHeap();
++  EXPECT_EQ(0, gc.dynamicOccupiedGrowth());
++
++  // Releasing newly acquired prepared payload must not consume the original
++  // external baseline, even when it belongs to a different prepared object.
++  lv.growingPrepared->acquireExtMem(gc, 4096);
++  EXPECT_EQ(4096, gc.dynamicOccupiedGrowth());
++  lv.growingPrepared->releaseExtMem(gc);
++  EXPECT_EQ(0, gc.dynamicOccupiedGrowth());
++  lv.growingPrepared->acquireExtMem(gc, 4096);
++  lv.growingPrepared = nullptr;
++  rt.collect();
++  EXPECT_EQ(0, gc.dynamicOccupiedGrowth());
++
++  // Detachment and shrinking native storage can debit a live prepared owner.
++  lv.prepared->releaseExtMem(gc);
++  lv.dynamic = DummyObject::createLongLived(gc);
++  const auto dynamicCellBytes = gc.dynamicOccupiedGrowth();
++  lv.dynamic->acquireExtMem(gc, 4096);
++  EXPECT_EQ(dynamicCellBytes + 4096, gc.dynamicOccupiedGrowth());
++  rt.collect();
++  EXPECT_EQ(dynamicCellBytes + 4096, gc.dynamicOccupiedGrowth());
++  lv.prepared = nullptr;
++  lv.dynamic = nullptr;
++  rt.collect();
++  EXPECT_EQ(0, gc.dynamicOccupiedGrowth());
++}
++
++TEST(GCBasicsTestHades, PreparedHolesStayOutsideAllocationAndPayload) {
++  if (kConcurrentGC)
++    return;
++  auto runtime = DummyRuntime::create(TestGCConfigFixedSize(
++      8 * FixedSizeHeapSegment::storageSize()));
++  auto &rt = *runtime;
++  auto &gc = rt.getHeap();
++  struct : Locals {
++    PinnedValue<DummyObject> prepared;
++    PinnedValue<DummyObject> dynamic;
++  } lv;
++  DummyLocalsRAII lraii{rt, &lv};
++  lv.prepared = DummyObject::createLongLived(gc);
++  gc.beginPreparedHeap();
++  const auto preparedStart = reinterpret_cast<uintptr_t>(
++      FixedSizeHeapSegment::storageStart(*lv.prepared));
++  lv.prepared = nullptr;
++  rt.collect();
++  lv.dynamic = DummyObject::createLongLived(gc);
++  EXPECT_NE(
++      preparedStart,
++      reinterpret_cast<uintptr_t>(
++          FixedSizeHeapSegment::storageStart(*lv.dynamic)));
++
++  HadesGC::FreePayloadRange ranges[128];
++  const auto result = gc.exportDynamicFreePayload(ranges, 4096, 4096);
++  ASSERT_EQ(HadesGC::FreePayloadStatus::Complete, result.status);
++  ASSERT_GT(result.count, 0);
++  const auto liveStart = reinterpret_cast<uintptr_t>(*lv.dynamic);
++  const auto liveEnd = liveStart + lv.dynamic->getAllocatedSize();
++  for (uint32_t i = 0; i < result.count; ++i) {
++    EXPECT_EQ(0, ranges[i].start % 4096);
++    EXPECT_EQ(0, ranges[i].end % 4096);
++    EXPECT_TRUE(
++        ranges[i].end <= preparedStart ||
++        ranges[i].start >= preparedStart + FixedSizeHeapSegment::storageSize());
++    EXPECT_TRUE(ranges[i].end <= liveStart || ranges[i].start >= liveEnd);
++    // Overwriting exported payload must leave free-cell headers and metadata
++    // usable by the next allocation and full sweep.
++    __asan_unpoison_memory_region(
++        reinterpret_cast<void *>(ranges[i].start),
++        ranges[i].end - ranges[i].start);
++    std::memset(
++        reinterpret_cast<void *>(ranges[i].start),
++        0,
++        ranges[i].end - ranges[i].start);
++    __asan_poison_memory_region(
++        reinterpret_cast<void *>(ranges[i].start),
++        ranges[i].end - ranges[i].start);
++  }
++  lv.dynamic = DummyObject::createLongLived(gc);
++  rt.collect();
++  EXPECT_EQ(1, lv.dynamic->x);
++}
++
++TEST(GCBasicsTestHades, YoungReclamationDefersBeforeOldGenerationPressure) {
++  using Cell = EmptyCell<(FixedSizeHeapSegment::maxSize() / 16) & ~(HeapAlign - 1)>;
++  const auto config = TestGCConfigFixedSize(
++      8 * FixedSizeHeapSegment::storageSize(),
++      GCConfig::Builder().withAllocInYoung(true));
++  auto runtime = DummyRuntime::create(config);
++  auto &rt = *runtime;
++  struct : Locals {
++    PinnedValue<Cell> survivor;
++  } lv;
++  DummyLocalsRAII lraii{rt, &lv};
++  bool deferred = false;
++  for (unsigned i = 0; i < 128; ++i) {
++    // Each previous survivor becomes unreachable in OG. Young-only collection
++    // must defer before this garbage exhausts the heap without an old cycle.
++    lv.survivor = Cell::create(rt);
++    auto result = rt.getHeap().tryReclaimYoungGeneration();
++    if (result.status == HadesGC::YoungReclaimStatus::Deferred) {
++      EXPECT_EQ(nullptr, result.payloadBegin);
++      EXPECT_EQ(nullptr, result.payloadEnd);
++      deferred = true;
++      break;
++    }
++    EXPECT_LT(result.payloadBegin, result.payloadEnd);
++    const auto survivor = reinterpret_cast<uintptr_t>(*lv.survivor);
++    EXPECT_FALSE(
++        reinterpret_cast<uintptr_t>(result.payloadBegin) <= survivor &&
++        survivor < reinterpret_cast<uintptr_t>(result.payloadEnd));
++  }
++  EXPECT_TRUE(deferred);
++  rt.collect();
++  EXPECT_EQ(
++      HadesGC::YoungReclaimStatus::Reclaimed,
++      rt.getHeap().tryReclaimYoungGeneration().status);
++}
++#endif
++
+ #if HERMESVM_GCKIND != _HERMESVM_GCVALUE_MALLOC
+ TEST(GCBasicsTestNCGen, TestIDPersistsAcrossMultipleCollections) {
+   using SegmentCell = EmptyCell<FixedSizeHeapSegment::maxSize()>;
+diff --git a/unittests/VMRuntime/StaticHUnitTest.cpp b/unittests/VMRuntime/StaticHUnitTest.cpp
+index a0f1bbb39ad3ed8936ebdc981cc7baa4191143a5..c809184b6d3f699e8e3181e76a799a9a48d08067 100644
+--- a/unittests/VMRuntime/StaticHUnitTest.cpp
++++ b/unittests/VMRuntime/StaticHUnitTest.cpp
+@@ -6,7 +6,9 @@
+  */
+ 
+ #include "VMRuntimeTestHelpers.h"
++#include "../../lib/VM/SHUnitExt.h"
+ 
++#include "hermes/BCGen/SerializedLiteralGenerator.h"
+ #include "hermes/VM/PropertyCache.h"
+ #include "hermes/VM/StaticHUtils.h"
+ #include "hermes/VM/static_h.h"
+@@ -106,6 +108,76 @@ TEST(StaticHUnitTest, RejectsMismatchedStaticABI) {
+ 
+ using StaticHCacheTest = RuntimeTestFixture;
+ 
++TEST_F(StaticHCacheTest, PreparesParentAndChildMapsAcrossUnitsAndCollection) {
++  // Install metadata directly to avoid consuming the process-wide unit indexes
++  // exercised by InitializesAllUsableUnitSlots. Runtime still owns these units.
++  struct LiteralUnit {
++    SHUnit unit;
++    SHSymbolID symbols[3];
++    SHCompressedPointer caches[2];
++  };
++  static const uint8_t keys[]{
++      hermes::SerializedLiteralGenerator::ShortStringTag | 3,
++      0, 0, 1, 0, 2, 0};
++  static const SHShapeTableEntry initialShapes[]{{0, 1}, {0, 2}};
++  static const SHShapeTableEntry addedShapes[]{{0, 3}};
++  static const uint32_t indexes[]{0, 1};
++  const auto value = Predefined::getSymbolID(Predefined::value);
++  auto install = [&](const SHShapeTableEntry *shapes, uint32_t count) {
++    auto *data = static_cast<LiteralUnit *>(std::calloc(1, sizeof(LiteralUnit)));
++    if (!data)
++      std::abort();
++    data->symbols[0] = value.unsafeGetRaw();
++    data->symbols[1] = Predefined::getSymbolID(Predefined::length).unsafeGetRaw();
++    data->symbols[2] = Predefined::getSymbolID(Predefined::name).unsafeGetRaw();
++    auto *unit = &data->unit;
++    unit->symbols = data->symbols;
++    unit->num_symbols = 3;
++    unit->obj_key_buffer = keys;
++    unit->obj_key_buffer_size = sizeof(keys);
++    unit->obj_shape_table = shapes;
++    unit->obj_shape_table_count = count;
++    unit->ordinary_literal_shapes = indexes;
++    unit->ordinary_literal_shape_count = count;
++    unit->object_literal_class_cache = data->caches;
++    unit->runtime_ext = new SHUnitExt{};
++    for (size_t index = 1; index < std::size(runtime.units); ++index) {
++      auto &slot = runtime.units[index];
++      if (!slot) {
++        slot = unit;
++        return unit;
++      }
++    }
++    std::abort();
++  };
++  auto *first = install(initialShapes, 2);
++  SHLegacyValue result;
++  auto *shr = getSHRuntime(runtime);
++  ASSERT_TRUE(_sh_prepare_literal_layouts(shr, &result));
++  auto checkMaps = [&](SHUnit *unit) {
++    auto *storage = unit->runtime_ext->preparedLiteralLayouts;
++    ASSERT_NE(nullptr, storage);
++    for (uint32_t i = 0; i < storage->size(); ++i) {
++      auto *clazz = vmcast<HiddenClass>(storage->at(i));
++      NamedPropertyDescriptor desc;
++      auto found = HiddenClass::tryFindPropertyFast(clazz, runtime, value, desc);
++      ASSERT_TRUE(found.hasValue());
++      EXPECT_TRUE(*found);
++      EXPECT_EQ(0u, desc.slot);
++    }
++  };
++  checkMaps(first);
++  auto *second = install(addedShapes, 1);
++  ASSERT_TRUE(_sh_prepare_literal_layouts(shr, &result));
++  checkMaps(first);
++  checkMaps(second);
++  // Only the per-unit GC storage roots the classes through this collection.
++  runtime.collect("prepared layouts test");
++  ASSERT_TRUE(_sh_prepare_literal_layouts(shr, &result));
++  checkMaps(first);
++  checkMaps(second);
++}
++
+ TEST_F(StaticHCacheTest, RetainsTwoShapesForNamedAndComputedReads) {
+   auto first = runtime.makeHandle(JSObject::create(runtime));
+   auto second = runtime.makeHandle(JSObject::create(runtime));

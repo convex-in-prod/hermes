@@ -1,18 +1,52 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Thu, 27 Aug 2026 13:49:27 +0800
-Subject: [PATCH 02/15] StaticH: publish runtime registry and ABI descriptor
+Subject: [PATCH 02/15] static-h: publish the runtime registry and ABI
+ descriptor
 
-Expose a bounded application-unit registry and an explicit descriptor for every generated/runtime layout used by Static Hermes. Validate the descriptor at unit initialization and cover capacity and mismatch behavior with VM runtime tests.
+Expose a bounded application-unit registry and a descriptor of the
+generated/runtime layouts used by Static Hermes. Reject mismatched
+descriptors at unit initialization and cover registry capacity and ABI
+rejection in the VM runtime tests.
+
+Describe the maintained static_h source branch and the patch-history
+workflow used to carry this embedding interface and subsequent changes.
 ---
+ README.md                               |  15 ++++
  include/hermes/VM/sh_runtime.h          |  13 ++-
  include/hermes/VM/static_h.h            | 102 +++++++++++++++++++++++
  lib/VM/StaticHUnit.cpp                  |  53 ++++++++++++
  unittests/VMRuntime/CMakeLists.txt      |   1 +
  unittests/VMRuntime/StaticHUnitTest.cpp | 106 ++++++++++++++++++++++++
- 5 files changed, 273 insertions(+), 2 deletions(-)
+ 6 files changed, 288 insertions(+), 2 deletions(-)
  create mode 100644 unittests/VMRuntime/StaticHUnitTest.cpp
 
+diff --git a/README.md b/README.md
+index 769386ebde68dbd79cb1c221752d7c99ce2929ab..1e33f194c24d5c1f8dd3b538620d281f464d4dca 100644
+--- a/README.md
++++ b/README.md
+@@ -6,6 +6,21 @@
+ 
+ Hermes is a JavaScript engine optimized for fast start-up of [React Native](https://reactnative.dev/) apps. It features ahead-of-time static optimization and compact bytecode.
+ 
++## Downstream static_h fork
++
++This fork maintains its downstream changes on `static_h`, based on the upstream
++`static_h` branch. The downstream series targets reproducible
++Static Hermes C-bundle builds and compatibility needed by self-hosted
++deployments on constrained hosts. Changes are kept in small commits with
++focused tests so isolated fixes can be proposed upstream independently.
++
++The `patch-history` orphan branch is the applyable record of the current train.
++It records the exact upstream base, source tip, generated patches, and result
++tree. Use its `scripts/update.sh` before and after a rebase or amended source
++commit, and `scripts/apply.sh` to reconstruct the train on the recorded
++upstream checkout. The source branch remains the authoritative working tree;
++the history branch is generated verification data.
++
+ If you're only interested in using pre-built Hermes in a new or existing React Native app, you do not need to follow this guide or have direct access to the Hermes source. Instead, just follow [these instructions to enable Hermes](https://reactnative.dev/docs/hermes).
+ 
+ > Noted that each Hermes release is aimed at a specific RN version. The rule of thumb is to always follow [Hermes releases](https://github.com/facebook/hermes/releases) strictly. Version mismatch can result in instant crash of your apps in the worst case scenario.
 diff --git a/include/hermes/VM/sh_runtime.h b/include/hermes/VM/sh_runtime.h
 index 1da30e2bd56ce4684963df45096e23c8f3373a67..c925166f05762c0a2720c625a32eedbab8764a8f 100644
 --- a/include/hermes/VM/sh_runtime.h

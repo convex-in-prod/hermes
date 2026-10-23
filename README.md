@@ -5,6 +5,24 @@ from the source branch. The source branch (`static_h`) starts at the upstream
 `static_h` tip and contains the maintained downstream commits; this branch
 stores an ordered, applyable patch snapshot for each revision of that train.
 
+Keep the source train organized by subsystem rather than by the embedding that
+uses it. Runtime/compiler interfaces and their consumers may share a patch;
+unrelated features should not accumulate in a general Wasm patch. Fold fixes,
+tests and documentation into the patch that owns the behavior.
+
+The substantial areas are the runtime registry/ABI, C-bundle emission, typed
+language support, native value construction, VM property/primitive fast paths,
+GC preparation and reclamation, native Promises/async startup, regex execution
+and specialization, compiler optimization, retained C layouts/exception dispatch,
+and the static ICU provider. Keep small independent correctness changes separate
+when that makes their purpose clearer. The maintained patches are ownership
+boundaries; upstream pull requests may extract smaller changes from them.
+
+The subsystem reorganization preserves the complete source tree. Its commit
+identities change, but the rewrite alone does not require rebuilding artifacts,
+changing consumer pins, or publishing a release. `RESULT_TREE` records the source
+content independently of those commit identities.
+
 The generated snapshot contains:
 
 - `UPSTREAM`: the exact upstream `static_h` commit on which the series applies;

@@ -1,0 +1,2964 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Mon, 28 Sep 2026 11:25:34 +0800
+Subject: [PATCH 09/15] vm: specialize property access and primitive operations
+
+Add bounded weak named and computed property caches, including two-shape
+named reads, interned-key reads and writes, and ordinary property-addition
+transitions. Trace class and key references, preserve reentrant setters,
+check extensibility, and retain generic paths for exotic receivers,
+dictionary layouts, accessors and unsupported keys.
+
+Read present ordinary-array storage and guarded numeric typed-array
+elements directly. Publish and check their mirrored layouts in the
+Static Hermes ABI. String method caches retain slots rather than values
+so method replacement and prototype changes preserve existing behavior.
+
+Avoid copying full-range string slices and unchanged ASCII case
+conversions. Share JavaScript numeric rounding helpers, add guarded
+plain-record and string-operation probes, and retain invocation-owned
+string reuse behind the native scope interface. Provide private array
+builtins for later guarded callback lowering.
+
+Copy eligible fresh ordinary objects without an own-key array or repeated
+shape transitions. Keep descriptor checks and barriered slot writes.
+Retain bytecode compatibility rejection and semantic coverage for cache
+invalidation, holes, detachment, property effects and native layout checks.
+---
+ doc/HighLevelOptimizations.md                 |  16 +
+ include/hermes/BCGen/HBC/BytecodeVersion.h    |   2 +-
+ include/hermes/FrontEndDefs/Builtins.def      |   4 +
+ include/hermes/Support/MathFunctions.h        |  42 ++
+ include/hermes/VM/CellKind.h                  |   6 +
+ include/hermes/VM/GCCell.h                    |   1 +
+ include/hermes/VM/JSObject.h                  |  20 +-
+ include/hermes/VM/PredefinedStrings.def       |   1 +
+ include/hermes/VM/PropertyCache.h             |  39 ++
+ include/hermes/VM/StringPrimitive.h           |   8 +-
+ include/hermes/VM/sh_mirror.h                 |  44 ++
+ include/hermes/VM/static_h.h                  | 305 +++++++++
+ include/hermes/VMLayouts/PropertyCache.h      |  24 +
+ lib/BCGen/SH/SH.cpp                           |  76 ++-
+ lib/VM/Interpreter-slowpaths.cpp              |   5 +
+ lib/VM/JSArray.cpp                            |   9 +
+ lib/VM/JSArrayBuffer.cpp                      |   8 +-
+ lib/VM/JSLib/Array.cpp                        |  32 +-
+ lib/VM/JSLib/HermesBuiltin.cpp                | 111 ++++
+ lib/VM/JSLib/Math.cpp                         |  51 +-
+ lib/VM/JSLib/MathStdFunctions.def             |   2 +-
+ lib/VM/JSLib/String.cpp                       |  19 +-
+ lib/VM/JSObject.cpp                           |  11 +-
+ lib/VM/JSTypedArray.cpp                       |   7 +
+ lib/VM/StaticH.cpp                            | 593 +++++++++++++++++-
+ lib/VM/StaticHUnit.cpp                        |  18 +
+ lib/VM/StringPrimitive.cpp                    |   4 +
+ .../copyDataProperties-fresh-fast-path.js     | 119 ++++
+ test/hermes/copyDataProperties-fresh-gc.js    |  48 ++
+ test/shermes/computed-loads.js                | 147 +++++
+ test/shermes/computed-stores.js               | 191 ++++++
+ test/shermes/polymorphic-read-cache.js        |  63 ++
+ test/shermes/string-method-cache.js           |  36 ++
+ unittests/VMRuntime/StaticHUnitTest.cpp       |  50 ++
+ unittests/VMRuntime/StringPrimitiveTest.cpp   |  15 +
+ 35 files changed, 2017 insertions(+), 110 deletions(-)
+ create mode 100644 include/hermes/Support/MathFunctions.h
+ create mode 100644 include/hermes/VMLayouts/PropertyCache.h
+ create mode 100644 test/hermes/copyDataProperties-fresh-fast-path.js
+ create mode 100644 test/hermes/copyDataProperties-fresh-gc.js
+ create mode 100644 test/shermes/computed-loads.js
+ create mode 100644 test/shermes/computed-stores.js
+ create mode 100644 test/shermes/polymorphic-read-cache.js
+ create mode 100644 test/shermes/string-method-cache.js
+
+diff --git a/doc/HighLevelOptimizations.md b/doc/HighLevelOptimizations.md
+index cc52b02676da22174785e9737b1789209489dec0..101b66de469ea6c4a14b6317c36764bc2a234ddf 100644
+--- a/doc/HighLevelOptimizations.md
++++ b/doc/HighLevelOptimizations.md
+@@ -32,6 +32,22 @@ Index-like keys, duplicate names and dictionary layouts retain their existing
+ definition path. The four layout statistics keep their existing meaning;
+ `hermes_objectLayoutHintHits` additionally counts the direct hint path.
+ 
++# Fresh ordinary object spread
++
++`copyDataProperties` has a bounded fast path for a fresh empty ordinary target
++and an ordinary source with at most five direct named properties. The source
++properties must be default enumerable data properties in direct slots, with no
++symbols, index-like properties, accessors, proxies, hosts, indirect storage or
++exclusion list. Custom and null prototypes are allowed because only own data
++properties are observed. The target adopts the source's data-only hidden class
++and copies its slots without an own-key walk or one hidden-class transition per
++property.
++
++Every unsupported layout uses the existing generic path. The fast path does not
++retain object identity or values across calls, and its slot writes remain rooted
++and barriered. Embeddings should validate semantics and dynamic reach before
++expecting a runtime benefit; the bounded path is not a general object clone.
++
+ # Spreading and modifying existing structures
+ 
+ An example of some sample code found in input to Hermes to clone a Map and add an element:
+diff --git a/include/hermes/BCGen/HBC/BytecodeVersion.h b/include/hermes/BCGen/HBC/BytecodeVersion.h
+index b2ffc21ca16fffc6dfefb4b9f3cbf722db1d75c1..7a9129ecfde410b84fd54b84bfdf116463298e79 100644
+--- a/include/hermes/BCGen/HBC/BytecodeVersion.h
++++ b/include/hermes/BCGen/HBC/BytecodeVersion.h
+@@ -20,7 +20,7 @@ namespace hbc {
+ 
+ // Bytecode version generated by this version of the compiler.
+ // Updated: Feb 12, 2026
+-const static uint32_t BYTECODE_VERSION = 99;
++const static uint32_t BYTECODE_VERSION = 102;
+ 
+ } // namespace hbc
+ } // namespace hermes
+diff --git a/include/hermes/FrontEndDefs/Builtins.def b/include/hermes/FrontEndDefs/Builtins.def
+index 2bbad2f468f7243f148c3ed54ddcdfefd838d372..47f8d89ad8247ba9ee5380fd0b8d8200393138f0 100644
+--- a/include/hermes/FrontEndDefs/Builtins.def
++++ b/include/hermes/FrontEndDefs/Builtins.def
+@@ -173,6 +173,10 @@ PRIVATE_BUILTIN(functionPrototypeCall)
+ PRIVATE_BUILTIN(fastArrayPop)
+ PRIVATE_BUILTIN(fastArraySlice)
+ 
++PRIVATE_BUILTIN(arrayPrototypeSome)
++PRIVATE_BUILTIN(arrayPrototypeJoin)
++PRIVATE_BUILTIN(arrayIterationLength)
++
+ JS_BUILTIN(spawnAsync)
+ MARK_FIRST_JS_BUILTIN(spawnAsync)
+ JS_BUILTIN(makeAsyncIterator)
+diff --git a/include/hermes/Support/MathFunctions.h b/include/hermes/Support/MathFunctions.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..307c42f10238473e3c33b37b90629fe8e35a069d
+--- /dev/null
++++ b/include/hermes/Support/MathFunctions.h
+@@ -0,0 +1,42 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++#ifndef HERMES_SUPPORT_MATHFUNCTIONS_H
++#define HERMES_SUPPORT_MATHFUNCTIONS_H
++
++#include <float.h>
++#include <math.h>
++#include <stdint.h>
++
++/// JavaScript rounding is toward positive infinity at a tie. Unlike round(),
++/// it preserves negative zero in [-0.5, 0). Avoid adding 0.5 where that addition
++/// would round a value below 0.5 to 1 or an already integral value upward.
++static inline double hermesMathRound(double x) {
++  const double integerThreshold = UINT64_C(1) << (DBL_MANT_DIG - 1);
++  double magnitude = fabs(x);
++  if (magnitude >= integerThreshold)
++    return x;
++  if (magnitude < 0.5)
++    return copysign(0, x);
++  return copysign(floor(x + 0.5), x);
++}
++
++/// Unlike fmin/fmax, JavaScript propagates either NaN. The sign comparison
++/// orders -0 before +0 as well as values on opposite sides of zero.
++static inline double hermesMathMin(double x, double y) {
++  if (isnan(x) || isnan(y))
++    return NAN;
++  return x < y || signbit(x) > signbit(y) ? x : y;
++}
++
++static inline double hermesMathMax(double x, double y) {
++  if (isnan(x) || isnan(y))
++    return NAN;
++  return x > y || signbit(x) < signbit(y) ? x : y;
++}
++
++#endif
+diff --git a/include/hermes/VM/CellKind.h b/include/hermes/VM/CellKind.h
+index 189d60a7f678b4989a231d4e7439fbe2148f369d..7e8feaec916f2601ce1c617c2636b091623074ea 100644
+--- a/include/hermes/VM/CellKind.h
++++ b/include/hermes/VM/CellKind.h
+@@ -8,6 +8,8 @@
+ #ifndef HERMES_VM_CELLKIND_H
+ #define HERMES_VM_CELLKIND_H
+ 
++#include "hermes/VM/sh_mirror.h"
++
+ #include <cstddef>
+ #include <cstdint>
+ #include <type_traits>
+@@ -24,6 +26,10 @@ enum class CellKind : uint8_t {
+ #include "hermes/VM/CellKinds.def"
+ };
+ 
++#define CELL_KIND(name) \
++  static_assert(static_cast<unsigned>(CellKind::name##Kind) == SH_##name##Kind);
++#include "hermes/VM/CellKinds.def"
++
+ // Verify the following order of consecutive ranges:
+ // [CallableUnknownMakesThis, CallableMakesThis, CallableExpectsThis]
+ static_assert(
+diff --git a/include/hermes/VM/GCCell.h b/include/hermes/VM/GCCell.h
+index 9af01f2f8924a6a6015f05f59984a8beba539461..2ddecf6cd3518e4fa43998f6055d3c7d5899b2c9 100644
+--- a/include/hermes/VM/GCCell.h
++++ b/include/hermes/VM/GCCell.h
+@@ -47,6 +47,7 @@ class KindAndSize {
+   // so that it can be accessed without any masking or shifting.
+   static constexpr size_t kNumSizeBits =
+       std::min<size_t>(kNumBits - kNumKindBits, 32);
++  static_assert(kNumSizeBits == SH_CELL_KIND_SHIFT);
+   static_assert(
+       sizeof(CellKind) * 8 <= kNumKindBits,
+       "CellKind size wider than available kind bits.");
+diff --git a/include/hermes/VM/JSObject.h b/include/hermes/VM/JSObject.h
+index 579562e7f606f54422a193a9ec399f32d28fdd18..869b16928512ce0dbd9ad84bff385bf6583b9adb 100644
+--- a/include/hermes/VM/JSObject.h
++++ b/include/hermes/VM/JSObject.h
+@@ -454,6 +454,13 @@ class JSObject : public GCCell {
+     return flags_.fastIndexProperties;
+   }
+ 
++  /// \return true if indirect storage has been allocated for named slots.
++  /// This is intentionally exposed only as a predicate; callers must still
++  /// use the ordinary property APIs to allocate or update that storage.
++  bool hasPropertyStorage() const {
++    return static_cast<bool>(propStorage_);
++  }
++
+   /// \return the `__proto__` internal property, which may be nullptr.
+   JSObject *getParent(PointerBase &runtime) const {
+     return getParentGCPtr().get(runtime);
+@@ -1091,6 +1098,8 @@ class JSObject : public GCCell {
+   /// \param valueOrAccessor the value of the new property. If the property is
+   ///   an accessor, it should be an instance of \c PropertyAccessor.
+   /// \param opFlags flags modifying the behavior in case of error.
++  /// \param unit owner of the optional property-addition cache.
++  /// \param cacheEntry cache to populate for an ordinary property addition.
+   /// \return \c true on success. In case of failure it returns an exception
+   ///   or false, depending on the value of \c opFlags.ThrowOnError.
+   /// Note: This can throw even if ThrowOnError is false,
+@@ -1104,7 +1113,9 @@ class JSObject : public GCCell {
+       SymbolID name,
+       DefinePropertyFlags dpFlags,
+       Handle<> valueOrAccessor,
+-      PropOpFlags opFlags = PropOpFlags()) {
++      PropOpFlags opFlags = PropOpFlags(),
++      SHUnit *unit = nullptr,
++      WritePropertyCacheEntry *cacheEntry = nullptr) {
+ #ifdef HERMES_SLOW_DEBUG
+     // In slow debug, check if the symbol looks like an array index. If that's
+     // the case, it should be using defineOwnComputed instead.
+@@ -1114,7 +1125,8 @@ class JSObject : public GCCell {
+         "Array index property should use defineOwnComputed instead");
+ #endif
+     return defineOwnPropertyInternal(
+-        selfHandle, runtime, name, dpFlags, valueOrAccessor, opFlags);
++        selfHandle, runtime, name, dpFlags, valueOrAccessor, opFlags, unit,
++        cacheEntry);
+   }
+ 
+   /// Same as \c defineOwnProperty, except the name can be a valid array index.
+@@ -1125,7 +1137,9 @@ class JSObject : public GCCell {
+       SymbolID name,
+       DefinePropertyFlags dpFlags,
+       Handle<> valueOrAccessor,
+-      PropOpFlags opFlags = PropOpFlags());
++      PropOpFlags opFlags = PropOpFlags(),
++      SHUnit *unit = nullptr,
++      WritePropertyCacheEntry *cacheEntry = nullptr);
+ 
+   /// Define a new property, which must not already exist in this object.
+   /// This is similar in intent to ES5.1 \c defineOwnProperty(), but is simpler
+diff --git a/include/hermes/VM/PredefinedStrings.def b/include/hermes/VM/PredefinedStrings.def
+index 6cf32aeec38ad346745bbc711ad8ee6cf293d831..e16ef108192f892fb27285df0fed5bf6e3c8ef49 100644
+--- a/include/hermes/VM/PredefinedStrings.def
++++ b/include/hermes/VM/PredefinedStrings.def
+@@ -480,6 +480,7 @@ STR(checkedTypeCast, "checkedTypeCast")
+ STR(setFunctionName, "setFunctionName")
+ STR(fastArrayPop, "fastArrayPop")
+ STR(fastArraySlice, "fastArraySlice")
++STR(arrayIterationLength, "arrayIterationLength")
+ STR(getFunctionLocation, "getFunctionLocation")
+ STR(isNative, "isNative")
+ STR(lineNumber, "lineNumber")
+diff --git a/include/hermes/VM/PropertyCache.h b/include/hermes/VM/PropertyCache.h
+index 7754568efba7fdb57204e5a53bfb4bda47d7f9cb..bcd52ed05416726c41e99b474d3b95aa1cf1a027 100644
+--- a/include/hermes/VM/PropertyCache.h
++++ b/include/hermes/VM/PropertyCache.h
+@@ -136,6 +136,45 @@ struct PrivateNameCacheEntry {
+   SlotIndex slot{0};
+ };
+ 
++/// Own data-property reads with a dynamic, already interned key. Both the
++/// shape and key are weak: collecting either must prevent a future cache hit.
++struct ComputedReadCacheEntry {
++  WeakRoot<HiddenClass> clazz{nullptr};
++  WeakRootSymbolID key{};
++  SlotIndex slot{0};
++};
++
++/// A dynamic key's named-write cache. A live key is never replaced: setters may
++/// reenter the same site while putNamed_RJS still owns a pointer to this entry.
++/// The initialization bit distinguishes zero-filled SH storage from symbol 0.
++struct ComputedWriteCacheEntry {
++  WritePropertyCacheEntry write;
++  WeakRootSymbolID key{};
++  uint32_t initialized{0};
++};
++
++static_assert(sizeof(SHComputedWriteCacheEntry) == sizeof(ComputedWriteCacheEntry));
++static_assert(
++    offsetof(SHComputedWriteCacheEntry, write) ==
++    offsetof(ComputedWriteCacheEntry, write));
++static_assert(
++    offsetof(SHComputedWriteCacheEntry, key) ==
++    offsetof(ComputedWriteCacheEntry, key));
++static_assert(
++    offsetof(SHComputedWriteCacheEntry, initialized) ==
++    offsetof(ComputedWriteCacheEntry, initialized));
++
++static_assert(sizeof(SHComputedReadCacheEntry) == sizeof(ComputedReadCacheEntry));
++static_assert(
++    offsetof(SHComputedReadCacheEntry, clazz) ==
++    offsetof(ComputedReadCacheEntry, clazz));
++static_assert(
++    offsetof(SHComputedReadCacheEntry, key) ==
++    offsetof(ComputedReadCacheEntry, key));
++static_assert(
++    offsetof(SHComputedReadCacheEntry, slot) ==
++    offsetof(ComputedReadCacheEntry, slot));
++
+ /// A cache entry for adding a property and transitioning the HiddenClass.
+ /// Stored in a list in RuntimeModule to save memory in WritePropertyCacheEntry.
+ /// In order to hit this cache entry:
+diff --git a/include/hermes/VM/StringPrimitive.h b/include/hermes/VM/StringPrimitive.h
+index 18f54d0dba4c39956d5fac1d2cbc02c83ebf0275..cab0a3c391c85fc229a881b874b80ef258059dae 100644
+--- a/include/hermes/VM/StringPrimitive.h
++++ b/include/hermes/VM/StringPrimitive.h
+@@ -251,6 +251,10 @@ class StringPrimitive : public VariableSizeRuntimeCell {
+     return (lengthAndFlags_ & LENGTH_FLAG_UNIQUED) != 0;
+   }
+ 
++  /// Read the existing identifier with the GC weak-reference barrier.
++  /// Requires isUniqued(); retaining the result across GC requires rooting it.
++  SymbolID getUniqueID(Runtime &runtime) const;
++
+   /// Compare a part of this string to \p other for equality.
+   /// \return true if the section of this string from \p start of length \p
+   /// length is equal to the string \p other.
+@@ -411,10 +415,6 @@ class StringPrimitive : public VariableSizeRuntimeCell {
+   /// \pre \c canBeUniqued() returns \c true.
+   inline void convertToUniqued(SymbolID uniqueID);
+ 
+-  /// \return the unique id.
+-  /// This requires and asserts that the string is uniqued.
+-  SymbolID getUniqueID(Runtime &runtime) const;
+-
+   /// Mark this string as not uniqued. This is used by IdentifierTable when
+   /// the associated SymbolID is garbage collected.
+   void clearUniquedBit() {
+diff --git a/include/hermes/VM/sh_mirror.h b/include/hermes/VM/sh_mirror.h
+index f763724f14ed57a505f2e93054b9b48afef97983..5e7b0c9e2a03ed89c0e6df003acc6fb2e268550c 100644
+--- a/include/hermes/VM/sh_mirror.h
++++ b/include/hermes/VM/sh_mirror.h
+@@ -10,6 +10,7 @@
+ 
+ #include "hermes/VM/sh_legacy_value.h"
+ #include "hermes/VM/sh_runtime.h"
++#include "hermes/VMLayouts/PropertyCache.h"
+ 
+ #ifdef HERMESVM_COMPRESSED_POINTERS
+ typedef uint32_t SHCompressedPointerRawType;
+@@ -44,6 +45,18 @@ typedef struct SHPrivateNameCacheEntry {
+   uint32_t slot;
+ } SHPrivateNameCacheEntry;
+ 
++typedef struct SHComputedReadCacheEntry {
++  SHCompressedPointerRawType clazz;
++  SHWeakRootSymbolID key;
++  uint32_t slot;
++} SHComputedReadCacheEntry;
++
++typedef struct SHComputedWriteCacheEntry {
++  SHWritePropertyCacheEntry write;
++  SHWeakRootSymbolID key;
++  uint32_t initialized;
++} SHComputedWriteCacheEntry;
++
+ /// Struct mirroring the layout of GCCell.
+ typedef struct SHGCCell {
+   SHCompressedPointerRawType kindAndSize;
+@@ -53,6 +66,15 @@ typedef struct SHGCCell {
+ #endif
+ } SHGCCell;
+ 
++enum SHCellKind {
++#define CELL_KIND(name) SH_##name##Kind,
++#include "hermes/VM/CellKinds.def"
++};
++
++// KindAndSize uses the low 32 bits for size on uncompressed 64-bit hosts,
++// and the low 24 bits on 32-bit or compressed-pointer hosts.
++#define SH_CELL_KIND_SHIFT (sizeof(SHCompressedPointerRawType) > 4 ? 32 : 24)
++
+ /// Struct mirroring the layout of JSObject (without the direct props).
+ typedef struct SHJSObject {
+   SHGCCell base;
+@@ -62,6 +84,28 @@ typedef struct SHJSObject {
+   SHCompressedPointerRawType propStorage;
+ } SHJSObject;
+ 
++typedef struct SHJSTypedArray {
++  SHJSObject base;
++  SHCompressedPointer buffer;
++  uint32_t length;
++  uint32_t offset;
++} SHJSTypedArray;
++
++typedef struct SHArrayImpl {
++  SHJSObject base;
++  uint32_t beginIndex;
++  uint32_t elemCount;
++  SHCompressedPointer indexedStorage;
++} SHArrayImpl;
++
++typedef struct SHJSArrayBuffer {
++  SHJSObject base;
++  uint8_t *data;
++  uint32_t size;
++  bool external;
++  bool attached;
++} SHJSArrayBuffer;
++
+ #ifdef HERMESVM_BOXED_DOUBLES
+ typedef SHCompressedPointerRawType SHGCSmallHermesValue;
+ #else
+diff --git a/include/hermes/VM/static_h.h b/include/hermes/VM/static_h.h
+index 133f6b4eabace2d358e6e7ddf43f2829d58d76ad..0607bd3bd9f4d9dfa9462741c932bd2cd0605ace 100644
+--- a/include/hermes/VM/static_h.h
++++ b/include/hermes/VM/static_h.h
+@@ -8,6 +8,7 @@
+ #ifndef HERMES_STATIC_H_H
+ #define HERMES_STATIC_H_H
+ 
++#include "hermes/Support/MathFunctions.h"
+ #include "hermes/Support/sh_tryfast_fp_cvt.h"
+ #include "hermes/VM/sh_legacy_value.h"
+ #include "hermes/VM/sh_mirror.h"
+@@ -90,6 +91,8 @@ typedef struct SHUnit {
+   uint32_t num_read_prop_cache_entries;
+   uint32_t num_write_prop_cache_entries;
+   uint32_t num_private_name_cache_entries;
++  uint32_t num_computed_read_cache_entries;
++  uint32_t num_computed_write_cache_entries;
+ 
+   /// Pool of ASCII strings.
+   const char *ascii_pool;
+@@ -121,6 +124,10 @@ typedef struct SHUnit {
+   /// `num_private_name_cache_entries` elements.  Must be zeroed
+   /// initially.
+   SHPrivateNameCacheEntry *private_name_cache;
++  /// Zero-initialized entries, grouped by SH_COMPUTED_READ_CACHE_WAYS per site.
++  SHComputedReadCacheEntry *computed_read_cache;
++  /// Zero-initialized entries, grouped by SH_COMPUTED_WRITE_CACHE_WAYS per site.
++  SHComputedWriteCacheEntry *computed_write_cache;
+ 
+   /// Object key buffer.
+   const unsigned char *obj_key_buffer;
+@@ -219,6 +226,42 @@ typedef struct SHLocals {
+     offsetof(SHUnit, num_write_prop_cache_entries))                          \
+   V(unit_num_private_cache_offset,                                           \
+     offsetof(SHUnit, num_private_name_cache_entries))                        \
++  V(unit_num_computed_cache_offset,                                         \
++    offsetof(SHUnit, num_computed_read_cache_entries))                      \
++  V(computed_cache_entry_size, sizeof(SHComputedReadCacheEntry))            \
++  V(computed_cache_ways, SH_COMPUTED_READ_CACHE_WAYS)                       \
++  V(computed_cache_associativity, SH_COMPUTED_READ_CACHE_ASSOCIATIVITY)     \
++  V(unit_num_computed_write_cache_offset,                                  \
++    offsetof(SHUnit, num_computed_write_cache_entries))                     \
++  V(computed_write_cache_entry_size, sizeof(SHComputedWriteCacheEntry))     \
++  V(computed_write_cache_key_offset, offsetof(SHComputedWriteCacheEntry, key)) \
++  V(computed_write_cache_initialized_offset,                               \
++    offsetof(SHComputedWriteCacheEntry, initialized))                        \
++  V(computed_write_cache_ways, SH_COMPUTED_WRITE_CACHE_WAYS)                 \
++  V(computed_write_cache_associativity, SH_COMPUTED_WRITE_CACHE_ASSOCIATIVITY) \
++  V(named_cache_ways, SH_NAMED_READ_CACHE_WAYS)                             \
++  V(array_impl_size, sizeof(SHArrayImpl))                                   \
++  V(array_begin_offset, offsetof(SHArrayImpl, beginIndex))                  \
++  V(array_count_offset, offsetof(SHArrayImpl, elemCount))                    \
++  V(array_storage_offset, offsetof(SHArrayImpl, indexedStorage))            \
++  V(array_kind, SH_JSArrayKind)                                            \
++  V(cell_kind_shift, SH_CELL_KIND_SHIFT)                                    \
++  V(uint8_array_kind, SH_Uint8ArrayKind)                                    \
++  V(int8_array_kind, SH_Int8ArrayKind)                                      \
++  V(uint8_clamped_array_kind, SH_Uint8ClampedArrayKind)                     \
++  V(uint16_array_kind, SH_Uint16ArrayKind)                                  \
++  V(int16_array_kind, SH_Int16ArrayKind)                                    \
++  V(uint32_array_kind, SH_Uint32ArrayKind)                                  \
++  V(int32_array_kind, SH_Int32ArrayKind)                                    \
++  V(float32_array_kind, SH_Float32ArrayKind)                                \
++  V(float64_array_kind, SH_Float64ArrayKind)                                \
++  V(typed_array_size, sizeof(SHJSTypedArray))                               \
++  V(typed_array_buffer_offset, offsetof(SHJSTypedArray, buffer))            \
++  V(typed_array_length_offset, offsetof(SHJSTypedArray, length))            \
++  V(typed_array_offset_offset, offsetof(SHJSTypedArray, offset))            \
++  V(array_buffer_size, sizeof(SHJSArrayBuffer))                             \
++  V(array_buffer_data_offset, offsetof(SHJSArrayBuffer, data))              \
++  V(array_buffer_attached_offset, offsetof(SHJSArrayBuffer, attached))      \
+   V(unit_ascii_pool_offset, offsetof(SHUnit, ascii_pool))                    \
+   V(unit_u16_pool_offset, offsetof(SHUnit, u16_pool))                        \
+   V(unit_strings_offset, offsetof(SHUnit, strings))                          \
+@@ -226,6 +269,8 @@ typedef struct SHLocals {
+   V(unit_write_cache_offset, offsetof(SHUnit, write_prop_cache))             \
+   V(unit_read_cache_offset, offsetof(SHUnit, read_prop_cache))               \
+   V(unit_private_cache_offset, offsetof(SHUnit, private_name_cache))         \
++  V(unit_computed_cache_offset, offsetof(SHUnit, computed_read_cache))       \
++  V(unit_computed_write_cache_offset, offsetof(SHUnit, computed_write_cache)) \
+   V(unit_object_key_buffer_offset, offsetof(SHUnit, obj_key_buffer))         \
+   V(unit_object_key_buffer_size_offset,                                      \
+     offsetof(SHUnit, obj_key_buffer_size))                                   \
+@@ -615,6 +660,50 @@ SHERMES_EXPORT SHLegacyValue _sh_ljs_callRequire(
+     SHLegacyValue *requireFunc,
+     uint32_t modIndex);
+ 
++/// Without allocation or JS effects, check for a plain data-only record whose
++/// parent is null or the intrinsic Object.prototype. Reusing missing reads also
++/// requires the embedding's restricted Object.prototype contract and nonstandard
++/// string keys. Any intervening effect invalidates the observed field values.
++SHERMES_EXPORT bool
++_sh_ljs_is_plain_record(SHRuntime *shr, SHLegacyValue source);
++
++SHERMES_EXPORT bool _sh_ljs_can_define_data_property(
++    SHRuntime *shr,
++    SHLegacyValue callee,
++    SHLegacyValue source);
++
++/// Check the original own data methods used by local string-result reuse.
++/// Does not invoke getters or JS; callers separately prove primitive inputs.
++SHERMES_EXPORT bool _sh_ljs_has_normalization_builtins(SHRuntime *shr);
++
++/// Check the intrinsic Array.prototype own join data property without invoking
++/// JS. A fresh array's join lookup must immediately follow this probe; testing
++/// only the returned callee would miss mutation by a getter returning the builtin.
++SHERMES_EXPORT bool _sh_ljs_has_array_join(SHRuntime *shr);
++
++/// Compiler-private access to the embedding's active string reuse scope.
++/// Inputs have already been guarded as strings and include every dependency.
++/// No active scope returns undefined. Lookup/store do not allocate or run JS.
++SHERMES_EXPORT SHLegacyValue
++_sh_ljs_string_reuse_lookup(SHRuntime *shr, uint32_t count, ...);
++SHERMES_EXPORT void _sh_ljs_string_reuse_store(
++    SHRuntime *shr, SHLegacyValue result, uint32_t count, ...);
++
++/// Primitive-input scans additionally guard indexed prototype observations and
++/// the methods allowed by their effect proof. Cached arrays are private copies;
++/// lookup may allocate a fresh array and throw. Unsupported results are not kept.
++SHERMES_EXPORT bool _sh_ljs_has_scan_reuse_builtins(SHRuntime *shr);
++SHERMES_EXPORT SHLegacyValue
++_sh_ljs_scan_reuse_lookup(SHRuntime *shr, SHLegacyValue input);
++SHERMES_EXPORT void _sh_ljs_scan_reuse_store(
++    SHRuntime *shr, SHLegacyValue input, SHLegacyValue result);
++
++/// Return whether the original trim builtin leaves a primitive string unchanged,
++/// or -1 when the caller must execute the original call. Does not allocate or
++/// invoke JS; the method lookup and argument evaluations must already have run.
++SHERMES_EXPORT int32_t
++_sh_ljs_try_string_trim_equal(SHLegacyValue callee, SHLegacyValue source);
++
+ /// Create a new environment with the specified \p size and \p parentEnv (which
+ /// may be null if this is a top level environment).
+ SHERMES_EXPORT SHLegacyValue _sh_ljs_create_environment(
+@@ -739,6 +828,20 @@ SHERMES_EXPORT void _sh_ljs_put_by_val_strict_rjs(
+     SHLegacyValue *target,
+     SHLegacyValue *key,
+     SHLegacyValue *value);
++SHERMES_EXPORT void _sh_ljs_put_by_val_cached_loose_rjs(
++    SHRuntime *shr,
++    SHUnit *unit,
++    SHLegacyValue *target,
++    SHLegacyValue *key,
++    SHLegacyValue *value,
++    SHComputedWriteCacheEntry *cache);
++SHERMES_EXPORT void _sh_ljs_put_by_val_cached_strict_rjs(
++    SHRuntime *shr,
++    SHUnit *unit,
++    SHLegacyValue *target,
++    SHLegacyValue *key,
++    SHLegacyValue *value,
++    SHComputedWriteCacheEntry *cache);
+ SHERMES_EXPORT void _sh_ljs_put_by_val_with_receiver_rjs(
+     SHRuntime *shr,
+     SHLegacyValue *target,
+@@ -881,12 +984,50 @@ static inline SHLegacyValue _sh_ljs_get_by_id_rjs_inline(
+   return _sh_ljs_get_by_id_rjs(shr, source, symID, propCacheEntry);
+ }
+ 
++/// \pre cache points to SH_NAMED_READ_CACHE_WAYS adjacent weak-rooted entries.
++SHERMES_EXPORT SHLegacyValue _sh_ljs_get_by_id_polymorphic_rjs(
++    SHRuntime *shr,
++    const SHLegacyValue *source,
++    SHSymbolID symID,
++    SHReadPropertyCacheEntry *cache);
++
++static inline SHLegacyValue _sh_ljs_get_by_id_polymorphic_rjs_inline(
++    SHRuntime *shr,
++    const SHLegacyValue *source,
++    SHSymbolID symID,
++    SHReadPropertyCacheEntry *cache) {
++  if (SH_LIKELY(_sh_ljs_is_object(*source))) {
++    SHJSObject *object = (SHJSObject *)_sh_ljs_get_pointer(*source);
++    for (unsigned i = 0; i < SH_NAMED_READ_CACHE_WAYS; ++i) {
++      if (cache[i].clazz == object->clazz)
++        return _sh_prload_inline(shr, *source, cache[i]._slot16);
++    }
++  }
++  return _sh_ljs_get_by_id_polymorphic_rjs(shr, source, symID, cache);
++}
++
+ SHERMES_EXPORT SHLegacyValue _sh_ljs_get_by_id_with_receiver_rjs(
+     SHRuntime *shr,
+     const SHLegacyValue *source,
+     const SHLegacyValue *receiver,
+     SHSymbolID symID,
+     SHReadPropertyCacheEntry *propCacheEntry);
++/// Compare a numeric index read from a known primitive string with one UTF-16
++/// code unit. Out-of-range keys still consult the prototype.
++SHERMES_EXPORT SHLegacyValue _sh_ljs_string_index_compare(
++    SHRuntime *shr,
++    SHLegacyValue source,
++    double key,
++    uint16_t character,
++    uint8_t invert);
++
++/// Read once and return a UTF-16 code unit, or -1 for any other property value.
++/// Used only when all consumers compare strictly against single-character strings.
++SHERMES_EXPORT SHLegacyValue _sh_ljs_get_indexed_char_code(
++    SHRuntime *shr,
++    SHLegacyValue source,
++    SHLegacyValue key);
++
+ SHERMES_EXPORT SHLegacyValue _sh_ljs_get_by_val_with_receiver_rjs(
+     SHRuntime *shr,
+     SHLegacyValue *source,
+@@ -899,6 +1040,136 @@ static inline SHLegacyValue _sh_ljs_get_by_val_rjs(
+   return _sh_ljs_get_by_val_with_receiver_rjs(shr, source, key, source);
+ }
+ 
++SHERMES_EXPORT SHLegacyValue _sh_ljs_get_by_val_cached_rjs(
++    SHRuntime *shr,
++    SHLegacyValue *source,
++    SHLegacyValue *key,
++    SHComputedReadCacheEntry *cache);
++
++/// Numeric element reads can complete without a runtime call or allocation.
++/// No raw storage pointer survives a call, so GC and detachment cannot invalidate
++/// this read. Array holes must fall through to inherited-property lookup. Other
++/// keys, Float16 and BigInt arrays retain the runtime path.
++static inline bool _sh_try_get_indexed_element(
++    SHRuntime *shr,
++    SHLegacyValue source,
++    double key,
++    SHLegacyValue *result) {
++  uint32_t index;
++  if (!_sh_ljs_is_object(source) || !sh_tryfast_f64_to_u32(key, index))
++    return false;
++  SHJSTypedArray *array = (SHJSTypedArray *)_sh_ljs_get_pointer(source);
++  const unsigned kind =
++      (unsigned)(array->base.base.kindAndSize >> SH_CELL_KIND_SHIFT) & 0xff;
++  if (kind == SH_JSArrayKind) {
++    SHArrayImpl *ordinary = (SHArrayImpl *)array;
++    uint32_t offset = index - ordinary->beginIndex;
++    if (offset >= ordinary->elemCount)
++      return false;
++    SHArrayStorageSmall *storage = (SHArrayStorageSmall *)
++        _sh_cp_decode_non_null(shr, ordinary->indexedStorage);
++    SHLegacyValue value = _sh_shv_unbox_inline(shr, storage->storage[offset]);
++    if (_sh_ljs_is_empty(value))
++      return false;
++    *result = value;
++    return true;
++  }
++#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
++  if (kind < SH_Uint8ArrayKind || kind > SH_Float64ArrayKind ||
++      kind == SH_Float16ArrayKind)
++    return false;
++  SHJSArrayBuffer *buffer =
++      (SHJSArrayBuffer *)_sh_cp_decode_non_null(shr, array->buffer);
++  if (index >= array->length || !buffer->attached) {
++    *result = _sh_ljs_undefined();
++    return true;
++  }
++  const uint8_t *data = buffer->data + array->offset;
++  // memcpy permits external storage and avoids C aliasing/alignment assumptions.
++  // Typed arrays use native element byte order; this is little endian in Wasm.
++#define SH_READ_TYPED_ELEMENT(name, type)                              \
++  case SH_##name##ArrayKind: {                                         \
++    type value;                                                       \
++    memcpy(&value, data + (size_t)index * sizeof(type), sizeof(type));   \
++    *result = _sh_ljs_untrusted_double((double)value);                  \
++    return true;                                                      \
++  }
++  switch (kind) {
++    SH_READ_TYPED_ELEMENT(Uint8, uint8_t)
++    SH_READ_TYPED_ELEMENT(Int8, int8_t)
++    SH_READ_TYPED_ELEMENT(Uint8Clamped, uint8_t)
++    SH_READ_TYPED_ELEMENT(Uint16, uint16_t)
++    SH_READ_TYPED_ELEMENT(Int16, int16_t)
++    SH_READ_TYPED_ELEMENT(Uint32, uint32_t)
++    SH_READ_TYPED_ELEMENT(Int32, int32_t)
++    SH_READ_TYPED_ELEMENT(Float32, float)
++    SH_READ_TYPED_ELEMENT(Float64, double)
++  }
++#undef SH_READ_TYPED_ELEMENT
++#endif
++  return false;
++}
++
++/// Prove all reads at start + iteration * step + [0, maxOffset] are in bounds.
++/// The compiler only emits this for numeric bounds and a positive bounded step.
++/// The fast region must not contain effects that can detach the buffer.
++static inline bool _sh_can_read_byte_array_loop(
++    SHRuntime *shr,
++    SHLegacyValue source,
++    double start,
++    double limit,
++    unsigned step,
++    unsigned maxOffset) {
++  uint32_t first, end;
++  if (!_sh_ljs_is_object(source) || !sh_tryfast_f64_to_u32(start, first) ||
++      !sh_tryfast_f64_to_u32(limit, end) || first >= end || step == 0)
++    return false;
++  SHJSTypedArray *array = (SHJSTypedArray *)_sh_ljs_get_pointer(source);
++  const unsigned kind =
++      (unsigned)(array->base.base.kindAndSize >> SH_CELL_KIND_SHIFT) & 0xff;
++  if (kind != SH_Uint8ArrayKind && kind != SH_Uint8ClampedArrayKind)
++    return false;
++  SHJSArrayBuffer *buffer =
++      (SHJSArrayBuffer *)_sh_cp_decode_non_null(shr, array->buffer);
++  const uint64_t last =
++      (uint64_t)first + ((uint64_t)end - first - 1) / step * step;
++  return buffer->attached && last + maxOffset < array->length;
++}
++
++/// Only valid inside a region admitted by GuardedByteArrayLoops. Keep the
++/// receiver live and decode its current backing storage on every read; no raw
++/// pointer may survive a collector safepoint on the loop backedge.
++static inline uint8_t _sh_read_byte_array_element(
++    SHRuntime *shr,
++    SHLegacyValue source,
++    double index) {
++  SHJSTypedArray *array = (SHJSTypedArray *)_sh_ljs_get_pointer(source);
++  SHJSArrayBuffer *buffer =
++      (SHJSArrayBuffer *)_sh_cp_decode_non_null(shr, array->buffer);
++  return buffer->data[(size_t)array->offset + (uint32_t)index];
++}
++
++static inline SHLegacyValue _sh_ljs_get_by_val_rjs_inline(
++    SHRuntime *shr,
++    SHLegacyValue *source,
++    SHLegacyValue *key) {
++  SHLegacyValue result;
++  if (_sh_try_get_indexed_element(shr, *source, key->f64, &result))
++    return result;
++  return _sh_ljs_get_by_val_rjs(shr, source, key);
++}
++
++static inline SHLegacyValue _sh_ljs_get_by_val_cached_rjs_inline(
++    SHRuntime *shr,
++    SHLegacyValue *source,
++    SHLegacyValue *key,
++    SHComputedReadCacheEntry *cache) {
++  SHLegacyValue result;
++  if (_sh_try_get_indexed_element(shr, *source, key->f64, &result))
++    return result;
++  return _sh_ljs_get_by_val_cached_rjs(shr, source, key, cache);
++}
++
+ SHERMES_EXPORT SHLegacyValue _sh_ljs_get_own_private_by_sym(
+     SHRuntime *shr,
+     const SHLegacyValue *source,
+@@ -910,6 +1181,16 @@ SHERMES_EXPORT SHLegacyValue _sh_ljs_get_own_private_by_sym(
+ SHERMES_EXPORT SHLegacyValue
+ _sh_ljs_get_by_index_rjs(SHRuntime *shr, SHLegacyValue *source, uint32_t key);
+ 
++static inline SHLegacyValue _sh_ljs_get_by_index_rjs_inline(
++    SHRuntime *shr,
++    SHLegacyValue *source,
++    uint32_t key) {
++  SHLegacyValue result;
++  if (_sh_try_get_indexed_element(shr, *source, key, &result))
++    return result;
++  return _sh_ljs_get_by_index_rjs(shr, source, key);
++}
++
+ /// Put an enumerable property by string id.
+ SHERMES_EXPORT void _sh_ljs_define_own_by_id(
+     SHRuntime *shr,
+@@ -917,6 +1198,14 @@ SHERMES_EXPORT void _sh_ljs_define_own_by_id(
+     SHSymbolID key,
+     SHLegacyValue *value,
+     SHWritePropertyCacheEntry *cacheEntry);
++/// Define an enumerable property with a unit-owned addition cache.
++SHERMES_EXPORT void _sh_ljs_define_own_by_id_in_unit(
++    SHRuntime *shr,
++    SHUnit *unit,
++    SHLegacyValue *target,
++    SHSymbolID key,
++    SHLegacyValue *value,
++    SHWritePropertyCacheEntry *cacheEntry);
+ /// Put an enumerable property.
+ SHERMES_EXPORT void _sh_ljs_define_own_by_val(
+     SHRuntime *shr,
+@@ -1616,6 +1905,22 @@ static inline uint32_t _sh_to_uint32_double(double d) {
+   return (uint32_t)_sh_to_int32_double_slow_path(d);
+ }
+ 
++/// Math.imul after the operands have been converted to their low 32 bits.
++static inline SHLegacyValue _sh_ljs_imul_uint32(uint32_t a, uint32_t b) {
++  uint32_t product = a * b;
++  return _sh_ljs_double(product <= INT32_MAX
++      ? (double)product : (double)product - 4294967296.0);
++}
++
++/// Math.imul for operands already known to be numbers.
++static inline SHLegacyValue _sh_ljs_imul_number(
++    SHLegacyValue a,
++    SHLegacyValue b) {
++  return _sh_ljs_imul_uint32(
++      _sh_to_uint32_double(_sh_ljs_get_double(a)),
++      _sh_to_uint32_double(_sh_ljs_get_double(b)));
++}
++
+ /// Store a property into direct storage.
+ SHERMES_EXPORT void _sh_prstore_direct(
+     SHRuntime *shr,
+diff --git a/include/hermes/VMLayouts/PropertyCache.h b/include/hermes/VMLayouts/PropertyCache.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..5d89d894a0b417431a12d86287e4f146257c5058
+--- /dev/null
++++ b/include/hermes/VMLayouts/PropertyCache.h
+@@ -0,0 +1,24 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++#ifndef HERMES_VMLAYOUTS_PROPERTYCACHE_H
++#define HERMES_VMLAYOUTS_PROPERTYCACHE_H
++
++// Ordinary SH named reads reserve two adjacent entries. Other users, including
++// the JIT, retain the single-entry layout and API.
++#define SH_NAMED_READ_CACHE_WAYS 2
++
++// Four sets of two shape/key pairs keep both receiver diversity and key
++// diversity bounded without increasing the per-site allocation.
++#define SH_COMPUTED_READ_CACHE_WAYS 8
++#define SH_COMPUTED_READ_CACHE_ASSOCIATIVITY 2
++
++// Each live key owns its named-write entry, including its shape transition.
++#define SH_COMPUTED_WRITE_CACHE_WAYS 16
++#define SH_COMPUTED_WRITE_CACHE_ASSOCIATIVITY 4
++
++#endif
+diff --git a/lib/BCGen/SH/SH.cpp b/lib/BCGen/SH/SH.cpp
+index 49fb44511b52f1467f7a59d21ecb23e2252892b5..de238ebed9a599fa064d6fdfa118afe3a4344870 100644
+--- a/lib/BCGen/SH/SH.cpp
++++ b/lib/BCGen/SH/SH.cpp
+@@ -29,6 +29,7 @@
+ #include "hermes/Support/DenseMapInfoSpecializations.h"
+ #include "hermes/Support/HashString.h"
+ #include "hermes/Support/UTF8.h"
++#include "hermes/VMLayouts/PropertyCache.h"
+ #include "hermes/VMLayouts/StackFrameLayout.h"
+ #include "llvh/ADT/MapVector.h"
+ 
+@@ -485,6 +486,8 @@ class SHNativeJSFunctionTable {
+ };
+ 
+ struct ModuleGen {
++  uint32_t nextComputedReadCacheIdx{0};
++  uint32_t nextComputedWriteCacheIdx{0};
+   /// Table containing uniqued strings for the current module.
+   SHStringTable stringTable{};
+ 
+@@ -696,9 +699,10 @@ class InstrGen {
+   }
+   llvh::raw_ostream &genStringConstReadIC(
+       LiteralString *LS,
+-      Value *optValue = nullptr) {
++      Value *optValue = nullptr,
++      uint32_t entries = 1) {
+     genStringConstICCommon(LS, optValue);
+-    return genReadIC(LS);
++    return genReadIC(LS, entries);
+   }
+ 
+   /// Generate a cache index. This must be used when passing parameters to API
+@@ -712,10 +716,12 @@ class InstrGen {
+       return os_ << "shUnit->write_prop_cache + " << nextWriteCacheIdx_++;
+     return os_ << "get_write_prop_cache(shUnit) + " << nextWriteCacheIdx_++;
+   }
+-  llvh::raw_ostream &genReadIC(LiteralString *LS) {
++  llvh::raw_ostream &genReadIC(LiteralString *LS, uint32_t entries = 1) {
++    const auto index = nextReadCacheIdx_;
++    nextReadCacheIdx_ += entries;
+     if (options_.emitCBundle)
+-      return os_ << "shUnit->read_prop_cache + " << nextReadCacheIdx_++;
+-    return os_ << "get_read_prop_cache(shUnit) + " << nextReadCacheIdx_++;
++      return os_ << "shUnit->read_prop_cache + " << index;
++    return os_ << "get_read_prop_cache(shUnit) + " << index;
+   }
+   llvh::raw_ostream &genPrivateNameIC(Value *privateName) {
+     if (options_.emitCBundle)
+@@ -1322,10 +1328,10 @@ class InstrGen {
+       os_ << ".raw";
+     } else {
+       assert(funcUntypedOp);
+-      os_ << funcUntypedOp << "(shr, &";
+-      generateRegister(*inst.getLeftHandSide());
+-      os_ << ", &";
+-      generateRegister(*inst.getRightHandSide());
++      os_ << funcUntypedOp << "(shr, ";
++      generateRegisterPtr(*inst.getLeftHandSide());
++      os_ << ", ";
++      generateRegisterPtr(*inst.getRightHandSide());
+       os_ << ")";
+     }
+     if (boolConv)
+@@ -1394,16 +1400,18 @@ class InstrGen {
+     }
+ 
+     if (strictMode)
+-      os_ << "_sh_ljs_put_by_val_strict_rjs";
++      os_ << "_sh_ljs_put_by_val_cached_strict_rjs";
+     else
+-      os_ << "_sh_ljs_put_by_val_loose_rjs";
+-    os_ << "(shr,&";
++      os_ << "_sh_ljs_put_by_val_cached_loose_rjs";
++    os_ << "(shr, shUnit, &";
+     generateRegister(*inst.getObject());
+     os_ << ", &";
+     generateRegister(*inst.getProperty());
+     os_ << ", &";
+     generateRegister(*inst.getStoredValue());
+-    os_ << ");\n";
++    os_ << ", shUnit->computed_write_cache + "
++        << moduleGen_.nextComputedWriteCacheIdx++
++        << " * SH_COMPUTED_WRITE_CACHE_WAYS);\n";
+   }
+   void generateStorePropertyLooseInst(StorePropertyLooseInst &inst) {
+     generateStorePropertyInstImpl(inst, false);
+@@ -1465,7 +1473,7 @@ class InstrGen {
+       assert(
+           inst.getIsEnumerable() &&
+           "Non-enumerable properties with literal keys should be handled by LoadConstants");
+-      os_ << "_sh_ljs_define_own_by_id(shr,&";
++      os_ << "_sh_ljs_define_own_by_id_in_unit(shr,shUnit,&";
+       generateRegister(*inst.getObject());
+       os_ << ", ";
+       genStringConstWriteIC(LS, inst.getStoredValue()) << ");\n";
+@@ -1565,29 +1573,46 @@ class InstrGen {
+     generateValue(inst);
+     os_ << " = ";
+     if (auto *LS = llvh::dyn_cast<LiteralString>(inst.getProperty())) {
+-      os_ << (options_.smallC ? "_sh_ljs_get_by_id_rjs"
+-                              : "_sh_ljs_get_by_id_rjs_inline")
++      os_ << (options_.smallC ? "_sh_ljs_get_by_id_polymorphic_rjs"
++                             : "_sh_ljs_get_by_id_polymorphic_rjs_inline")
+           << "(shr,&";
+       generateRegister(*inst.getObject());
+       os_ << ",";
+-      genStringConstReadIC(LS) << ");\n";
++      genStringConstReadIC(LS, nullptr, SH_NAMED_READ_CACHE_WAYS) << ");\n";
+       return;
+     }
+     // If the prop is an index-like constant, generate the special bytecode.
+     if (auto *litNum = llvh::dyn_cast<LiteralNumber>(inst.getProperty())) {
+       if (auto idxOpt = doubleToArrayIndex(litNum->getValue())) {
+-        os_ << "_sh_ljs_get_by_index_rjs(shr,&";
++        os_ << (options_.smallC ? "_sh_ljs_get_by_index_rjs"
++                               : "_sh_ljs_get_by_index_rjs_inline")
++            << "(shr,&";
+         generateRegister(*inst.getObject());
+         os_ << ", ";
+         os_ << *idxOpt << ");\n";
+         return;
+       }
+     }
+-    os_ << "_sh_ljs_get_by_val_rjs(shr,&";
++    if (inst.getProperty()->getType().isNumberType()) {
++      // Numeric-only sites cannot use a named-property cache.
++      os_ << (options_.smallC ? "_sh_ljs_get_by_val_rjs"
++                             : "_sh_ljs_get_by_val_rjs_inline")
++          << "(shr,&";
++      generateRegister(*inst.getObject());
++      os_ << ", &";
++      generateRegister(*inst.getProperty());
++      os_ << ");\n";
++      return;
++    }
++    os_ << (options_.smallC ? "_sh_ljs_get_by_val_cached_rjs"
++                           : "_sh_ljs_get_by_val_cached_rjs_inline")
++        << "(shr,&";
+     generateRegister(*inst.getObject());
+     os_ << ", &";
+     generateRegister(*inst.getProperty());
+-    os_ << ");\n";
++    os_ << ", shUnit->computed_read_cache + "
++        << moduleGen_.nextComputedReadCacheIdx++
++        << " * SH_COMPUTED_READ_CACHE_WAYS);\n";
+   }
+   void generateLoadPropertyWithReceiverInst(
+       LoadPropertyWithReceiverInst &inst) {
+@@ -3217,6 +3242,10 @@ void generateUnitData(
+      << nextReadCacheIdx << "];\n"
+      << "  SHPrivateNameCacheEntry private_name_cache_data["
+      << nextPrivateNameCacheIdx << "];\n"
++     << "  SHComputedReadCacheEntry computed_read_cache_data["
++     << moduleGen.nextComputedReadCacheIdx << " * SH_COMPUTED_READ_CACHE_WAYS];\n"
++     << "  SHComputedWriteCacheEntry computed_write_cache_data["
++     << moduleGen.nextComputedWriteCacheIdx << " * SH_COMPUTED_WRITE_CACHE_WAYS];\n"
+      << "  SHCompressedPointer object_literal_class_cache["
+      << moduleGen.literalBuffers.objShapeTable.size() << "];\n};\n"
+      << "SHUnit *CREATE_THIS_UNIT(void) {\n"
+@@ -3228,11 +3257,18 @@ void generateUnitData(
+   OS << ",.num_symbols =" << moduleGen.stringTable.size()
+      << ", .num_write_prop_cache_entries = " << nextWriteCacheIdx
+      << ", .num_read_prop_cache_entries = " << nextReadCacheIdx
++     << ", .num_private_name_cache_entries = " << nextPrivateNameCacheIdx
++     << ", .num_computed_read_cache_entries = "
++     << moduleGen.nextComputedReadCacheIdx << " * SH_COMPUTED_READ_CACHE_WAYS"
++     << ", .num_computed_write_cache_entries = "
++     << moduleGen.nextComputedWriteCacheIdx << " * SH_COMPUTED_WRITE_CACHE_WAYS"
+      << ", .ascii_pool = s_ascii_pool, .u16_pool = s_u16_pool,"
+      << ".strings = s_strings, .symbols = unit_data->symbol_data,"
+      << ".write_prop_cache = unit_data->write_prop_cache_data,"
+      << ".read_prop_cache = unit_data->read_prop_cache_data, "
+      << ".private_name_cache = unit_data->private_name_cache_data, "
++     << ".computed_read_cache = unit_data->computed_read_cache_data, "
++     << ".computed_write_cache = unit_data->computed_write_cache_data, "
+      << ".obj_key_buffer = s_obj_key_buffer, .obj_key_buffer_size = "
+      << moduleGen.literalBuffers.objKeyBuffer.size() << ", "
+      << ".literal_val_buffer = s_literal_val_buffer, .literal_val_buffer_size = "
+diff --git a/lib/VM/Interpreter-slowpaths.cpp b/lib/VM/Interpreter-slowpaths.cpp
+index fa585f16fcf24f1aa2954b930ebc44ab3e2bcd09..53959769951032fc0453f61781b838ac60e2b0ae 100644
+--- a/lib/VM/Interpreter-slowpaths.cpp
++++ b/lib/VM/Interpreter-slowpaths.cpp
+@@ -794,6 +794,11 @@ ExecutionStatus Interpreter::putByValTransient_RJS(
+     Handle<> name,
+     Handle<> value,
+     bool strictMode) {
++  // Reject an uncoercible receiver before converting the key. Key conversion
++  // can execute user code and must not run for a null or undefined receiver.
++  if (LLVM_UNLIKELY(base->isNull() || base->isUndefined()))
++    return runtime.raiseTypeError("Cannot set a property on null or undefined");
++
+   auto idRes = valueToSymbolID(runtime, name);
+   if (idRes == ExecutionStatus::EXCEPTION)
+     return ExecutionStatus::EXCEPTION;
+diff --git a/lib/VM/JSArray.cpp b/lib/VM/JSArray.cpp
+index e3ddb67023cc08ee8492cb3088e500063d8782d5..27f17c7ba86723dfc47cec29a991bb598f39e77b 100644
+--- a/lib/VM/JSArray.cpp
++++ b/lib/VM/JSArray.cpp
+@@ -13,6 +13,7 @@
+ #include "hermes/VM/JSTypedArray.h"
+ #include "hermes/VM/Operations.h"
+ #include "hermes/VM/PropertyAccessor.h"
++#include "hermes/VM/sh_mirror.h"
+ 
+ namespace hermes {
+ namespace vm {
+@@ -21,6 +22,14 @@ namespace vm {
+ // class ArrayImpl
+ 
+ void ArrayImplBuildMeta(const GCCell *cell, Metadata::Builder &mb) {
++  static_assert(sizeof(ArrayImpl) == sizeof(SHArrayImpl));
++  static_assert(
++      offsetof(ArrayImpl, beginIndex_) == offsetof(SHArrayImpl, beginIndex));
++  static_assert(
++      offsetof(ArrayImpl, elemCount_) == offsetof(SHArrayImpl, elemCount));
++  static_assert(
++      offsetof(ArrayImpl, indexedStorage_) ==
++      offsetof(SHArrayImpl, indexedStorage));
+   mb.addJSObjectOverlapSlots(JSObject::numOverlapSlots<ArrayImpl>());
+   JSObjectBuildMeta(cell, mb);
+   const auto *self = static_cast<const ArrayImpl *>(cell);
+diff --git a/lib/VM/JSArrayBuffer.cpp b/lib/VM/JSArrayBuffer.cpp
+index da9898c7e26cb986550b8312677b765f1d93e7a1..fe0198df851b27662fa234ed693dfac0fe119649 100644
+--- a/lib/VM/JSArrayBuffer.cpp
++++ b/lib/VM/JSArrayBuffer.cpp
+@@ -128,7 +128,13 @@ JSArrayBuffer::JSArrayBuffer(
+     Runtime &runtime,
+     Handle<JSObject> parent,
+     Handle<HiddenClass> clazz)
+-    : JSObject(runtime, *parent, *clazz), attached_(false) {}
++    : JSObject(runtime, *parent, *clazz), attached_(false) {
++  static_assert(sizeof(JSArrayBuffer) == sizeof(SHJSArrayBuffer));
++  static_assert(offsetof(JSArrayBuffer, data_) == offsetof(SHJSArrayBuffer, data));
++  static_assert(offsetof(JSArrayBuffer, size_) == offsetof(SHJSArrayBuffer, size));
++  static_assert(
++      offsetof(JSArrayBuffer, attached_) == offsetof(SHJSArrayBuffer, attached));
++}
+ 
+ void JSArrayBuffer::_finalizeImpl(GCCell *cell, GC &gc) {
+   auto *self = vmcast<JSArrayBuffer>(cell);
+diff --git a/lib/VM/JSLib/Array.cpp b/lib/VM/JSLib/Array.cpp
+index 5dc1c740e90c32fa5f8a6a0c5dac56d234722487..afc4e7546c2611927e0fa55a9ad3402a4f4ad479 100644
+--- a/lib/VM/JSLib/Array.cpp
++++ b/lib/VM/JSLib/Array.cpp
+@@ -93,13 +93,15 @@ HermesValue createArrayConstructor(Runtime &runtime) {
+       nullptr,
+       arrayPrototypeConcat,
+       1);
+-  defineMethod(
+-      runtime,
+-      arrayPrototype,
+-      Predefined::getSymbolID(Predefined::join),
+-      nullptr,
+-      arrayPrototypeJoin,
+-      1);
++  runtime.registerBuiltin(
++      BuiltinMethod::HermesBuiltin_arrayPrototypeJoin,
++      defineMethod(
++          runtime,
++          arrayPrototype,
++          Predefined::getSymbolID(Predefined::join),
++          nullptr,
++          arrayPrototypeJoin,
++          1));
+   defineMethod(
+       runtime,
+       arrayPrototype,
+@@ -275,13 +277,15 @@ HermesValue createArrayConstructor(Runtime &runtime) {
+       nullptr,
+       arrayPrototypeEvery,
+       1);
+-  defineMethod(
+-      runtime,
+-      arrayPrototype,
+-      Predefined::getSymbolID(Predefined::some),
+-      nullptr,
+-      arrayPrototypeSome,
+-      1);
++  runtime.registerBuiltin(
++      BuiltinMethod::HermesBuiltin_arrayPrototypeSome,
++      defineMethod(
++          runtime,
++          arrayPrototype,
++          Predefined::getSymbolID(Predefined::some),
++          nullptr,
++          arrayPrototypeSome,
++          1));
+   defineMethod(
+       runtime,
+       arrayPrototype,
+diff --git a/lib/VM/JSLib/HermesBuiltin.cpp b/lib/VM/JSLib/HermesBuiltin.cpp
+index 086efd6794bf85f6800547c921c26c64e1701583..29381c57e684a85a84286233557ad0aa30ac37e1 100644
+--- a/lib/VM/JSLib/HermesBuiltin.cpp
++++ b/lib/VM/JSLib/HermesBuiltin.cpp
+@@ -227,6 +227,97 @@ CallResult<HermesValue> hermesBuiltinThrowReferenceError(
+ 
+ namespace {
+ 
++/// Copy a bounded, ordinary data-only record into a fresh empty object without
++/// creating an own-key array or performing one hidden-class transition per
++/// property. The source descriptors are still checked before adopting its layout.
++///
++/// This is deliberately narrower than the generic object-spread contract.
++/// The source must have only default enumerable data properties in contiguous
++/// named slots, and the target must be an empty, extensible ordinary object.
++/// Prototype identity is immaterial for own data properties; ordinary custom
++/// and null prototypes are therefore allowed.
++/// Every other case keeps the generic path below so getters, symbols, indexed
++/// properties and target identity remain observable.
++bool tryCopyFreshObjectDataProperties(
++    Runtime &runtime,
++    Handle<JSObject> target,
++    Handle<JSObject> source,
++    Handle<JSObject> excludedItems) {
++  if (excludedItems || target->getKind() != CellKind::JSObjectKind ||
++      source->getKind() != CellKind::JSObjectKind ||
++      target->isProxyObject() || target->isHostObject() ||
++      source->isProxyObject() || source->isHostObject() ||
++      !target->isExtensible() || target->hasPropertyStorage()) {
++    return false;
++  }
++
++  struct : public Locals {
++    PinnedValue<HiddenClass> sourceClass;
++  } lv;
++  LocalsRAII lraii(runtime, &lv);
++
++  auto *targetClass = target->getClass(runtime);
++  lv.sourceClass = source->getClass(runtime);
++  auto *sourceClass = lv.sourceClass.get();
++  // A fresh object with a medium-sized record is common at host object
++  // boundaries. Permit indirect slots, but keep the bound small enough that a
++  // rejected generic spread never turns into an unbounded allocation attempt.
++  constexpr unsigned kMaxProperties = 16;
++  if (targetClass->isDictionary() || targetClass->getNumProperties() != 0 ||
++      sourceClass->isDictionary() || sourceClass->getMayHaveAccessor() ||
++      sourceClass->getHasIndexLikeProperties() ||
++      sourceClass->getNumProperties() > kMaxProperties ||
++      source->getOwnIndexedRange(source.get(), runtime) !=
++          std::pair<uint32_t, uint32_t>{0, 0}) {
++    return false;
++  }
++
++  unsigned count = 0;
++  bool eligible = true;
++  HiddenClass::forEachPropertyNoAlloc(
++      sourceClass,
++      runtime,
++      [&count, &eligible](SymbolID id, NamedPropertyDescriptor desc) {
++        if (!eligible || count >= kMaxProperties || !id.isUniqued() ||
++            InternalProperty::isInternal(id) || desc.slot != count ||
++            desc.flags != PropertyFlags::defaultNewNamedPropertyFlags()) {
++          eligible = false;
++          return;
++        }
++        ++count;
++      });
++
++  if (!eligible || count != sourceClass->getNumProperties())
++    return false;
++
++  if (count <= JSObject::DIRECT_PROPERTY_SLOTS) {
++    // No allocation or user code can run after the checks above. The source
++    // slots are therefore stable while the target adopts the shared layout.
++    NoAllocScope noAlloc(runtime);
++    target->updateClassNoAllocPropStorageUnsafe(runtime, sourceClass);
++    for (unsigned i = 0; i < count; ++i) {
++      JSObject::setNamedSlotValueDirectUnsafe(
++          target.get(),
++          runtime,
++          i,
++          JSObject::getNamedSlotValueUnsafe(source.get(), runtime, i));
++    }
++  } else {
++    // addNewOwnPropertyInSlot allocates the target's indirect storage on the
++    // first out-of-line slot and when it grows. Reload the class from its root
++    // for every slot: collection updates the root, not the earlier raw pointer.
++    for (unsigned i = 0; i < count; ++i) {
++      JSObject::addNewOwnPropertyInSlot(
++          target.get(),
++          runtime,
++          lv.sourceClass.get(),
++          i,
++          JSObject::getNamedSlotValueUnsafe(source.get(), runtime, i));
++    }
++  }
++  return true;
++}
++
+ CallResult<HermesValue> copyDataPropertiesSlowPath_RJS(
+     Runtime &runtime,
+     Handle<JSObject> target,
+@@ -373,6 +464,9 @@ CallResult<HermesValue> hermesBuiltinCopyDataProperties(
+       (!excludedItems || !excludedItems->isProxyObject()) &&
+       "excludedItems internal List is a Proxy");
+ 
++  if (tryCopyFreshObjectDataProperties(runtime, target, source, excludedItems))
++    return target.getHermesValue();
++
+   // We cannot use the fast path if the object is a proxy, host object, or when
+   // there could potentially be an accessor defined on the object. This is
+   // because in order to use JSObject::forEachOwnPropertyWhile, we must not
+@@ -1146,6 +1240,17 @@ CallResult<HermesValue> hermesBuiltinFastArraySlice(void *, Runtime &runtime) {
+   return lv.result.getHermesValue();
+ }
+ 
++/// Snapshot an actual array's nonconfigurable length without executing user
++/// code. Proxies and array-like objects must retain the generic builtin path.
++static CallResult<HermesValue> hermesBuiltinArrayIterationLength(
++    void *,
++    Runtime &runtime) {
++  auto value = runtime.getCurrentFrame().getNativeArgs().getArg(0);
++  auto *array = dyn_vmcast<JSArray>(value);
++  return HermesValue::encodeTrustedNumberValue(
++      array ? static_cast<double>(JSArray::getLength(array, runtime)) : -1);
++}
++
+ void createHermesBuiltins(Runtime &runtime) {
+   struct : public Locals {
+     PinnedValue<NativeFunction> method;
+@@ -1261,6 +1366,12 @@ void createHermesBuiltins(Runtime &runtime) {
+       hermesBuiltinFastArraySlice,
+       2);
+ 
++  defineInternMethod(
++      B::HermesBuiltin_arrayIterationLength,
++      P::arrayIterationLength,
++      hermesBuiltinArrayIterationLength,
++      1);
++
+   // Define the 'requireFast' function, which takes a number argument.
+   defineInternMethod(
+       B::HermesBuiltin_requireFast, P::requireFast, requireFast, 1);
+diff --git a/lib/VM/JSLib/Math.cpp b/lib/VM/JSLib/Math.cpp
+index 49eaf330f11513c8d4bdf43a709dcdb2f223186a..4bcb40d85338c39df68fbb6e3197c6626d51a75f 100644
+--- a/lib/VM/JSLib/Math.cpp
++++ b/lib/VM/JSLib/Math.cpp
+@@ -12,6 +12,7 @@
+ #include "JSLibInternal.h"
+ 
+ #include "hermes/Support/Conversions.h"
++#include "hermes/Support/MathFunctions.h"
+ #include "hermes/VM/JSLib/JSLibStorage.h"
+ #include "hermes/VM/Operations.h"
+ #include "hermes/VM/SingleObject.h"
+@@ -38,36 +39,6 @@ namespace vm {
+ 
+ //===----------------------------------------------------------------------===//
+ /// Math.
+-// Implementation of Math.round(), following ES 5.1 15.8.2.15
+-// This cannot be a simple call to std::round() because std::round() rounds
+-// halfways away from zero, while Math.round must round towards positive
+-// infinity.
+-// The essential algorithm is floor(x + 0.5). However this has three
+-// complications:
+-//  1. The range [-.5, -0] must round to -0, not +0
+-//  2. The largest value less than 0.5, when added to 0.5, becomes 1.0
+-//  (precision loss), causing us to round to 1 and not 0.
+-//  3. Above a certain threshold (shown below), x + 0.5 is the same as x + 1.0
+-//  (precision loss), causing us to round too high.
+-// We handle this by checking explicitly for the problematic ranges.
+-static double roundHalfwaysTowardsInfinity(double x) {
+-  // The first integer where all larger values are also integral
+-  // The -1 is to account for the implicit (hidden) bit in the mantissa
+-  static constexpr double integer_threshold = 1LLU << (DBL_MANT_DIG - 1);
+-  double absf = std::fabs(x);
+-  if (absf >= integer_threshold) {
+-    // x is necessarily already integral.
+-    return x;
+-  } else if (absf < 0.5) {
+-    // x may have too much precision to add 0.5. Just round to +/- 0.
+-    return std::copysign(0, x);
+-  } else {
+-    // Here we can apply the normal rounding algorithm, but we need to be
+-    // careful about -0.5, which must round to -0.
+-    return std::copysign(std::floor(x + 0.5), x);
+-  }
+-}
+-
+ /// The Math object has functions like sin, cos, exp, etc. Most take one
+ /// argument, a few take two arguments, min() and max() may take any number
+ /// of arguments, and random() takes none. Use context as a index to switch to
+@@ -153,15 +124,7 @@ CallResult<HermesValue> mathMax(void *, Runtime &runtime) {
+     if (LLVM_UNLIKELY(res == ExecutionStatus::EXCEPTION)) {
+       return ExecutionStatus::EXCEPTION;
+     }
+-    double arg = res->getNumber();
+-    if (std::isnan(result)) {
+-      continue;
+-    } else if (std::isnan(arg)) {
+-      result = std::numeric_limits<double>::quiet_NaN();
+-    } else if (arg > result || std::signbit(arg) < std::signbit(result)) {
+-      // signbit(arg) < signbit(result) => arg is at least +0, result at most -0
+-      result = arg;
+-    }
++    result = hermesMathMax(result, res->getNumber());
+   }
+   return HermesValue::encodeTrustedNumberValue(result);
+ }
+@@ -177,15 +140,7 @@ CallResult<HermesValue> mathMin(void *, Runtime &runtime) {
+     if (LLVM_UNLIKELY(res == ExecutionStatus::EXCEPTION)) {
+       return ExecutionStatus::EXCEPTION;
+     }
+-    double arg = res->getNumber();
+-    if (std::isnan(result)) {
+-      continue;
+-    } else if (std::isnan(arg)) {
+-      result = std::numeric_limits<double>::quiet_NaN();
+-    } else if (arg < result || std::signbit(arg) > std::signbit(result)) {
+-      // signbit(arg) > signbit(result) => arg is at most -0, result at least +0
+-      result = arg;
+-    }
++    result = hermesMathMin(result, res->getNumber());
+   }
+   return HermesValue::encodeTrustedNumberValue(result);
+ }
+diff --git a/lib/VM/JSLib/MathStdFunctions.def b/lib/VM/JSLib/MathStdFunctions.def
+index d285f9f5ba2e8e09d2d4a52eebe5ea928a129f66..f2fc74ee9aa15bc6d34824ed7e13e2b31d69ee5c 100644
+--- a/lib/VM/JSLib/MathStdFunctions.def
++++ b/lib/VM/JSLib/MathStdFunctions.def
+@@ -30,7 +30,7 @@ MATHFUNC_1ARG(log10, std::log10)
+ MATHFUNC_1ARG(log1p, ::log1p)
+ MATHFUNC_1ARG(log2, std::log2)
+ MATHFUNC_1ARG(trunc, std::trunc)
+-MATHFUNC_1ARG(round, roundHalfwaysTowardsInfinity)
++MATHFUNC_1ARG(round, hermesMathRound)
+ MATHFUNC_1ARG(sin, std::sin)
+ MATHFUNC_1ARG(sinh, ::sinh)
+ MATHFUNC_1ARG(sqrt, std::sqrt)
+diff --git a/lib/VM/JSLib/String.cpp b/lib/VM/JSLib/String.cpp
+index b0ae4eab2f389d186d3ece83814b2e34cff55abb..a503e925db70c7ffe8f9b872b9342e39361f4ea3 100644
+--- a/lib/VM/JSLib/String.cpp
++++ b/lib/VM/JSLib/String.cpp
+@@ -937,14 +937,10 @@ static CallResult<HermesValue> convertCase(
+     Handle<StringPrimitive> S,
+     const bool upperCase,
+     const bool useCurrentLocale) {
+-  // Copying is unavoidable in this function, do it early on.
+-  SmallU16String<32> buff;
+-  // Must copy instead of just getting the reference, because later operations
+-  // may trigger GC and hence invalid pointers inside S.
+-  S->appendUTF16String(buff);
+-  UTF16Ref str = buff.arrayRef();
+-
+   {
++    // Keep the source rooted across output allocation, without first copying
++    // unchanged ASCII strings into a temporary UTF-16 buffer.
++    auto str = StringPrimitive::createStringView(runtime, S);
+     // Try a fast path for ASCII strings.
+     // First, bitwise-or all the characters to see if any one isn't ASCII.
+     char16_t mask = 0;
+@@ -964,8 +960,8 @@ static CallResult<HermesValue> convertCase(
+       }
+     }
+     // localeAffectsCasing() is only consulted once the scan says the fast
+-    // path is otherwise available: the ICU and Java backends query the host
+-    // locale on every call (a JNI round trip on Java), and a non-ASCII
++    // path is otherwise available: the CoreFoundation and Java backends check
++    // the locale on every call (a JNI round trip on Java), and a non-ASCII
+     // string can never take this path, so asking first would charge every
+     // locale-sensitive conversion for an answer it cannot use.
+     if (mask <= 127 &&
+@@ -975,7 +971,7 @@ static CallResult<HermesValue> convertCase(
+         return S.getHermesValue();
+       }
+ 
+-      if (str.size() == 1) {
++      if (str.length() == 1) {
+         // Use the Runtime stored representations of single-character strings.
+         char16_t c = str[0];
+         if (upperCase) {
+@@ -1013,6 +1009,9 @@ static CallResult<HermesValue> convertCase(
+       return HermesValue::encodeStringValue(*builder->getStringPrimitive());
+     }
+   }
++  // Unicode/locale conversion can resize the buffer and invoke platform code.
++  SmallU16String<32> buff;
++  S->appendUTF16String(buff);
+   platform_unicode::convertToCase(
+       buff,
+       upperCase ? platform_unicode::CaseConversion::ToUpper
+diff --git a/lib/VM/JSObject.cpp b/lib/VM/JSObject.cpp
+index ed7129f738ee94f9eb8079622ea1472824216126..84f0f59c69a6d1a3073edca35bfd66bddb6e6680 100644
+--- a/lib/VM/JSObject.cpp
++++ b/lib/VM/JSObject.cpp
+@@ -2102,7 +2102,10 @@ CallResult<bool> JSObject::defineOwnPropertyInternal(
+     SymbolID name,
+     DefinePropertyFlags dpFlags,
+     Handle<> valueOrAccessor,
+-    PropOpFlags opFlags) {
++    PropOpFlags opFlags,
++    SHUnit *unit,
++    WritePropertyCacheEntry *cacheEntry) {
++  assert(!cacheEntry || unit);
+   assert(
+       !opFlags.getMustExist() && "cannot use mustExist with defineOwnProperty");
+   assert(
+@@ -2156,11 +2159,13 @@ CallResult<bool> JSObject::defineOwnPropertyInternal(
+     // initialize it and try again.
+     JSObject::initializeLazyObject(runtime, selfHandle);
+     return defineOwnPropertyInternal(
+-        selfHandle, runtime, name, dpFlags, valueOrAccessor, opFlags);
++        selfHandle, runtime, name, dpFlags, valueOrAccessor, opFlags, unit,
++        cacheEntry);
+   }
+ 
+   return addOwnProperty(
+-      selfHandle, runtime, name, dpFlags, valueOrAccessor, opFlags);
++      selfHandle, runtime, name, dpFlags, valueOrAccessor, opFlags,
++      /*runtimeModule*/ nullptr, unit, cacheEntry);
+ }
+ 
+ ExecutionStatus JSObject::defineNewOwnProperty(
+diff --git a/lib/VM/JSTypedArray.cpp b/lib/VM/JSTypedArray.cpp
+index 8ec678009b859224058f4efdf333e17e458750bc..df57095cdebcc995be485e86d175bf33973af024 100644
+--- a/lib/VM/JSTypedArray.cpp
++++ b/lib/VM/JSTypedArray.cpp
+@@ -24,6 +24,13 @@ JSTypedArrayBase::JSTypedArrayBase(
+       buffer_(nullptr),
+       length_(0),
+       offset_(0) {
++  static_assert(sizeof(JSTypedArrayBase) == sizeof(SHJSTypedArray));
++  static_assert(
++      offsetof(JSTypedArrayBase, buffer_) == offsetof(SHJSTypedArray, buffer));
++  static_assert(
++      offsetof(JSTypedArrayBase, length_) == offsetof(SHJSTypedArray, length));
++  static_assert(
++      offsetof(JSTypedArrayBase, offset_) == offsetof(SHJSTypedArray, offset));
+   flags_.indexedStorage = true;
+   flags_.fastIndexProperties = true;
+ }
+diff --git a/lib/VM/StaticH.cpp b/lib/VM/StaticH.cpp
+index 644b5ea169b68ffcf0a085ab49b20a2287a90a01..b31b6c985e54f0cd7a9bb45fbdb46ac06cfb5aa7 100644
+--- a/lib/VM/StaticH.cpp
++++ b/lib/VM/StaticH.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include "SHUnitExt.h"
+ #include "hermes/BCGen/SerializedLiteralParser.h"
++#include "hermes/Platform/Unicode/PlatformUnicode.h"
+ #include "hermes/Support/UTF8.h"
+ #include "hermes/VM/ArrayStorage.h"
+ #include "hermes/VM/Callable.h"
+@@ -21,6 +22,7 @@
+ #include "hermes/VM/JSRegExp.h"
+ #include "hermes/VM/JSTypedArray.h"
+ #include "hermes/VM/ModuleExportsCache-inline.h"
++#include "hermes/VM/PrimitiveBox.h"
+ #include "hermes/VM/PropertyAccessor.h"
+ #include "hermes/VM/SerializedLiteralOperations.h"
+ #include "hermes/VM/ScopedStringReuse.h"
+@@ -31,6 +33,7 @@
+ 
+ #include "JSLib/JSLibInternal.h"
+ 
++#include <algorithm>
+ #include <cstdarg>
+ #include <cmath>
+ #include <limits>
+@@ -215,6 +218,350 @@ extern "C" void _sh_ljs_reify_arguments_strict(
+   reifyArguments(shr, frame, lazyReg, true);
+ }
+ 
++static int32_t readIndexedCharacter(
++    SHRuntime *shr,
++    SHLegacyValue source,
++    SHLegacyValue key) {
++  auto value = *toPHV(&source);
++  auto keyValue = *toPHV(&key);
++  uint32_t index;
++  if (value.isString() && keyValue.isNumber() &&
++      sh_tryfast_f64_to_u32(keyValue.getNumber(), index) &&
++      index < value.getString()->getStringLength())
++    return value.getString()->at(index);
++
++  Runtime &runtime = getRuntime(shr);
++  auto result = [&]() -> CallResult<int32_t> {
++    GCScopeMarkerRAII marker{runtime};
++    struct : Locals {
++      PinnedValue<> source;
++      PinnedValue<> key;
++    } lv;
++    LocalsRAII lraii{runtime, &lv};
++    // Native calls pass values by copy. Root both before property-key coercion
++    // or a getter can collect, and leave every RAII scope before throwing to JS.
++    lv.source = value;
++    lv.key = keyValue;
++    auto read = lv.source->isObject()
++        ? JSObject::getComputed_RJS(
++              Handle<JSObject>::vmcast(&lv.source), runtime, lv.key)
++        : Interpreter::getByValTransient_RJS(runtime, lv.source, lv.key);
++    if (LLVM_UNLIKELY(read == ExecutionStatus::EXCEPTION))
++      return ExecutionStatus::EXCEPTION;
++    auto observed = read->getHermesValue();
++    if (observed.isString() && observed.getString()->getStringLength() == 1)
++      return int32_t(observed.getString()->at(0));
++    return -1;
++  }();
++  if (LLVM_UNLIKELY(result == ExecutionStatus::EXCEPTION))
++    _sh_throw_current(shr);
++  return result.getValue();
++}
++
++extern "C" bool _sh_ljs_is_plain_record(
++    SHRuntime *shr,
++    SHLegacyValue source) {
++  auto &runtime = getRuntime(shr);
++  const auto value = *toPHV(&source);
++  if (!value.isObject())
++    return false;
++  auto *object = vmcast<JSObject>(value);
++  // Do not initialize lazy state, invoke host hooks or follow custom prototypes.
++  if (object->getKind() != CellKind::JSObjectKind || object->isHostObject() ||
++      object->isLazy())
++    return false;
++  auto *clazz = object->getClass(runtime);
++  if (clazz->isDictionary() || clazz->isTyped() || clazz->getMayHaveAccessor())
++    return false;
++  auto *parent = object->getParent(runtime);
++  return parent == nullptr || parent == *runtime.objectPrototype;
++}
++
++extern "C" bool _sh_ljs_can_define_data_property(
++    SHRuntime *shr,
++    SHLegacyValue callee,
++    SHLegacyValue source) {
++  auto *function = dyn_vmcast<NativeFunction>(*toPHV(&callee));
++  const auto value = *toPHV(&source);
++  if (!function || function->getFunctionPtr() != objectDefineProperty ||
++      !value.isObject())
++    return false;
++  auto &runtime = getRuntime(shr);
++  auto *object = vmcast<JSObject>(value);
++  // Skipping `in` must not remove a proxy/host hook or lazy initialization,
++  // including one on a prototype. This probe neither allocates nor calls JS.
++  for (unsigned depth = 0; object && depth < 16; ++depth) {
++    if (object->getKind() != CellKind::JSObjectKind || object->isHostObject() ||
++        object->isProxyObject() || object->isLazy() ||
++        object->getClass(runtime)->isTyped())
++      return false;
++    object = object->getParent(runtime);
++  }
++  return object == nullptr;
++}
++
++extern "C" int32_t _sh_ljs_try_string_trim_equal(
++    SHLegacyValue callee,
++    SHLegacyValue source) {
++  const auto value = *toPHV(&source);
++  const auto method = *toPHV(&callee);
++  auto *function = dyn_vmcast<NativeFunction>(method);
++  if (!value.isString() || !function ||
++      function->getFunctionPtr() != stringPrototypeTrim)
++    return -1;
++
++  auto *string = value.getString();
++  const auto length = string->getStringLength();
++  if (!length)
++    return 1;
++  // Equality only depends on the endpoints. No substring, call frame or
++  // coercion is needed, including when the complete string is whitespace.
++  const char16_t first = string->at(0);
++  const char16_t last = string->at(length - 1);
++  return !(isWhiteSpaceChar(first) || isLineTerminatorChar(first) ||
++           isWhiteSpaceChar(last) || isLineTerminatorChar(last));
++}
++
++extern "C" bool _sh_ljs_has_array_join(SHRuntime *shr) {
++  auto &runtime = getRuntime(shr);
++  NamedPropertyDescriptor descriptor;
++  if (!JSObject::getOwnNamedDescriptor(
++          runtime.arrayPrototype, runtime,
++          Predefined::getSymbolID(Predefined::join), descriptor) ||
++      descriptor.flags.accessor)
++    return false;
++  auto value = JSObject::getNamedSlotValueUnsafe(
++      *runtime.arrayPrototype, runtime, descriptor).unboxToHV(runtime);
++  return value.isObject() && value.getObject() == runtime.getBuiltinCallable(
++      BuiltinMethod::HermesBuiltin_arrayPrototypeJoin);
++}
++
++template <typename Key>
++static bool hasOwnNativeMethod(
++    Runtime &runtime,
++    Handle<JSObject> object,
++    Key key,
++    NativeFunctionPtr expected) {
++  NamedPropertyDescriptor descriptor;
++  if (!JSObject::getOwnNamedDescriptor(
++          object, runtime, Predefined::getSymbolID(key), descriptor) ||
++      descriptor.flags.accessor)
++    return false;
++  auto value = JSObject::getNamedSlotValueUnsafe(
++      object.get(), runtime, descriptor).unboxToHV(runtime);
++  auto *function = dyn_vmcast<NativeFunction>(value);
++  // Several string methods share an entry point with different contexts.
++  return function && function->getFunctionPtr() == expected &&
++      function->getContext() == nullptr;
++}
++
++extern "C" bool _sh_ljs_has_normalization_builtins(SHRuntime *shr) {
++  auto &runtime = getRuntime(shr);
++  if (!runtime.activeStringReuse)
++    return false;
++  auto *callee = vmcast<NativeJSFunction>(
++      runtime.getCurrentFrame().getCalleeClosureUnsafe());
++  if (!runtime.activeStringReuse->allowsReuse(callee->getFunctionInfo()))
++    return false;
++  return hasOwnNativeMethod(runtime, runtime.stringPrototype,
++                            Predefined::trim, stringPrototypeTrim) &&
++      hasOwnNativeMethod(runtime, runtime.stringPrototype,
++                         Predefined::includes, stringPrototypeIncludesOrStartsWith) &&
++      hasOwnNativeMethod(runtime, runtime.arrayPrototype,
++                         Predefined::join, arrayPrototypeJoin);
++}
++
++extern "C" bool _sh_ljs_has_scan_reuse_builtins(SHRuntime *shr) {
++  auto &runtime = getRuntime(shr);
++  if (!runtime.activeStringReuse)
++    return false;
++  auto *callee = vmcast<NativeJSFunction>(
++      runtime.getCurrentFrame().getCalleeClosureUnsafe());
++  if (!runtime.activeStringReuse->allowsReuse(callee->getFunctionInfo()))
++    return false;
++  GCScopeMarkerRAII marker{runtime};
++  if (runtime.arrayPrototype->getParent(runtime) != *runtime.objectPrototype ||
++      runtime.stringPrototype->getParent(runtime) != *runtime.objectPrototype ||
++      runtime.objectPrototype->getParent(runtime) != nullptr ||
++      vmcast<JSArray>(*runtime.arrayPrototype)->getEndIndex() != 0)
++    return false;
++  const std::array<Handle<JSObject>, 3> prototypes{
++      runtime.arrayPrototype, runtime.stringPrototype, runtime.objectPrototype};
++  if (!runtime.activeStringReuse->hasScanNumericKeyProof(prototypes)) {
++    for (auto prototype : prototypes) {
++      auto clazz = runtime.makeHandle(prototype->getClass(runtime));
++      if (clazz->isDictionary() || clazz->getHasIndexLikeProperties())
++        return false;
++      // Numeric string indexing can observe inherited negative, fractional,
++      // NaN or Infinity keys as well as array indices. Never invoke a getter.
++      if (!HiddenClass::forEachPropertyWhile(clazz, runtime,
++          [](Runtime &runtime, SymbolID key, NamedPropertyDescriptor) {
++            if (!isPropertyNamePrimitive(key))
++              return true;
++            auto name = runtime.getIdentifierTable().getStringView(runtime, key);
++            if (name.length() == 0)
++              return true;
++            auto first = name[0];
++            return !((first >= '0' && first <= '9') || first == '-' ||
++                     first == 'N' || first == 'I');
++          }))
++        return false;
++    }
++    runtime.activeStringReuse->rememberScanNumericKeyProof(prototypes);
++  }
++  return hasOwnNativeMethod(runtime, runtime.stringPrototype,
++                            Predefined::trim, stringPrototypeTrim) &&
++      hasOwnNativeMethod(runtime, runtime.stringPrototype,
++                         Predefined::slice, stringPrototypeSlice) &&
++      hasOwnNativeMethod(runtime, runtime.arrayPrototype,
++                         Predefined::push, arrayPrototypePush);
++}
++
++/// Copy only bounded dense string arrays. The compiler proves local ownership;
++/// this representation check avoids exposing cached identities even when other
++/// successful paths return nested records, sparse arrays or large results.
++static CallResult<HermesValue> copyScanResult(
++    Runtime &runtime,
++    Handle<> result,
++    uint64_t remaining = ScopedStringReuse::maxEntryStorageBytes) {
++  if (result->isString())
++    return ScopedStringReuse::consumeStringStorage(result->getString(), remaining)
++        ? result.getHermesValue()
++        : HermesValue::encodeUndefinedValue();
++  auto array = Handle<JSArray>::dyn_vmcast(result);
++  if (!array || array->getParent(runtime) != *runtime.arrayPrototype ||
++      !array->hasFastIndexProperties() || !array->isExtensible() ||
++      array->getClass(runtime)->getNumProperties() !=
++          runtime.arrayClass->getNumProperties())
++    return HermesValue::encodeUndefinedValue();
++  auto length = JSArray::getLength(*array, runtime);
++  if (length > 128 || array->getBeginIndex() != 0 || array->getEndIndex() != length)
++    return HermesValue::encodeUndefinedValue();
++  const uint64_t elementBytes = uint64_t(length) * sizeof(SmallHermesValue);
++  if (elementBytes > remaining)
++    return HermesValue::encodeUndefinedValue();
++  remaining -= elementBytes;
++  for (uint32_t i = 0; i < length; ++i) {
++    auto value = array->at(runtime, i);
++    if (!value.isString() || !ScopedStringReuse::consumeStringStorage(
++                                 value.getString(runtime), remaining))
++      return HermesValue::encodeUndefinedValue();
++  }
++  auto created = JSArray::create(runtime, length, length);
++  if (created == ExecutionStatus::EXCEPTION)
++    return ExecutionStatus::EXCEPTION;
++  auto copy = runtime.makeHandle(std::move(*created));
++  for (uint32_t i = 0; i < length; ++i)
++    JSArray::unsafeSetExistingElementAt(*copy, runtime, i, array->at(runtime, i));
++  return copy.getHermesValue();
++}
++
++extern "C" SHLegacyValue _sh_ljs_scan_reuse_lookup(
++    SHRuntime *shr, SHLegacyValue input) {
++  auto &runtime = getRuntime(shr);
++  auto copied = [&]() -> CallResult<HermesValue> {
++    GCScopeMarkerRAII marker{runtime};
++    auto *scope = runtime.activeStringReuse;
++    assert(scope && "scan guard must establish an active invocation scope");
++    auto *callee = vmcast<NativeJSFunction>(
++        runtime.getCurrentFrame().getCalleeClosureUnsafe());
++    auto snapshot = runtime.makeHandle(scope->lookup(
++        callee->getFunctionInfo(), {toPHV(&input), 1}));
++    return copyScanResult(runtime, snapshot);
++  }();
++  if (copied == ExecutionStatus::EXCEPTION)
++    _sh_throw_current(shr);
++  return *copied;
++}
++
++extern "C" void _sh_ljs_scan_reuse_store(
++    SHRuntime *shr, SHLegacyValue input, SHLegacyValue result) {
++  auto &runtime = getRuntime(shr);
++  auto status = [&]() -> ExecutionStatus {
++    GCScopeMarkerRAII marker{runtime};
++    auto key = runtime.makeHandle(*toPHV(&input));
++    auto value = runtime.makeHandle(*toPHV(&result));
++    uint64_t remaining = ScopedStringReuse::maxEntryStorageBytes;
++    if (!ScopedStringReuse::consumeStringStorage(key->getString(), remaining))
++      return ExecutionStatus::RETURNED;
++    auto copied = copyScanResult(runtime, value, remaining);
++    if (copied == ExecutionStatus::EXCEPTION)
++      return ExecutionStatus::EXCEPTION;
++    if (copied->isUndefined())
++      return ExecutionStatus::RETURNED;
++    auto *callee = vmcast<NativeJSFunction>(
++        runtime.getCurrentFrame().getCalleeClosureUnsafe());
++    const PinnedHermesValue storedInput{key.getHermesValue()};
++    runtime.activeStringReuse->store(
++        callee->getFunctionInfo(), {&storedInput, 1}, *copied);
++    return ExecutionStatus::RETURNED;
++  }();
++  if (status == ExecutionStatus::EXCEPTION)
++    _sh_throw_current(shr);
++}
++
++extern "C" SHLegacyValue _sh_ljs_string_reuse_lookup(
++    SHRuntime *shr, uint32_t count, ...) {
++  auto &runtime = getRuntime(shr);
++  if (!runtime.activeStringReuse)
++    return HermesValue::encodeUndefinedValue();
++  assert(count > 0 && count <= ScopedStringReuse::maxInputs);
++  std::array<PinnedHermesValue, ScopedStringReuse::maxInputs> inputs;
++  va_list arguments;
++  va_start(arguments, count);
++  for (unsigned i = 0; i < count; ++i) {
++    auto value = va_arg(arguments, SHLegacyValue);
++    inputs[i] = *toPHV(&value);
++  }
++  va_end(arguments);
++  auto *callee = vmcast<NativeJSFunction>(
++      runtime.getCurrentFrame().getCalleeClosureUnsafe());
++  return runtime.activeStringReuse->lookup(
++      callee->getFunctionInfo(), {inputs.data(), count});
++}
++
++extern "C" void _sh_ljs_string_reuse_store(
++    SHRuntime *shr, SHLegacyValue result, uint32_t count, ...) {
++  auto &runtime = getRuntime(shr);
++  if (!runtime.activeStringReuse)
++    return;
++  assert(count > 0 && count <= ScopedStringReuse::maxInputs);
++  std::array<PinnedHermesValue, ScopedStringReuse::maxInputs> inputs;
++  va_list arguments;
++  va_start(arguments, count);
++  for (unsigned i = 0; i < count; ++i) {
++    auto value = va_arg(arguments, SHLegacyValue);
++    inputs[i] = *toPHV(&value);
++  }
++  va_end(arguments);
++  auto *callee = vmcast<NativeJSFunction>(
++      runtime.getCurrentFrame().getCalleeClosureUnsafe());
++  runtime.activeStringReuse->store(callee->getFunctionInfo(),
++      {inputs.data(), count}, *toPHV(&result));
++}
++
++LLVM_ATTRIBUTE_NOINLINE
++extern "C" SHLegacyValue _sh_ljs_get_indexed_char_code(
++    SHRuntime *shr,
++    SHLegacyValue source,
++    SHLegacyValue key) {
++  return HermesValue::encodeTrustedNumberValue(
++      readIndexedCharacter(shr, source, key));
++}
++
++LLVM_ATTRIBUTE_NOINLINE
++extern "C" SHLegacyValue _sh_ljs_string_index_compare(
++    SHRuntime *shr,
++    SHLegacyValue source,
++    double key,
++    uint16_t character,
++    uint8_t invert) {
++  assert(toPHV(&source)->isString() && "compiler must prove a primitive string");
++  int32_t code = readIndexedCharacter(
++      shr, source, HermesValue::encodeTrustedNumberValue(key));
++  return HermesValue::encodeBoolValue((code == character) != invert);
++}
++
+ LLVM_ATTRIBUTE_NOINLINE
+ extern "C" SHLegacyValue _sh_ljs_get_by_val_with_receiver_rjs(
+     SHRuntime *shr,
+@@ -294,6 +641,64 @@ _sh_ljs_get_by_index_rjs(SHRuntime *shr, SHLegacyValue *source, uint32_t key) {
+   return res->getHermesValue();
+ }
+ 
++LLVM_ATTRIBUTE_NOINLINE
++extern "C" SHLegacyValue _sh_ljs_get_by_val_cached_rjs(
++    SHRuntime *shr,
++    SHLegacyValue *source,
++    SHLegacyValue *key,
++    SHComputedReadCacheEntry *cache) {
++  Runtime &runtime = getRuntime(shr);
++  const auto sourceValue = *toPHV(source);
++  const auto keyValue = *toPHV(key);
++  if (sourceValue.isObject()) {
++    SymbolID id{};
++    if (keyValue.isSymbol()) {
++      id = keyValue.getSymbol();
++    } else if (keyValue.isString() && keyValue.getString()->isUniqued()) {
++      id = keyValue.getString()->getUniqueID(runtime);
++    }
++    if (id.isValid()) {
++      auto *obj = vmcast<JSObject>(sourceValue);
++      const CompressedPointer clazzPtr{obj->getClassGCPtr()};
++      constexpr unsigned associativity = SH_COMPUTED_READ_CACHE_ASSOCIATIVITY;
++      constexpr unsigned sets = SH_COMPUTED_READ_CACHE_WAYS / associativity;
++      static_assert(SH_COMPUTED_READ_CACHE_WAYS % associativity == 0);
++      auto *entries = reinterpret_cast<ComputedReadCacheEntry *>(cache) +
++          (id.unsafeGetRaw() % sets) * associativity;
++      for (unsigned i = 0; i < associativity; ++i) {
++        if (entries[i].clazz == clazzPtr && entries[i].key == id) {
++          return JSObject::getNamedSlotValueUnsafe(obj, runtime, entries[i].slot)
++              .unboxToHV(runtime);
++        }
++      }
++      // Restrict insertion to ordinary objects and immutable shapes. No key
++      // coercion, allocation or user code occurs between lookup and slot read.
++      if (obj->getKind() == CellKind::JSObjectKind &&
++          !obj->getFlags().hostObject && !obj->getFlags().lazyObject &&
++          !obj->getClass(runtime)->isDictionary()) {
++        NamedPropertyDescriptor desc;
++        auto found = JSObject::tryGetOwnNamedDescriptorFast(obj, runtime, id, desc);
++        if (found && *found && !desc.flags.accessor) {
++          // FIFO replacement within this key's set. Moving weak entries is safe
++          // here because descriptor lookup and the slot read cannot collect.
++          for (unsigned i = associativity - 1; i > 0; --i) {
++            entries[i].clazz = entries[i - 1].clazz.getNoBarrierUnsafe();
++            entries[i].key = entries[i - 1].key;
++            entries[i].slot = entries[i - 1].slot;
++          }
++          auto &entry = entries[0];
++          entry.clazz = clazzPtr;
++          entry.key = id;
++          entry.slot = desc.slot;
++          return JSObject::getNamedSlotValueUnsafe(obj, runtime, desc)
++              .unboxToHV(runtime);
++        }
++      }
++    }
++  }
++  return _sh_ljs_get_by_val_with_receiver_rjs(shr, source, key, source);
++}
++
+ LLVM_ATTRIBUTE_NOINLINE
+ extern "C" SHLegacyValue _sh_ljs_get_own_private_by_sym(
+     SHRuntime *shr,
+@@ -813,6 +1218,8 @@ static inline void putById_RJS(
+         sh_unit_get_add_cache_entry(unit, cacheEntry->getAddCacheIndex());
+     if (LLVM_LIKELY(addCacheEntry.startClazz == clazzPtr) &&
+         LLVM_LIKELY(addCacheEntry.resultClazz) &&
++        // preventExtensions changes an object flag without changing its shape.
++        LLVM_LIKELY(obj->isExtensible()) &&
+         LLVM_LIKELY(
+             addCacheEntry.getParentEpoch() == runtime.getParentCacheEpoch()) &&
+         LLVM_LIKELY(addCacheEntry.parent == obj->getParentGCPtr())) {
+@@ -1043,6 +1450,91 @@ extern "C" void _sh_ljs_put_by_val_strict_rjs(
+   putByVal_RJS(shr, target, key, value, true);
+ }
+ 
++template <bool strictMode>
++static void putByValCached_RJS(
++    SHRuntime *shr,
++    SHUnit *unit,
++    SHLegacyValue *target,
++    SHLegacyValue *key,
++    SHLegacyValue *value,
++    SHComputedWriteCacheEntry *cache) {
++  Runtime &runtime = getRuntime(shr);
++  const auto targetValue = *toPHV(target);
++  const auto keyValue = *toPHV(key);
++  if (targetValue.isObject()) {
++    auto *obj = vmcast<JSObject>(targetValue);
++    SymbolID id{};
++    if (keyValue.isSymbol()) {
++      id = keyValue.getSymbol();
++    } else if (keyValue.isString() && keyValue.getString()->isUniqued()) {
++      id = keyValue.getString()->getUniqueID(runtime);
++    }
++    // Indexed/exotic receivers keep their computed-property semantics. Key
++    // coercion also stays on the original path, at the original program point.
++    if (id.isValid() && obj->getKind() == CellKind::JSObjectKind &&
++        !obj->isHostObject() && !obj->getFlags().lazyObject) {
++      constexpr unsigned associativity = SH_COMPUTED_WRITE_CACHE_ASSOCIATIVITY;
++      constexpr unsigned sets = SH_COMPUTED_WRITE_CACHE_WAYS / associativity;
++      static_assert(SH_COMPUTED_WRITE_CACHE_WAYS % associativity == 0);
++      auto *entries = reinterpret_cast<ComputedWriteCacheEntry *>(cache) +
++          (id.unsafeGetRaw() % sets) * associativity;
++      ComputedWriteCacheEntry *unused = nullptr;
++      for (unsigned i = 0; i < associativity; ++i) {
++        auto &entry = entries[i];
++        if (entry.initialized && entry.key == id) {
++          putById_RJS<false, strictMode>(
++              runtime, unit, toPHV(target), id, toPHV(value), &entry.write);
++          return;
++        }
++        if (!unused && (!entry.initialized || entry.key.isInvalid()))
++          unused = &entry;
++      }
++      if (unused &&
++          (!keyValue.isString() || !toArrayIndex(keyValue.getString()))) {
++        // Keep each live key bound to this entry even during recursive setters.
++        // A collected key can be reused, but its old shape and transition must
++        // be invalidated first. Reuse the add-cache index to bound storage.
++        unused->write.clazz = CompressedPointer{nullptr};
++        if (unused->write.hasAddCacheIndex()) {
++          auto &add = sh_unit_get_add_cache_entry(
++              unit, unused->write.getAddCacheIndex());
++          add.startClazz = CompressedPointer{nullptr};
++          add.resultClazz = CompressedPointer{nullptr};
++          add.parent = CompressedPointer{nullptr};
++        }
++        unused->key = id;
++        unused->initialized = 1;
++        putById_RJS<false, strictMode>(
++            runtime, unit, toPHV(target), id, toPHV(value), &unused->write);
++        return;
++      }
++    }
++  }
++  putByVal_RJS(shr, target, key, value, strictMode);
++}
++
++LLVM_ATTRIBUTE_NOINLINE
++extern "C" void _sh_ljs_put_by_val_cached_loose_rjs(
++    SHRuntime *shr,
++    SHUnit *unit,
++    SHLegacyValue *target,
++    SHLegacyValue *key,
++    SHLegacyValue *value,
++    SHComputedWriteCacheEntry *cache) {
++  putByValCached_RJS<false>(shr, unit, target, key, value, cache);
++}
++
++LLVM_ATTRIBUTE_NOINLINE
++extern "C" void _sh_ljs_put_by_val_cached_strict_rjs(
++    SHRuntime *shr,
++    SHUnit *unit,
++    SHLegacyValue *target,
++    SHLegacyValue *key,
++    SHLegacyValue *value,
++    SHComputedWriteCacheEntry *cache) {
++  putByValCached_RJS<true>(shr, unit, target, key, value, cache);
++}
++
+ static inline void putByIndex_RJS(
+     SHRuntime *shr,
+     SHLegacyValue *target,
+@@ -1270,8 +1762,25 @@ static inline HermesValue getByIdWithReceiver_RJS(
+     CallResult<PseudoHandle<>> resPH{ExecutionStatus::EXCEPTION};
+     {
+       GCScopeMarkerRAII marker{runtime};
+-      resPH = Interpreter::getByIdTransientWithReceiver_RJS(
+-          runtime, source, symID, receiver);
++      if (source->isString() && cacheEntry &&
++          symID != Predefined::getSymbolID(Predefined::length)) {
++        auto prototype = Handle<JSObject>::vmcast(&runtime.stringPrototype);
++        // Cache the prototype's own data slot, not its current value. Replacing
++        // a method keeps reading the new slot value; changing property flags
++        // or deleting it invalidates the class match. Accessors keep the
++        // primitive receiver on the ordinary lookup path.
++        if (cacheEntry->clazz == prototype->getClassGCPtr()) {
++          return JSObject::getNamedSlotValueUnsafe(
++                     *prototype, runtime, cacheEntry->getSlot())
++              .unboxToHV(runtime);
++        }
++        resPH = JSObject::getNamedWithReceiver_RJS(
++            prototype, runtime, symID, receiver,
++            DEFAULT_PROP_OP_FLAGS(false), cacheEntry);
++      } else {
++        resPH = Interpreter::getByIdTransientWithReceiver_RJS(
++            runtime, source, symID, receiver);
++      }
+     }
+     if (LLVM_UNLIKELY(resPH == ExecutionStatus::EXCEPTION))
+       _sh_throw_current(getSHRuntime(runtime));
+@@ -1417,6 +1926,36 @@ extern "C" SHLegacyValue _sh_ljs_get_by_id_rjs(
+       reinterpret_cast<ReadPropertyCacheEntry *>(propCacheEntry));
+ }
+ 
++LLVM_ATTRIBUTE_NOINLINE
++extern "C" SHLegacyValue _sh_ljs_get_by_id_polymorphic_rjs(
++    SHRuntime *shr,
++    const SHLegacyValue *source,
++    SHSymbolID symID,
++    SHReadPropertyCacheEntry *cache) {
++  auto &runtime = getRuntime(shr);
++  auto *entries = reinterpret_cast<ReadPropertyCacheEntry *>(cache);
++  if (toPHV(source)->isObject()) {
++    auto *object = vmcast<JSObject>(*toPHV(source));
++    const CompressedPointer clazz{object->getClassGCPtr()};
++    for (unsigned i = 0; i < SH_NAMED_READ_CACHE_WAYS; ++i) {
++      if (entries[i].clazz == clazz) {
++        return JSObject::getNamedSlotValueUnsafe(
++                   object, runtime, entries[i].getSlot())
++            .unboxToHV(runtime);
++      }
++    }
++  }
++  // Rotate before the potentially allocating lookup, keeping every weak pointer
++  // in the unit's traced storage. The oldest entry becomes the replacement slot;
++  // uncachable reads retain both entries. Prototype validation stays in getById.
++  std::rotate(
++      cache,
++      cache + SH_NAMED_READ_CACHE_WAYS - 1,
++      cache + SH_NAMED_READ_CACHE_WAYS);
++  return getById_RJS<false>(
++      runtime, Handle<>{toPHV(source)}, SymbolID::unsafeCreate(symID), entries);
++}
++
+ LLVM_ATTRIBUTE_NOINLINE
+ extern "C" SHLegacyValue _sh_ljs_get_by_id_with_receiver_rjs(
+     SHRuntime *shr,
+@@ -1432,9 +1971,12 @@ extern "C" SHLegacyValue _sh_ljs_get_by_id_with_receiver_rjs(
+       reinterpret_cast<ReadPropertyCacheEntry *>(propCacheEntry));
+ }
+ 
+-LLVM_ATTRIBUTE_NOINLINE
+-extern "C" void _sh_ljs_define_own_by_id(
++// Specialize the legacy and unit-owned entry points without an extra runtime
++// call or unused addition-cache checks on the legacy path.
++LLVM_ATTRIBUTE_ALWAYS_INLINE
++static inline void defineOwnById(
+     SHRuntime *shr,
++    SHUnit *unit,
+     SHLegacyValue *target,
+     SHSymbolID key,
+     SHLegacyValue *value,
+@@ -1456,6 +1998,24 @@ extern "C" void _sh_ljs_define_own_by_id(
+     JSObject::setNamedSlotValueUnsafe(obj, runtime, cacheEntry->getSlot(), shv);
+     return;
+   }
++  // An object's shape alone does not rule out exotic or lazy behavior. Reuse
++  // the existing assignment transition cache only for ordinary receivers,
++  // retaining its parent/epoch checks and its traced weak references.
++  const bool cacheAddition = unit && cacheEntry &&
++      obj->getKind() == CellKind::JSObjectKind && !obj->isHostObject() &&
++      !obj->isLazy() && !obj->getClass(runtime)->isTyped();
++  if (cacheAddition) {
++    const auto &add =
++        sh_unit_get_add_cache_entry(unit, cacheEntry->getAddCacheIndex());
++    if (add.startClazz == clazzPtr && add.resultClazz && obj->isExtensible() &&
++        add.getParentEpoch() == runtime.getParentCacheEpoch() &&
++        add.parent == obj->getParentGCPtr()) {
++      JSObject::addNewOwnPropertyInSlot(
++          obj, runtime, add.resultClazz.getNonNull(runtime, runtime.getHeap()),
++          add.getSlot(), shv);
++      return;
++    }
++  }
+   NamedPropertyDescriptor desc;
+   OptValue<bool> hasOwnProp =
+       JSObject::tryGetOwnNamedDescriptorFast(obj, runtime, symID, desc);
+@@ -1486,12 +2046,35 @@ extern "C" void _sh_ljs_define_own_by_id(
+         symID,
+         DefinePropertyFlags::getDefaultNewPropertyFlags(),
+         Handle<>(valuePHV),
+-        PropOpFlags().plusThrowOnError());
++        PropOpFlags().plusThrowOnError(),
++        unit,
++        cacheAddition ? cacheEntry : nullptr);
+   }
+   if (LLVM_UNLIKELY(putRes == ExecutionStatus::EXCEPTION))
+     _sh_throw_current(getSHRuntime(runtime));
+ }
+ 
++LLVM_ATTRIBUTE_NOINLINE
++extern "C" void _sh_ljs_define_own_by_id(
++    SHRuntime *shr,
++    SHLegacyValue *target,
++    SHSymbolID key,
++    SHLegacyValue *value,
++    SHWritePropertyCacheEntry *propCacheEntry) {
++  defineOwnById(shr, nullptr, target, key, value, propCacheEntry);
++}
++
++LLVM_ATTRIBUTE_NOINLINE
++extern "C" void _sh_ljs_define_own_by_id_in_unit(
++    SHRuntime *shr,
++    SHUnit *unit,
++    SHLegacyValue *target,
++    SHSymbolID key,
++    SHLegacyValue *value,
++    SHWritePropertyCacheEntry *propCacheEntry) {
++  defineOwnById(shr, unit, target, key, value, propCacheEntry);
++}
++
+ LLVM_ATTRIBUTE_NOINLINE
+ extern "C" void _sh_ljs_define_own_by_val(
+     SHRuntime *shr,
+diff --git a/lib/VM/StaticHUnit.cpp b/lib/VM/StaticHUnit.cpp
+index 4cce9f599fb00e6e868fedd669cf0399d9e55c16..57ea558d44fa78c32dcbcc5dd78b84450db000f8 100644
+--- a/lib/VM/StaticHUnit.cpp
++++ b/lib/VM/StaticHUnit.cpp
+@@ -306,11 +306,29 @@ void hermes::vm::sh_unit_mark_weak_roots(
+       acceptor.acceptWeakSym(prop.nameVal);
+     }
+ 
++    for (auto &entry : llvh::makeMutableArrayRef(
++             reinterpret_cast<ComputedReadCacheEntry *>(
++                 unit->computed_read_cache),
++             unit->num_computed_read_cache_entries)) {
++      acceptor.acceptWeak(entry.clazz);
++      acceptor.acceptWeakSym(entry.key);
++    }
++
+     for (auto &entry : llvh::makeMutableArrayRef(
+              reinterpret_cast<WeakRootBase *>(unit->object_literal_class_cache),
+              unit->obj_shape_table_count)) {
+       acceptor.acceptWeak(entry);
+     }
++
++    for (auto &entry : llvh::makeMutableArrayRef(
++             reinterpret_cast<ComputedWriteCacheEntry *>(
++                 unit->computed_write_cache),
++             unit->num_computed_write_cache_entries)) {
++      if (entry.initialized) {
++        acceptor.acceptWeak(entry.write.clazz);
++        acceptor.acceptWeakSym(entry.key);
++      }
++    }
+   }
+ 
+   if (markLongLived) {
+diff --git a/lib/VM/StringPrimitive.cpp b/lib/VM/StringPrimitive.cpp
+index 5bf0eb3faa636d974da9c14bd49a1f7d15044b87..67986bb7ed1a8c5160844db2f825ba0a51ca6828 100644
+--- a/lib/VM/StringPrimitive.cpp
++++ b/lib/VM/StringPrimitive.cpp
+@@ -320,6 +320,10 @@ CallResult<HermesValue> StringPrimitive::slice(
+   assert(
+       start + length <= str->getStringLength() && "Invalid length for slice");
+ 
++  if (start == 0 && length == str->getStringLength()) {
++    return str.getHermesValue();
++  }
++
+   SafeUInt32 safeLen(length);
+ 
+   // Special case for 1-character strings, some of which are cached in the
+diff --git a/test/hermes/copyDataProperties-fresh-fast-path.js b/test/hermes/copyDataProperties-fresh-fast-path.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..f81eeee262435b5a1f6243396142b0d2a329ef63
+--- /dev/null
++++ b/test/hermes/copyDataProperties-fresh-fast-path.js
+@@ -0,0 +1,119 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++// RUN: %hermes -Xhermes-internal-test-methods -O %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -exec %s -Wx,-Xhermes-internal-test-methods | %FileCheck --match-full-lines %s
++
++var source = {a: 1, b: {nested: 2}, c: "text"};
++var copy = {...source};
++print(copy.a, copy.b.nested, copy.c, copy !== source);
++// CHECK: 1 2 text true
++copy.a = 17;
++print(source.a, copy.a);
++// CHECK-NEXT: 1 17
++
++// A getter must still run with the original receiver and order, including GC.
++var getterReads = 0;
++var getterSource = {};
++Object.defineProperty(getterSource, "a", {
++  enumerable: true,
++  get: function () { ++getterReads; gc(); return 9; }
++});
++var getterCopy = {...getterSource};
++print(getterReads, getterCopy.a);
++// CHECK-NEXT: 1 9
++
++// Symbols, non-enumerable fields and indexed properties retain the generic path.
++var symbol = Symbol("s");
++var symbolSource = {a: 3};
++symbolSource[symbol] = 4;
++var symbolCopy = {...symbolSource};
++print(symbolCopy.a, symbolCopy[symbol], Object.getOwnPropertySymbols(symbolCopy).length);
++// CHECK-NEXT: 3 4 1
++
++var hiddenSource = {a: 5};
++Object.defineProperty(hiddenSource, "hidden", {value: 6, enumerable: false});
++var hiddenCopy = {...hiddenSource};
++print(hiddenCopy.a, hiddenCopy.hidden === undefined);
++// CHECK-NEXT: 5 true
++
++var indexedSource = {a: 7};
++indexedSource["0"] = 8;
++var indexedCopy = {...indexedSource};
++print(indexedCopy["0"], indexedCopy.a, Object.keys(indexedCopy).join(","));
++// CHECK-NEXT: 8 7 0,a
++
++var prototype = {inherited: 10};
++var customSource = Object.create(prototype);
++customSource.a = 11;
++var customSourceCopy = {...customSource};
++var customTarget = {__proto__: prototype, ...{a: 12}};
++print(customSourceCopy.a, customSourceCopy.inherited === undefined,
++    customTarget.a, customTarget.inherited);
++// CHECK-NEXT: 11 true 12 10
++var nullSource = Object.create(null);
++nullSource.a = 18;
++var customBothTarget = Object.create(prototype);
++HermesInternal.copyDataProperties(customBothTarget, customSource);
++var nullSourceCopy = {...nullSource};
++print(customBothTarget.a, customBothTarget.inherited,
++    nullSourceCopy.a, Object.getPrototypeOf(nullSourceCopy) === Object.prototype);
++// CHECK-NEXT: 11 10 18 true
++
++// Adopting the source's property layout must not change the target's prototype.
++var sourcePrototype = {fromSource: 21};
++var targetPrototype = {fromTarget: 22};
++var mismatchedSource = Object.create(sourcePrototype);
++mismatchedSource.a = 23;
++var mismatchedTarget = Object.create(targetPrototype);
++HermesInternal.copyDataProperties(mismatchedTarget, mismatchedSource);
++print(mismatchedTarget.a, mismatchedTarget.fromSource === undefined,
++    mismatchedTarget.fromTarget, Object.getPrototypeOf(mismatchedTarget) === targetPrototype);
++// CHECK-NEXT: 23 true 22 true
++
++var existingTarget = {a: 0};
++HermesInternal.copyDataProperties(existingTarget, {a: 13, b: 14});
++print(existingTarget.a, existingTarget.b);
++// CHECK-NEXT: 13 14
++
++// Medium records use indirect named storage on the source and target. They
++// still satisfy the same data-only contract and must retain independent slots.
++var mediumSource = {
++  a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8,
++  i: 9, j: 10, k: 11, l: 12
++};
++var mediumCopy = {...mediumSource};
++mediumCopy.a = 41;
++mediumCopy.l = 52;
++gc();
++print(mediumSource.a, mediumSource.l, mediumCopy.a, mediumCopy.l,
++    Object.keys(mediumCopy).length);
++// CHECK-NEXT: 1 12 41 52 12
++
++var mediumSourcePrototype = {inheritedSource: 61};
++var mediumTargetPrototype = {inheritedTarget: 62};
++var mediumCustomSource = Object.create(mediumSourcePrototype);
++for (var mediumKey of Object.keys(mediumSource))
++  mediumCustomSource[mediumKey] = mediumSource[mediumKey];
++var mediumCustomTarget = Object.create(mediumTargetPrototype);
++HermesInternal.copyDataProperties(mediumCustomTarget, mediumCustomSource);
++gc();
++print(mediumCustomTarget.a, mediumCustomTarget.l,
++    mediumCustomTarget.inheritedSource === undefined,
++    mediumCustomTarget.inheritedTarget, Object.keys(mediumCustomTarget).length);
++// CHECK-NEXT: 1 12 true 62 12
++
++var callableTarget = function () {};
++HermesInternal.copyDataProperties(callableTarget, {a: 19});
++print(callableTarget.a, typeof callableTarget);
++// CHECK-NEXT: 19 function
++
++var gcSource = {a: {nested: 15}, b: 16};
++var gcCopy = {...gcSource};
++gc();
++print(gcCopy.a.nested, gcCopy.b);
++// CHECK-NEXT: 15 16
+diff --git a/test/hermes/copyDataProperties-fresh-gc.js b/test/hermes/copyDataProperties-fresh-gc.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..f5c53d104096f43e2614f7a6d639646268480aa5
+--- /dev/null
++++ b/test/hermes/copyDataProperties-fresh-gc.js
+@@ -0,0 +1,48 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++// RUN: %hermes -O -Xhermes-internal-test-methods -gc-sanitize-handles=1 %s | %FileCheck --match-full-lines %s
++// RUN: %hermes -O0 -Xhermes-internal-test-methods -gc-sanitize-handles=1 %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -exec %s -Wx,-Xhermes-internal-test-methods,-gc-sanitize-handles=1 | %FileCheck --match-full-lines %s
++// RUN: %shermes -O0 -exec %s -Wx,-Xhermes-internal-test-methods,-gc-sanitize-handles=1 | %FileCheck --match-full-lines %s
++
++// Under MallocGC handle sanitization, allocating or growing the target's
++// indirect storage moves the source, its hidden class, and all object values.
++// Collection after the copy alone would not exercise stale pointers in its loop.
++for (var width = 6; width <= 17; ++width) {
++  var source = {};
++  for (var field = 0; field < width; ++field)
++    source['field' + field] = {value: field};
++
++  var target = {};
++  HermesInternal.copyDataProperties(target, source);
++  if (target === source ||
++      Object.keys(target).join(',') !== Object.keys(source).join(','))
++    throw new Error('copy identity or property order changed');
++
++  for (var field = 0; field < width; ++field) {
++    var key = 'field' + field;
++    if (target[key] !== source[key] || target[key].value !== field)
++      throw new Error('copied object value changed');
++    target[key] = null;
++    if (source[key] === null)
++      throw new Error('copy aliases source property storage');
++  }
++  print('copied', width);
++}
++// CHECK: copied 6
++// CHECK-NEXT: copied 7
++// CHECK-NEXT: copied 8
++// CHECK-NEXT: copied 9
++// CHECK-NEXT: copied 10
++// CHECK-NEXT: copied 11
++// CHECK-NEXT: copied 12
++// CHECK-NEXT: copied 13
++// CHECK-NEXT: copied 14
++// CHECK-NEXT: copied 15
++// CHECK-NEXT: copied 16
++// CHECK-NEXT: copied 17
+diff --git a/test/shermes/computed-loads.js b/test/shermes/computed-loads.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..5367c18e5e97cec657763309f555a53f18194a79
+--- /dev/null
++++ b/test/shermes/computed-loads.js
+@@ -0,0 +1,147 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++// RUN: %shermes -O -exec %s -Wx,-Xhermes-internal-test-methods | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -Xsmall-c -exec %s -Wx,-Xhermes-internal-test-methods | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -emit-c -o %t.c %s
++// RUN: %FileCheck --check-prefix=C --input-file=%t.c %s
++
++function read(object, key) {
++  "noinline";
++  return object[key];
++}
++function assert(value) {
++  if (!value) throw new Error('computed load contract');
++}
++var key = Symbol('key');
++var object = {alpha: 1, beta: 2, gamma: 3, delta: 4, [key]: 5};
++var keys = Object.keys(object).concat(key);
++for (var round = 0; round < 8; ++round) {
++  for (var i = 0; i < keys.length; ++i) assert(read(object, keys[i]) === i + 1);
++  gc();
++}
++object.alpha = 10;
++assert(read(object, 'alpha') === 10);
++var getterCalls = 0;
++Object.defineProperty(object, 'alpha', {get() { ++getterCalls; return 11; }});
++assert(read(object, 'alpha') === 11 && getterCalls === 1);
++delete object.beta;
++Object.setPrototypeOf(object, {beta: 12});
++assert(read(object, 'beta') === 12);
++object.beta = 13;
++assert(read(object, 'beta') === 13);
++var proxyCalls = 0;
++var proxy = new Proxy(object, {get(target, key) { ++proxyCalls; return key; }});
++assert(read(proxy, 'alpha') === 'alpha' && proxyCalls === 1);
++var coercions = 0;
++assert(read(object, {[Symbol.toPrimitive]() {
++  ++coercions;
++  gc();
++  object.beta = 14;
++  return 'beta';
++}}) === 14 && coercions === 1);
++assert(read('abc', 1) === 'b');
++assert(read({0: 9}, -0) === 9);
++for (var j = 0; j < 200; ++j) object['field' + j] = j;
++delete object.field100;
++object.field100 = 1000;
++assert(read(object, 'field100') === 1000);
++var failed = false;
++try { read(null, {toString() { throw new Error('must not coerce'); }}); }
++catch (e) { failed = e instanceof TypeError; }
++assert(failed);
++print('computed properties passed');
++// CHECK: computed properties passed
++
++// The same keys occupy different slots on these two receiver shapes.
++var left = {first: 1, second: 2, [key]: 3};
++var right = {[key]: 4, second: 5, first: 6};
++for (var round = 0; round < 20; ++round) {
++  assert(read(left, 'first') === 1 && read(right, 'first') === 6);
++  assert(read(left, key) === 3 && read(right, key) === 4);
++  gc();
++}
++var ordinary = [10, undefined, 30, 40];
++for (var round = 0; round < 4; ++round) {
++  assert(read(ordinary, 0) === 10 && read(ordinary, 1) === undefined);
++  ordinary.shift();
++  ordinary.unshift(10);
++  gc();
++}
++delete ordinary[1];
++var parent = Object.create(Array.prototype);
++Object.defineProperty(parent, '1', {get() { return this[0] + 1; }});
++Object.setPrototypeOf(ordinary, parent);
++assert(read(ordinary, 1) === 11);
++Object.defineProperty(ordinary, '2', {get() { gc(); return 32; }});
++assert(read(ordinary, 2) === 32);
++ordinary.length = 1;
++assert(read(ordinary, 2) === undefined && read(ordinary, 1) === 11);
++ordinary['4294967295'] = 99;
++ordinary['-1'] = 98;
++assert(read(ordinary, 4294967295) === 99 && read(ordinary, -1) === 98);
++assert(read(ordinary, -0) === 10 && read(ordinary, 0.5) === undefined);
++assert(read(Object.freeze([42]), 0) === 42);
++assert(read(new Proxy([1], {get() { return 43; }}), 0) === 43);
++assert(read([null, {answer: 44}], 1).answer === 44);
++print('polymorphic and ordinary elements passed');
++// CHECK-NEXT: polymorphic and ordinary elements passed
++
++var constructors = [Uint8Array, Int8Array, Uint8ClampedArray, Uint16Array,
++  Int16Array, Uint32Array, Int32Array, Float32Array, Float64Array];
++for (var ctor of constructors) {
++  var array = new ctor([0, 12, 23, 34]).subarray(1);
++  for (var round = 0; round < 3; ++round) {
++    assert(read(array, 0) === 12 && read(array, 1) === 23);
++    assert(read(array, -0) === 12 && read(array, '1') === 23);
++    assert(read(array, -1) === undefined && read(array, 0.5) === undefined);
++    assert(read(array, array.length) === undefined);
++    assert(read(array, NaN) === undefined && read(array, Infinity) === undefined);
++    assert(read(array, 4294967295) === undefined);
++    gc();
++  }
++  HermesInternal.detachArrayBuffer(array.buffer);
++  assert(read(array, 0) === undefined);
++}
++assert(read(new Int8Array([-128]), 0) === -128);
++assert(read(new Int16Array([-32768]), 0) === -32768);
++assert(read(new Uint32Array([4294967295]), 0) === 4294967295);
++assert(read(new Int32Array([-2147483648]), 0) === -2147483648);
++var floating = new Float64Array([NaN, -0, Infinity]);
++assert(Number.isNaN(read(floating, 0)) && Object.is(read(floating, 1), -0));
++assert(read(floating, 2) === Infinity);
++// NaN payloads must not become tagged pointers when read as doubles.
++var words = new Uint32Array(floating.buffer);
++words[0] = 1; words[1] = 0xffff0000;
++assert(Number.isNaN(read(floating, 0)));
++assert(read(new BigInt64Array([-1n]), 0) === -1n);
++assert(read(new BigUint64Array([18446744073709551615n]), 0) === 18446744073709551615n);
++print('typed elements passed');
++// CHECK-NEXT: typed elements passed
++
++function numeric(a, b) {
++  "noinline";
++  a = +a; b = +b;
++  return [a | b, a & b, a ^ b, a << b, a >> b, a >>> b];
++}
++function generic(a, b) {
++  "noinline";
++  return [a | b, a & b, a ^ b, a << b, a >> b, a >>> b];
++}
++for (var a of [-0, -1, 2147483648, 4294967295, 4294967297, 1e30, NaN, Infinity, -3.7]) {
++  for (var b of [-1, 0, 31, 32, 33, 3.4, Infinity]) {
++    assert(JSON.stringify(numeric(a, b)) === JSON.stringify(generic(a, b)));
++  }
++}
++failed = false;
++try { generic(3n, 1n); } catch (e) { failed = e instanceof TypeError; }
++assert(failed);
++print('numeric operations passed');
++// CHECK-NEXT: numeric operations passed
++
++// C: _sh_ljs_get_by_val_cached_rjs_inline
++// C: _sh_to_uint32_double(_sh_ljs_get_double
+diff --git a/test/shermes/computed-stores.js b/test/shermes/computed-stores.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..ef78d85dba345d9470107c17f232e3eb2c5b05dd
+--- /dev/null
++++ b/test/shermes/computed-stores.js
+@@ -0,0 +1,191 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++// RUN: %shermes -O -exec %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -Xsmall-c -exec %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -emit-c -o %t.c %s
++// RUN: %FileCheck --check-prefix=C --input-file=%t.c %s
++
++function store(object, key, value) {
++  "noinline";
++  "use strict";
++  object[key] = value;
++}
++function loose(object, key, value) {
++  "noinline";
++  object[key] = value;
++}
++function assert(value) {
++  if (!value) throw new Error('computed store contract');
++}
++function throwsTypeError(body) {
++  var failed = false;
++  try { body(); } catch (e) { failed = e instanceof TypeError; }
++  assert(failed);
++}
++var symbol = Symbol('field');
++var keys = ['alpha', 'beta', 'gamma', 'delta', symbol];
++for (var round = 0; round < 8; ++round) {
++  var object = {};
++  for (var i = 0; i < keys.length; ++i) store(object, keys[i], {value: i});
++  gc();
++  for (var i = 0; i < keys.length; ++i) assert(object[keys[i]].value === i);
++  for (var i = keys.length - 1; i >= 0; --i) store(object, keys[i], i + 10);
++  assert(object.alpha === 10 && object[symbol] === 14);
++  assert(Object.keys(object).join(',') === 'alpha,beta,gamma,delta');
++}
++
++// A cached addition must observe later changes on the same parent object.
++var parent = {};
++var receiver;
++var calls = 0;
++for (var round = 0; round < 3; ++round) store(Object.create(parent), 'alpha', 1);
++Object.defineProperty(parent, 'alpha', {
++  configurable: true,
++  set(value) { receiver = this; ++calls; assert(value === 7); }
++});
++var child = Object.create(parent);
++store(child, 'alpha', 7);
++assert(receiver === child && calls === 1 && !Object.hasOwn(child, 'alpha'));
++Object.defineProperty(parent, 'alpha', {value: 8, writable: false});
++throwsTypeError(() => store(Object.create(parent), 'alpha', 9));
++var ignored = Object.create(parent);
++loose(ignored, 'alpha', 9);
++assert(ignored.alpha === 8 && !Object.hasOwn(ignored, 'alpha'));
++
++var sealed = Object.preventExtensions({alpha: 1});
++store(sealed, 'alpha', 2);
++assert(sealed.alpha === 2);
++throwsTypeError(() => store(sealed, 'beta', 3));
++Object.freeze(sealed);
++throwsTypeError(() => store(sealed, 'alpha', 3));
++loose(sealed, 'alpha', 3);
++assert(sealed.alpha === 2);
++for (var round = 0; round < 3; ++round) store({}, 'delta', 1);
++throwsTypeError(() => store(Object.preventExtensions({}), 'delta', 2));
++function namedStore(object) {
++  "noinline";
++  "use strict";
++  object.delta = 1;
++}
++for (var round = 0; round < 3; ++round) namedStore({});
++throwsTypeError(() => namedStore(Object.preventExtensions({})));
++var changed = {alpha: 1};
++store(changed, 'alpha', 2);
++Object.defineProperty(changed, 'alpha', {set(value) { this.beta = value; }});
++store(changed, 'alpha', 12);
++assert(changed.beta === 12);
++delete changed.alpha;
++store(changed, 'alpha', 13);
++assert(changed.alpha === 13);
++
++var protoObject = {};
++var newParent = {inherited: 14};
++store(protoObject, '__proto__', newParent);
++assert(Object.getPrototypeOf(protoObject) === newParent);
++var nullParent = Object.create(null);
++store(nullParent, '__proto__', newParent);
++assert(nullParent.__proto__ === newParent && Object.getPrototypeOf(nullParent) === null);
++
++// Recursive setters revisit this store site with many keys, collect, and throw.
++var recursiveKeys = [];
++for (var i = 0; i < 80; ++i) recursiveKeys.push(Symbol('recursive'));
++var recursive = {};
++Object.defineProperty(recursive, 'alpha', {set(value) {
++  // Symbols enter the key cache immediately; freshly concatenated strings may
++  // still be uninterned and would only exercise the generic fallback here.
++  for (var i = 0; i < recursiveKeys.length; ++i) store(value, recursiveKeys[i], i);
++  gc();
++  if (value.fail) throw 17;
++}});
++var nested = {};
++store(recursive, 'alpha', nested);
++assert(nested[recursiveKeys[0]] === 0 && nested[recursiveKeys[79]] === 79);
++var caught = false;
++try { store(recursive, 'alpha', {fail: true}); } catch (e) { caught = e === 17; }
++assert(caught);
++store(nested, 'alpha', 18);
++assert(nested.alpha === 18);
++
++var coercions = 0;
++store(nested, {[Symbol.toPrimitive]() {
++  ++coercions;
++  gc();
++  return 'beta';
++}}, 19);
++assert(coercions === 1 && nested.beta === 19);
++throwsTypeError(() => store(null, {toString() { ++coercions; return 'x'; }}, 0));
++throwsTypeError(() => loose(undefined, {toString() { ++coercions; return 'x'; }}, 0));
++assert(coercions === 1);
++var proxyCalls = 0;
++var proxy = new Proxy({}, {set(target, key, value, receiver) {
++  ++proxyCalls;
++  assert(receiver === proxy && key === 'alpha' && value === 20);
++  return true;
++}});
++store(proxy, 'alpha', 20);
++assert(proxyCalls === 1);
++var proxyParent = new Proxy({}, {set(target, key, value, receiver) {
++  ++proxyCalls;
++  receiver.seen = value;
++  return true;
++}});
++// Avoid invoking the proxy setter recursively for its evidence field.
++Object.defineProperty(proxyParent, 'seen', {value: 0, writable: true});
++var proxyChild = {seen: 0};
++Object.setPrototypeOf(proxyChild, proxyParent);
++store(proxyChild, 'alpha', 21);
++assert(proxyChild.seen === 21 && proxyCalls === 2);
++
++var array = [];
++store(array, '0', 22);
++store(array, 1, 23);
++assert(array.length === 2 && array[0] === 22 && array[1] === 23);
++store(array, 'length', 0);
++assert(array.length === 0 && array[0] === undefined);
++var typed = new Uint8Array(2);
++store(typed, '0', 255);
++store(typed, 1, 11);
++assert(typed[0] === 255 && typed[1] === 11);
++var indexed = {};
++for (var key of ['2', '1', '4294967295', '01']) store(indexed, key, key);
++assert(Object.keys(indexed).join(',') === '1,2,4294967295,01');
++throwsTypeError(() => store('abc', 'length', 0));
++loose('abc', 'length', 0);
++
++// Exercise dictionary shapes at a site with a populated key cache.
++for (var round = 0; round < 4; ++round) {
++  var many = {};
++  for (var i = 0; i < 200; ++i) store(many, 'field' + i, {value: i});
++  delete many.field80;
++  store(many, 'field80', {value: 800});
++  assert(many.field80.value === 800 && many.field199.value === 199);
++  gc();
++}
++
++// Give temporary keys their own site so permanent keys from earlier cases do
++// not fill the cache and keep this test on the uncached fallback throughout.
++function weakStore(object, key, value) {
++  "noinline";
++  "use strict";
++  object[key] = value;
++}
++for (var round = 0; round < 4; ++round) {
++  for (var i = 0; i < 40; ++i) {
++    var temporary = {};
++    var temporaryKey = Symbol('temporary');
++    weakStore(temporary, temporaryKey, {value: i});
++    assert(temporary[temporaryKey].value === i);
++    weakStore(temporary, temporaryKey, i + 1);
++    assert(temporary[temporaryKey] === i + 1);
++  }
++  gc();
++}
++print('computed stores passed');
++// CHECK: computed stores passed
++// C: _sh_ljs_put_by_val_cached_strict_rjs
++// C: _sh_ljs_put_by_val_cached_loose_rjs
+diff --git a/test/shermes/polymorphic-read-cache.js b/test/shermes/polymorphic-read-cache.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..d680d6a3bd247c9ce391b7cfb419837e187cd00f
+--- /dev/null
++++ b/test/shermes/polymorphic-read-cache.js
+@@ -0,0 +1,63 @@
++// Copyright (c) Meta Platforms, Inc. and affiliates.
++//
++// This source code is licensed under the MIT license found in the
++// LICENSE file in the root directory of this source tree.
++
++// RUN: %shermes -O -exec %s | %FileCheck --match-full-lines %s
++// RUN: %shermes -O -Xsmall-c -exec %s | %FileCheck --match-full-lines %s
++
++function read(object) {
++  'noinline';
++  return object.value;
++}
++function check(actual, expected) {
++  if (actual !== expected) throw new Error('named read contract');
++}
++var first = {value: 1};
++var second = {before: 2, value: 3};
++for (var i = 0; i < 20; ++i) {
++  check(read(first), 1);
++  check(read(second), 3);
++  gc();
++}
++first.value = 4;
++check(read(first), 4);
++var getterCalls = 0;
++Object.defineProperty(first, 'value', {configurable: true, get() {
++  ++getterCalls;
++  gc();
++  return 5;
++}});
++check(read(first), 5);
++check(getterCalls, 1);
++check(read(second), 3);
++delete second.value;
++Object.setPrototypeOf(second, {value: 6});
++check(read(second), 6);
++Object.setPrototypeOf(second, {before: 7, value: 8});
++check(read(second), 8);
++second.value = 9;
++check(read(second), 9);
++var proxyCalls = 0;
++check(read(new Proxy(second, {get(target, key, receiver) {
++  ++proxyCalls;
++  return receiver === this ? 0 : 10;
++}})), 10);
++check(proxyCalls, 1);
++String.prototype.value = 11;
++check(read('text'), 11);
++String.prototype.value = 12;
++check(read('text'), 12);
++delete String.prototype.value;
++check(read('text'), undefined);
++for (var i = 0; i < 200; ++i) second['field' + i] = i;
++delete second.field100;
++delete second.value;
++check(read(second), 8);
++second.value = 13;
++check(read(second), 13);
++var threw = false;
++try { read(null); } catch (e) { threw = e instanceof TypeError; }
++check(threw, true);
++print('named reads passed');
++// CHECK: named reads passed
+diff --git a/test/shermes/string-method-cache.js b/test/shermes/string-method-cache.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..b371cb64710cb588e070f0fe66a87cb167179183
+--- /dev/null
++++ b/test/shermes/string-method-cache.js
+@@ -0,0 +1,36 @@
++// Copyright (c) Meta Platforms, Inc. and affiliates.
++//
++// This source code is licensed under the MIT license found in the
++// LICENSE file in the root directory of this source tree.
++
++// RUN: %shermes -exec -O %s | %FileCheck %s
++// RUN: %shermes -exec -O0 %s | %FileCheck %s
++
++function method(value) { return value.probe(); }
++function check(actual, expected) {
++  if (actual !== expected) throw new Error('String method cache changed behavior');
++}
++String.prototype.probe = function() { 'use strict'; return this; };
++for (var i = 0; i < 100; ++i) check(method('first'), 'first');
++String.prototype.probe = function() { return 'replaced'; };
++check(method('first'), 'replaced');
++Object.defineProperty(String.prototype, 'probe', {
++  configurable: true,
++  get: function() {
++    'use strict';
++    check(typeof this, 'string');
++    return function() { 'use strict'; return this; };
++  },
++});
++check(method('getter'), 'getter');
++delete String.prototype.probe;
++Object.prototype.probe = function() { return 'inherited'; };
++check(method('first'), 'inherited');
++String.prototype.probe = function() { return 'own'; };
++check(method('first'), 'own');
++check(method({ probe: function() { return 'object'; } }), 'object');
++check(method('first'), 'own');
++delete String.prototype.probe;
++delete Object.prototype.probe;
++print('string method cache passed');
++// CHECK: string method cache passed
+diff --git a/unittests/VMRuntime/StaticHUnitTest.cpp b/unittests/VMRuntime/StaticHUnitTest.cpp
+index 87be113a8a12acd4320fe516958a9a9846701db2..a0f1bbb39ad3ed8936ebdc981cc7baa4191143a5 100644
+--- a/unittests/VMRuntime/StaticHUnitTest.cpp
++++ b/unittests/VMRuntime/StaticHUnitTest.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include "VMRuntimeTestHelpers.h"
+ 
++#include "hermes/VM/PropertyCache.h"
+ #include "hermes/VM/StaticHUtils.h"
+ #include "hermes/VM/static_h.h"
+ 
+@@ -103,4 +104,53 @@ TEST(StaticHUnitTest, RejectsMismatchedStaticABI) {
+       "Static Hermes ABI mismatch: generated.*runtime archive");
+ }
+ 
++using StaticHCacheTest = RuntimeTestFixture;
++
++TEST_F(StaticHCacheTest, RetainsTwoShapesForNamedAndComputedReads) {
++  auto first = runtime.makeHandle(JSObject::create(runtime));
++  auto second = runtime.makeHandle(JSObject::create(runtime));
++  const auto key = Predefined::getSymbolID(Predefined::value);
++  const auto otherKey = Predefined::getSymbolID(Predefined::length);
++  ASSERT_TRUE(*JSObject::putNamed_RJS(
++      first, runtime, key, runtime.makeHandle(1.0_hd)));
++  ASSERT_TRUE(*JSObject::putNamed_RJS(
++      second, runtime, otherKey, runtime.makeHandle(2.0_hd)));
++  ASSERT_TRUE(*JSObject::putNamed_RJS(
++      second, runtime, key, runtime.makeHandle(3.0_hd)));
++  ASSERT_NE(first->getClass(runtime), second->getClass(runtime));
++
++  SHReadPropertyCacheEntry named[SH_NAMED_READ_CACHE_WAYS]{};
++  SHComputedReadCacheEntry computed[SH_COMPUTED_READ_CACHE_WAYS]{};
++  SHLegacyValue keyValue = HermesValue::encodeStringValue(
++      runtime.getStringPrimFromSymbolID(key));
++  SHLegacyValue sources[]{first.getHermesValue(), second.getHermesValue()};
++  auto *shr = getSHRuntime(runtime);
++  // No allocation or user code is possible for these own data reads. JS tests
++  // separately exercise traced unit caches across collections and invalidation.
++  for (unsigned round = 0; round < 10; ++round) {
++    for (unsigned i = 0; i < 2; ++i) {
++      EXPECT_EQ(
++          1.0 + 2 * i,
++          _sh_ljs_get_by_id_polymorphic_rjs(
++              shr, &sources[i], key.unsafeGetRaw(), named).f64);
++      EXPECT_EQ(
++          1.0 + 2 * i,
++          _sh_ljs_get_by_val_cached_rjs(
++              shr, &sources[i], &keyValue, computed).f64);
++    }
++  }
++  // Warm alternating receivers must not refill the named cache or overwrite
++  // the other receiver's computed entry.
++  EXPECT_EQ(2, named[0].numChanges + named[1].numChanges);
++  auto *computedEntries = reinterpret_cast<ComputedReadCacheEntry *>(computed);
++  unsigned retained = 0;
++  for (unsigned i = 0; i < SH_COMPUTED_READ_CACHE_WAYS; ++i) {
++    if (computedEntries[i].key == key &&
++        (computedEntries[i].clazz == first->getClassGCPtr() ||
++         computedEntries[i].clazz == second->getClassGCPtr()))
++      ++retained;
++  }
++  EXPECT_EQ(2u, retained);
++}
++
+ } // namespace
+diff --git a/unittests/VMRuntime/StringPrimitiveTest.cpp b/unittests/VMRuntime/StringPrimitiveTest.cpp
+index 2dab3a46721ad4c3f9ccb333db175e0bdbe0c10a..d85ba65aa9eb12c5d2683159ec2e49bb99945654 100644
+--- a/unittests/VMRuntime/StringPrimitiveTest.cpp
++++ b/unittests/VMRuntime/StringPrimitiveTest.cpp
+@@ -212,6 +212,21 @@ TEST_F(StringPrimTest, CreateTest) {
+           .equals(createUTF16Ref(u"foo")));
+ }
+ 
++TEST_F(StringPrimTest, FullSliceRetainsPrimitive) {
++  for (auto input : {u"", u"a", u"unchanged", u"\u03b1\u03b2\u03b3"}) {
++    auto str = StringPrimitive::createNoThrow(runtime, createUTF16Ref(input));
++    auto full = StringPrimitive::slice(runtime, str, 0, str->getStringLength());
++    ASSERT_NE(full, ExecutionStatus::EXCEPTION);
++    EXPECT_EQ(full->getString(), str.get());
++  }
++  auto str = StringPrimitive::createNoThrow(runtime, "abcd");
++  auto part = StringPrimitive::slice(runtime, str, 1, 2);
++  ASSERT_NE(part, ExecutionStatus::EXCEPTION);
++  auto result = runtime.makeHandle(vmcast<StringPrimitive>(*part));
++  EXPECT_TRUE(StringPrimitive::createStringView(runtime, result)
++                  .equals(createUTF16Ref(u"bc")));
++}
++
+ TEST_F(StringPrimTest, EqualityTest) {
+   auto s1 = StringPrimitive::createNoThrow(runtime, createUTF16Ref(u"abc"));
+   auto s2 = StringPrimitive::createNoThrow(runtime, createUTF16Ref(u"abc"));
